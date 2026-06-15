@@ -17,6 +17,14 @@ general-purpose terminal multiplexer or production process supervisor.
 
 Demons supports Linux and macOS.
 
+Install the published crate:
+
+```sh
+cargo install demons --locked
+```
+
+Or install from the source tree:
+
 ```sh
 cargo install --path . --locked
 ```
