@@ -1,0 +1,16 @@
+[settings]
+leader = "alt-j"
+
+[[task]]
+name = "server"
+command = "cargo run"
+
+[[task]]
+name = "web"
+command = "npm run dev -- --host 0.0.0.0"
+cwd = "./web"
+env = { BROWSER = "none" }
+
+[[task]]
+name = "logs"
+command = ["tail", "-f", "/tmp/app.log"]

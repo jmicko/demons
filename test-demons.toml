@@ -1,0 +1,19 @@
+[settings]
+layout = "grid"
+leader = "alt-j"
+
+[[task]]
+name = "cpu"
+command = "./test_commands.sh cpu"
+
+[[task]]
+name = "clock"
+command = "./test_commands.sh clock"
+
+[[task]]
+name = "load"
+command = "./test_commands.sh load"
+
+[[task]]
+name = "count"
+command = "./test_commands.sh count"

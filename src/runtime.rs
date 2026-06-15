@@ -1,0 +1,1455 @@
+use std::{
+    collections::HashSet,
+    env,
+    io::{self, Read, Stdout, Write},
+    path::PathBuf,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, SyncSender},
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context, Result};
+use crossterm::{
+    event::{
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
+    },
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+use portable_pty::{Child, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
+use ratatui::{
+    Frame, Terminal,
+    backend::CrosstermBackend,
+    buffer::Buffer,
+    layout::Rect,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Paragraph, Widget},
+};
+use vt100::{MouseProtocolEncoding, MouseProtocolMode, Parser};
+
+use crate::{
+    config::{Leader, LoadedConfig, Task, TaskCommand},
+    layout::{Grid, choose_grid, pane_rects},
+};
+
+const SCROLLBACK_LINES: usize = 10_000;
+const RESTART_GRACE: Duration = Duration::from_secs(1);
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+const EVENT_INTERVAL: Duration = Duration::from_millis(25);
+const ALT_ESCAPE_TIMEOUT: Duration = Duration::from_millis(50);
+const MODE_BUTTON_WIDTH: u16 = 13;
+
+type ProcessRegistry = Arc<Mutex<HashSet<u32>>>;
+
+pub fn run(loaded: LoadedConfig) -> Result<()> {
+    let registry = Arc::new(Mutex::new(HashSet::new()));
+    install_panic_hook(Arc::clone(&registry));
+    let shutdown_requested = register_shutdown_signals()?;
+
+    let mut terminal_guard = TerminalGuard::enter()?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))
+        .context("failed to initialize terminal")?;
+    terminal.clear().context("failed to clear terminal")?;
+
+    let (tx, rx) = mpsc::sync_channel(1024);
+    let mut app = App::new(loaded, tx, rx, registry);
+    let initial_size = terminal.size().context("failed to read terminal size")?;
+    let initial_area = Rect::new(0, 0, initial_size.width, initial_size.height);
+    app.update_layout(initial_area);
+    app.spawn_all();
+
+    let loop_result = run_loop(&mut terminal, &mut app, &shutdown_requested);
+    let shutdown_result = app.shutdown();
+    terminal.show_cursor().ok();
+    terminal_guard.restore();
+
+    loop_result.and(shutdown_result)
+}
+
+fn run_loop(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    app: &mut App,
+    shutdown_requested: &AtomicBool,
+) -> Result<()> {
+    let mut dirty = true;
+    loop {
+        if shutdown_requested.load(Ordering::Relaxed) {
+            app.mark_stopping();
+            terminal.draw(|frame| app.draw(frame)).ok();
+            return Ok(());
+        }
+        dirty |= app.drain_process_events();
+        dirty |= app.tick()?;
+
+        if dirty {
+            terminal
+                .draw(|frame| app.draw(frame))
+                .context("failed to draw terminal UI")?;
+            dirty = false;
+        }
+
+        if event::poll(EVENT_INTERVAL).context("failed to poll terminal input")? {
+            let event = event::read().context("failed to read terminal input")?;
+            if app.handle_terminal_event(event)? == Action::Quit {
+                app.mark_stopping();
+                terminal.draw(|frame| app.draw(frame)).ok();
+                return Ok(());
+            }
+            dirty = true;
+        }
+    }
+}
+
+struct App {
+    loaded: LoadedConfig,
+    tasks: Vec<TaskRuntime>,
+    focus: usize,
+    mode: AppMode,
+    grid: Grid,
+    pane_rects: Vec<Rect>,
+    content_rects: Vec<Rect>,
+    footer_rect: Option<Rect>,
+    mode_button_rect: Option<Rect>,
+    tx: SyncSender<ProcessEvent>,
+    rx: Receiver<ProcessEvent>,
+    registry: ProcessRegistry,
+    stopping: bool,
+    pending_escape: Option<Instant>,
+}
+
+impl App {
+    fn new(
+        loaded: LoadedConfig,
+        tx: SyncSender<ProcessEvent>,
+        rx: Receiver<ProcessEvent>,
+        registry: ProcessRegistry,
+    ) -> Self {
+        let tasks = loaded
+            .config
+            .tasks
+            .iter()
+            .cloned()
+            .map(|task| {
+                let cwd = loaded.task_cwd(&task);
+                TaskRuntime::new(task, cwd)
+            })
+            .collect();
+        Self {
+            loaded,
+            tasks,
+            focus: 0,
+            mode: AppMode::Input,
+            grid: Grid {
+                columns: 1,
+                rows: 1,
+            },
+            pane_rects: Vec::new(),
+            content_rects: Vec::new(),
+            footer_rect: None,
+            mode_button_rect: None,
+            tx,
+            rx,
+            registry,
+            stopping: false,
+            pending_escape: None,
+        }
+    }
+
+    fn spawn_all(&mut self) {
+        for index in 0..self.tasks.len() {
+            self.spawn(index);
+        }
+    }
+
+    fn spawn(&mut self, index: usize) {
+        let size = self.tasks[index].pty_size;
+        if let Err(error) =
+            self.tasks[index].spawn(index, size, self.tx.clone(), Arc::clone(&self.registry))
+        {
+            self.tasks[index].record_spawn_error(&error);
+        }
+    }
+
+    fn update_layout(&mut self, terminal_area: Rect) {
+        let (pane_area, footer_rect) = if terminal_area.height > 3 {
+            (
+                Rect::new(
+                    terminal_area.x,
+                    terminal_area.y,
+                    terminal_area.width,
+                    terminal_area.height - 1,
+                ),
+                Some(Rect::new(
+                    terminal_area.x,
+                    terminal_area.bottom() - 1,
+                    terminal_area.width,
+                    1,
+                )),
+            )
+        } else {
+            (terminal_area, None)
+        };
+        self.footer_rect = footer_rect;
+        self.mode_button_rect = footer_rect.map(|footer| {
+            Rect::new(
+                footer.x,
+                footer.y,
+                footer.width.min(MODE_BUTTON_WIDTH),
+                footer.height,
+            )
+        });
+        self.grid = choose_grid(self.tasks.len(), pane_area);
+        self.pane_rects = pane_rects(pane_area, self.grid, self.tasks.len());
+        self.content_rects = self
+            .pane_rects
+            .iter()
+            .map(|rect| {
+                Rect::new(
+                    rect.x.saturating_add(1),
+                    rect.y.saturating_add(1),
+                    rect.width.saturating_sub(2),
+                    rect.height.saturating_sub(2),
+                )
+            })
+            .collect();
+
+        for (task, area) in self.tasks.iter_mut().zip(&self.content_rects) {
+            task.resize(area.width, area.height);
+        }
+    }
+
+    fn draw(&mut self, frame: &mut Frame<'_>) {
+        let frame_area = frame.area();
+        self.update_layout(frame_area);
+        let buffer = frame.buffer_mut();
+
+        for index in 0..self.tasks.len() {
+            let area = self.pane_rects[index];
+            let content = self.content_rects[index];
+            let focused = index == self.focus;
+            let border_color = match (focused, self.mode) {
+                (true, AppMode::Input) => Color::Cyan,
+                (true, AppMode::Command) => Color::Yellow,
+                _ => Color::DarkGray,
+            };
+            let (status, status_color) = self.tasks[index].status_label();
+            let title = Line::from(vec![
+                Span::raw(" "),
+                Span::styled(status, Style::default().fg(status_color)),
+                Span::raw(" "),
+                Span::styled(
+                    self.tasks[index].task.name.as_str(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+            ]);
+            let restart = Line::from(Span::styled(
+                " [↻] ",
+                Style::default().fg(if focused { Color::Yellow } else { Color::Gray }),
+            ))
+            .right_aligned();
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border_color))
+                .title(title)
+                .title(restart);
+            block.render(area, buffer);
+
+            render_screen(&self.tasks[index].parser, content, buffer);
+        }
+
+        if let (Some(footer_area), Some(button_area)) = (self.footer_rect, self.mode_button_rect) {
+            let help_area = Rect::new(
+                button_area.right(),
+                footer_area.y,
+                footer_area.width.saturating_sub(button_area.width),
+                1,
+            );
+            let (mode_label, mode_color, help) = match self.mode {
+                AppMode::Input => (
+                    "INPUT MODE",
+                    Color::Cyan,
+                    format!(
+                        " {} | {}: command mode ",
+                        self.tasks[self.focus].task.name,
+                        self.loaded.config.settings.leader.label()
+                    ),
+                ),
+                AppMode::Command => (
+                    "COMMAND MODE",
+                    Color::Yellow,
+                    format!(
+                        " arrows/hjkl: move | r: restart | R: all | c: clear | q: quit | {}: input ",
+                        self.loaded.config.settings.leader.label()
+                    ),
+                ),
+            };
+            Paragraph::new(mode_label)
+                .alignment(ratatui::layout::Alignment::Center)
+                .style(Style::default().fg(Color::Black).bg(mode_color))
+                .render(button_area, buffer);
+            Paragraph::new(help)
+                .style(Style::default().fg(Color::White).bg(Color::DarkGray))
+                .render(help_area, buffer);
+        }
+
+        if self.mode == AppMode::Input {
+            let task = &self.tasks[self.focus];
+            let area = self.content_rects[self.focus];
+            if task.scroll_offset == 0 && !task.parser.screen().hide_cursor() {
+                let (row, column) = task.parser.screen().cursor_position();
+                if row < area.height && column < area.width {
+                    frame.set_cursor_position((area.x + column, area.y + row));
+                }
+            }
+        }
+    }
+
+    fn handle_terminal_event(&mut self, event: Event) -> Result<Action> {
+        match event {
+            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                self.handle_key(key)
+            }
+            Event::Mouse(mouse) => self.handle_mouse(mouse),
+            Event::Paste(text) => {
+                if self.mode == AppMode::Input {
+                    let bracketed = self.tasks[self.focus].parser.screen().bracketed_paste();
+                    if bracketed {
+                        self.tasks[self.focus].write_input(b"\x1b[200~")?;
+                    }
+                    self.tasks[self.focus].write_input(text.as_bytes())?;
+                    if bracketed {
+                        self.tasks[self.focus].write_input(b"\x1b[201~")?;
+                    }
+                }
+                Ok(Action::Continue)
+            }
+            Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => Ok(Action::Continue),
+            _ => Ok(Action::Continue),
+        }
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> Result<Action> {
+        let leader = self.loaded.config.settings.leader;
+        if leader == Leader::AltJ {
+            if let Some(started) = self.pending_escape.take() {
+                if started.elapsed() <= ALT_ESCAPE_TIMEOUT && is_legacy_alt_j(key) {
+                    self.toggle_mode();
+                    return Ok(Action::Continue);
+                }
+                self.apply_escape()?;
+            }
+            if key.code == KeyCode::Esc && key.modifiers.is_empty() {
+                self.pending_escape = Some(Instant::now());
+                return Ok(Action::Continue);
+            }
+        }
+
+        if is_leader(key, leader) {
+            self.toggle_mode();
+            return Ok(Action::Continue);
+        }
+
+        if self.mode == AppMode::Input {
+            let application_cursor = self.tasks[self.focus].parser.screen().application_cursor();
+            let bytes = encode_key(key, application_cursor);
+            if !bytes.is_empty() {
+                self.tasks[self.focus].write_input(&bytes)?;
+            }
+            return Ok(Action::Continue);
+        }
+
+        match key.code {
+            KeyCode::Esc => self.mode = AppMode::Input,
+            KeyCode::Tab => self.cycle_focus(1),
+            KeyCode::BackTab => self.cycle_focus(-1),
+            KeyCode::Left | KeyCode::Char('h') => self.move_focus(Direction::Left),
+            KeyCode::Right | KeyCode::Char('l') => self.move_focus(Direction::Right),
+            KeyCode::Up | KeyCode::Char('k') => self.move_focus(Direction::Up),
+            KeyCode::Down | KeyCode::Char('j') => self.move_focus(Direction::Down),
+            KeyCode::Char('r') => self.request_restart(self.focus),
+            KeyCode::Char('R') => {
+                for index in 0..self.tasks.len() {
+                    self.request_restart(index);
+                }
+            }
+            KeyCode::Char('q') => return Ok(Action::Quit),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Ok(Action::Quit);
+            }
+            KeyCode::Char('c') => self.tasks[self.focus].clear(),
+            _ => {}
+        }
+        Ok(Action::Continue)
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<Action> {
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && self.mode_button_hit(mouse.column, mouse.row)
+        {
+            self.toggle_mode();
+            return Ok(Action::Continue);
+        }
+
+        let Some(index) = self.pane_at(mouse.column, mouse.row) else {
+            return Ok(Action::Continue);
+        };
+
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && self.restart_hit(index, mouse.column, mouse.row)
+        {
+            self.focus = index;
+            self.request_restart(index);
+            return Ok(Action::Continue);
+        }
+
+        if matches!(mouse.kind, MouseEventKind::Down(_)) {
+            self.focus = index;
+        }
+
+        let content = self.content_rects[index];
+        if !contains(content, mouse.column, mouse.row) {
+            return Ok(Action::Continue);
+        }
+
+        let mouse_mode = self.tasks[index].parser.screen().mouse_protocol_mode();
+        if self.mode == AppMode::Command || mouse_mode == MouseProtocolMode::None {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => self.tasks[index].scroll_up(3),
+                MouseEventKind::ScrollDown => self.tasks[index].scroll_down(3),
+                _ => {}
+            }
+            return Ok(Action::Continue);
+        }
+
+        if should_forward_mouse(mouse.kind, mouse_mode) {
+            let local_x = mouse.column - content.x + 1;
+            let local_y = mouse.row - content.y + 1;
+            let encoding = self.tasks[index].parser.screen().mouse_protocol_encoding();
+            let bytes = encode_mouse(mouse, local_x, local_y, encoding);
+            self.tasks[index].write_input(&bytes)?;
+        }
+        Ok(Action::Continue)
+    }
+
+    fn toggle_mode(&mut self) {
+        self.mode = match self.mode {
+            AppMode::Input => AppMode::Command,
+            AppMode::Command => AppMode::Input,
+        };
+    }
+
+    fn mode_button_hit(&self, x: u16, y: u16) -> bool {
+        self.mode_button_rect
+            .is_some_and(|rect| contains(rect, x, y))
+    }
+
+    fn pane_at(&self, x: u16, y: u16) -> Option<usize> {
+        self.pane_rects
+            .iter()
+            .position(|rect| contains(*rect, x, y))
+    }
+
+    fn restart_hit(&self, index: usize, x: u16, y: u16) -> bool {
+        let area = self.pane_rects[index];
+        area.width >= 5
+            && y == area.y
+            && x >= area.right().saturating_sub(4)
+            && x < area.right().saturating_sub(1)
+    }
+
+    fn cycle_focus(&mut self, delta: isize) {
+        let count = self.tasks.len() as isize;
+        self.focus = (self.focus as isize + delta).rem_euclid(count) as usize;
+    }
+
+    fn move_focus(&mut self, direction: Direction) {
+        let row = self.focus / self.grid.columns;
+        let column = self.focus % self.grid.columns;
+        let next = match direction {
+            Direction::Left if column > 0 => Some(self.focus - 1),
+            Direction::Right if column + 1 < self.grid.columns => Some(self.focus + 1),
+            Direction::Up if row > 0 => Some(self.focus - self.grid.columns),
+            Direction::Down => Some(self.focus + self.grid.columns),
+            _ => None,
+        };
+        if let Some(next) = next.filter(|index| *index < self.tasks.len()) {
+            self.focus = next;
+        }
+    }
+
+    fn request_restart(&mut self, index: usize) {
+        if self.stopping {
+            return;
+        }
+        if let Some(pid) = self.tasks[index].pid {
+            self.tasks[index].restart_requested = true;
+            self.tasks[index].kill_deadline = Some(Instant::now() + RESTART_GRACE);
+            self.tasks[index].status = TaskStatus::Restarting;
+            self.tasks[index].message("\r\n\x1b[33m[demons] restarting...\x1b[0m\r\n");
+            if signal_process_group(pid, libc::SIGTERM).is_err() {
+                self.tasks[index].kill_deadline = Some(Instant::now());
+            }
+        } else {
+            self.spawn(index);
+        }
+    }
+
+    fn drain_process_events(&mut self) -> bool {
+        let mut changed = false;
+        // Bound each pass so a process that writes continuously cannot starve
+        // keyboard input or screen redraws.
+        for _ in 0..256 {
+            let Ok(event) = self.rx.try_recv() else {
+                break;
+            };
+            self.apply_process_event(event);
+            changed = true;
+        }
+        changed
+    }
+
+    fn apply_process_event(&mut self, event: ProcessEvent) {
+        match event {
+            ProcessEvent::Output {
+                task,
+                generation,
+                bytes,
+            } if self.tasks[task].generation == generation => {
+                self.tasks[task].parser.process(&bytes);
+                let scroll_offset = self.tasks[task].scroll_offset;
+                if scroll_offset > 0 {
+                    self.tasks[task].parser.set_scrollback(scroll_offset);
+                }
+            }
+            ProcessEvent::Exited {
+                task,
+                generation,
+                status,
+            } if self.tasks[task].generation == generation => {
+                if let Some(pid) = self.tasks[task].pid.take() {
+                    registry_remove(&self.registry, pid);
+                }
+                self.tasks[task].master = None;
+                self.tasks[task].writer = None;
+                self.tasks[task].kill_deadline = None;
+                self.tasks[task].status = TaskStatus::Exited {
+                    code: status.exit_code(),
+                    success: status.success(),
+                    signal: status.signal().map(str::to_owned),
+                };
+                let reason = match status.signal() {
+                    Some(signal) => format!("signal {signal}"),
+                    None => format!("code {}", status.exit_code()),
+                };
+                self.tasks[task].message(&format!(
+                    "\r\n\x1b[90m[demons] process exited ({reason})\x1b[0m\r\n"
+                ));
+
+                if self.tasks[task].restart_requested && !self.stopping {
+                    self.tasks[task].restart_requested = false;
+                    self.spawn(task);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn tick(&mut self) -> Result<bool> {
+        let now = Instant::now();
+        let mut changed = false;
+        if self
+            .pending_escape
+            .is_some_and(|started| now.duration_since(started) >= ALT_ESCAPE_TIMEOUT)
+        {
+            self.pending_escape = None;
+            self.apply_escape()?;
+            changed = true;
+        }
+        for task in &mut self.tasks {
+            if task.kill_deadline.is_some_and(|deadline| deadline <= now) {
+                if let Some(pid) = task.pid {
+                    signal_process_group(pid, libc::SIGKILL).ok();
+                }
+                task.kill_deadline = None;
+                changed = true;
+            }
+        }
+        Ok(changed)
+    }
+
+    fn apply_escape(&mut self) -> Result<()> {
+        match self.mode {
+            AppMode::Input => self.tasks[self.focus].write_input(b"\x1b")?,
+            AppMode::Command => self.mode = AppMode::Input,
+        }
+        Ok(())
+    }
+
+    fn mark_stopping(&mut self) {
+        self.stopping = true;
+        for task in &mut self.tasks {
+            if task.pid.is_some() {
+                task.status = TaskStatus::Stopping;
+            }
+        }
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        self.stopping = true;
+        for task in &mut self.tasks {
+            task.restart_requested = false;
+            if let Some(pid) = task.pid {
+                signal_process_group(pid, libc::SIGTERM).ok();
+            }
+        }
+
+        let deadline = Instant::now() + SHUTDOWN_GRACE;
+        while self.tasks.iter().any(|task| task.pid.is_some()) && Instant::now() < deadline {
+            match self.rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(event) => self.apply_process_event(event),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+
+        for task in &self.tasks {
+            if let Some(pid) = task.pid {
+                signal_process_group(pid, libc::SIGKILL).ok();
+            }
+        }
+
+        while self.tasks.iter().any(|task| task.pid.is_some()) {
+            match self.rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(event) => self.apply_process_event(event),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    anyhow::bail!("timed out waiting for child processes to exit");
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        Ok(())
+    }
+}
+
+struct TaskRuntime {
+    task: Task,
+    cwd: PathBuf,
+    parser: Parser,
+    master: Option<Box<dyn MasterPty + Send>>,
+    writer: Option<Box<dyn Write + Send>>,
+    pid: Option<u32>,
+    status: TaskStatus,
+    generation: u64,
+    restart_requested: bool,
+    kill_deadline: Option<Instant>,
+    pty_size: PtySize,
+    scroll_offset: usize,
+}
+
+impl TaskRuntime {
+    fn new(task: Task, cwd: PathBuf) -> Self {
+        let pty_size = PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        Self {
+            task,
+            cwd,
+            parser: Parser::new(pty_size.rows, pty_size.cols, SCROLLBACK_LINES),
+            master: None,
+            writer: None,
+            pid: None,
+            status: TaskStatus::NotStarted,
+            generation: 0,
+            restart_requested: false,
+            kill_deadline: None,
+            pty_size,
+            scroll_offset: 0,
+        }
+    }
+
+    fn spawn(
+        &mut self,
+        task_index: usize,
+        size: PtySize,
+        tx: SyncSender<ProcessEvent>,
+        registry: ProcessRegistry,
+    ) -> Result<()> {
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
+        self.status = TaskStatus::Starting;
+        self.scroll_offset = 0;
+        self.parser.set_scrollback(0);
+
+        let pair = native_pty_system()
+            .openpty(size)
+            .with_context(|| format!("failed to open PTY for task {:?}", self.task.name))?;
+        let mut command = self.command_builder();
+        command.cwd(&self.cwd);
+        for (key, value) in &self.task.env {
+            command.env(key, value);
+        }
+
+        let mut child = pair
+            .slave
+            .spawn_command(command)
+            .with_context(|| format!("failed to spawn task {:?}", self.task.name))?;
+        let Some(pid) = child.process_id() else {
+            child.kill().ok();
+            child.wait().ok();
+            anyhow::bail!("spawned process did not report a process ID");
+        };
+        let mut reader = match pair.master.try_clone_reader() {
+            Ok(reader) => reader,
+            Err(error) => {
+                terminate_unmanaged_child(&mut child, pid);
+                return Err(error).context("failed to open PTY reader");
+            }
+        };
+        let writer = match pair.master.take_writer() {
+            Ok(writer) => writer,
+            Err(error) => {
+                terminate_unmanaged_child(&mut child, pid);
+                return Err(error).context("failed to open PTY writer");
+            }
+        };
+
+        let output_tx = tx.clone();
+        if let Err(error) = thread::Builder::new()
+            .name(format!("demons-output-{}", self.task.name))
+            .spawn(move || {
+                let mut buffer = [0_u8; 8192];
+                loop {
+                    match reader.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => {
+                            if output_tx
+                                .send(ProcessEvent::Output {
+                                    task: task_index,
+                                    generation,
+                                    bytes: buffer[..read].to_vec(),
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+            })
+        {
+            terminate_unmanaged_child(&mut child, pid);
+            return Err(error).context("failed to start PTY reader thread");
+        }
+
+        registry_insert(&registry, pid);
+        self.pid = Some(pid);
+        self.writer = Some(writer);
+        self.master = Some(pair.master);
+        self.status = TaskStatus::Running;
+
+        thread::Builder::new()
+            .name(format!("demons-wait-{}", self.task.name))
+            .spawn(move || {
+                let status = child
+                    .wait()
+                    .unwrap_or_else(|_| ExitStatus::with_exit_code(1));
+                registry_remove(&registry, pid);
+                tx.send(ProcessEvent::Exited {
+                    task: task_index,
+                    generation,
+                    status,
+                })
+                .ok();
+            })
+            .unwrap_or_else(|error| panic!("failed to start child wait thread: {error}"));
+        Ok(())
+    }
+
+    fn command_builder(&self) -> CommandBuilder {
+        match &self.task.command {
+            TaskCommand::Shell(command) => {
+                let shell = env::var_os("SHELL")
+                    .filter(|shell| !shell.is_empty())
+                    .unwrap_or_else(|| "/bin/sh".into());
+                let mut builder = CommandBuilder::new(shell);
+                builder.arg("-c");
+                builder.arg(command);
+                builder
+            }
+            TaskCommand::Direct(parts) => {
+                let mut builder = CommandBuilder::new(&parts[0]);
+                builder.args(&parts[1..]);
+                builder
+            }
+        }
+    }
+
+    fn resize(&mut self, columns: u16, rows: u16) {
+        let size = PtySize {
+            // vt100 0.15 can underflow while wrapping output on a one-cell
+            // screen. Tiny host terminals still need a valid backing screen.
+            rows: rows.max(2),
+            cols: columns.max(2),
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        if size.rows == self.pty_size.rows && size.cols == self.pty_size.cols {
+            return;
+        }
+        self.pty_size = size;
+        self.parser.set_size(size.rows, size.cols);
+        if let Some(master) = &self.master {
+            master.resize(size).ok();
+        }
+    }
+
+    fn write_input(&mut self, bytes: &[u8]) -> Result<()> {
+        let Some(writer) = self.writer.as_mut() else {
+            return Ok(());
+        };
+        let result = writer.write_all(bytes).and_then(|()| writer.flush());
+        if let Err(error) = result {
+            self.writer = None;
+            self.message(&format!(
+                "\r\n\x1b[31m[demons] task input closed: {error}\x1b[0m\r\n"
+            ));
+        }
+        Ok(())
+    }
+
+    fn clear(&mut self) {
+        self.parser = Parser::new(self.pty_size.rows, self.pty_size.cols, SCROLLBACK_LINES);
+        self.scroll_offset = 0;
+    }
+
+    fn scroll_up(&mut self, rows: usize) {
+        self.scroll_offset = self
+            .scroll_offset
+            .saturating_add(rows)
+            .min(SCROLLBACK_LINES);
+        self.parser.set_scrollback(self.scroll_offset);
+    }
+
+    fn scroll_down(&mut self, rows: usize) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(rows);
+        self.parser.set_scrollback(self.scroll_offset);
+    }
+
+    fn message(&mut self, message: &str) {
+        self.parser.set_scrollback(0);
+        self.scroll_offset = 0;
+        self.parser.process(message.as_bytes());
+    }
+
+    fn record_spawn_error(&mut self, error: &anyhow::Error) {
+        self.pid = None;
+        self.writer = None;
+        self.master = None;
+        self.status = TaskStatus::Failed;
+        self.message(&format!(
+            "\r\n\x1b[31m[demons] failed to start: {error:#}\x1b[0m\r\n"
+        ));
+    }
+
+    fn status_label(&self) -> (String, Color) {
+        match &self.status {
+            TaskStatus::NotStarted => ("⏸".to_owned(), Color::DarkGray),
+            TaskStatus::Starting => ("…".to_owned(), Color::Yellow),
+            TaskStatus::Running => ("●".to_owned(), Color::Green),
+            TaskStatus::Restarting => ("↻".to_owned(), Color::Yellow),
+            TaskStatus::Stopping => ("■".to_owned(), Color::Yellow),
+            TaskStatus::Failed => ("✗".to_owned(), Color::Red),
+            TaskStatus::Exited {
+                code,
+                success,
+                signal,
+            } => {
+                if *success {
+                    ("✓".to_owned(), Color::Green)
+                } else if let Some(signal) = signal {
+                    (format!("✗ {signal}"), Color::Red)
+                } else {
+                    (format!("✗ {code}"), Color::Red)
+                }
+            }
+        }
+    }
+}
+
+enum ProcessEvent {
+    Output {
+        task: usize,
+        generation: u64,
+        bytes: Vec<u8>,
+    },
+    Exited {
+        task: usize,
+        generation: u64,
+        status: ExitStatus,
+    },
+}
+
+#[derive(Clone, Debug)]
+enum TaskStatus {
+    NotStarted,
+    Starting,
+    Running,
+    Restarting,
+    Stopping,
+    Failed,
+    Exited {
+        code: u32,
+        success: bool,
+        signal: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppMode {
+    Input,
+    Command,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Action {
+    Continue,
+    Quit,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Direction {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+struct TerminalGuard {
+    active: bool,
+}
+
+impl TerminalGuard {
+    fn enter() -> Result<Self> {
+        enable_raw_mode().context("failed to enable raw terminal mode")?;
+        if let Err(error) = execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste
+        ) {
+            disable_raw_mode().ok();
+            return Err(error).context("failed to enter terminal UI");
+        }
+        Ok(Self { active: true })
+    }
+
+    fn restore(&mut self) {
+        if !self.active {
+            return;
+        }
+        disable_raw_mode().ok();
+        execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        )
+        .ok();
+        self.active = false;
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+fn install_panic_hook(registry: ProcessRegistry) {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic| {
+        let pids = registry
+            .lock()
+            .map(|pids| pids.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for pid in pids {
+            signal_process_group(pid, libc::SIGKILL).ok();
+        }
+        disable_raw_mode().ok();
+        execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        )
+        .ok();
+        previous(panic);
+    }));
+}
+
+fn register_shutdown_signals() -> Result<Arc<AtomicBool>> {
+    let requested = Arc::new(AtomicBool::new(false));
+    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        signal_hook::flag::register(signal, Arc::clone(&requested))
+            .with_context(|| format!("failed to register signal handler for {signal}"))?;
+    }
+    Ok(requested)
+}
+
+fn signal_process_group(pid: u32, signal: libc::c_int) -> io::Result<()> {
+    let result = unsafe { libc::kill(-(pid as libc::pid_t), signal) };
+    if result == 0 {
+        return Ok(());
+    }
+    let group_error = io::Error::last_os_error();
+    if group_error.raw_os_error() != Some(libc::ESRCH) {
+        return Err(group_error);
+    }
+
+    let result = unsafe { libc::kill(pid as libc::pid_t, signal) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn terminate_unmanaged_child(child: &mut Box<dyn Child + Send + Sync>, pid: u32) {
+    signal_process_group(pid, libc::SIGKILL).ok();
+    child.kill().ok();
+    child.wait().ok();
+}
+
+fn registry_insert(registry: &ProcessRegistry, pid: u32) {
+    if let Ok(mut pids) = registry.lock() {
+        pids.insert(pid);
+    }
+}
+
+fn registry_remove(registry: &ProcessRegistry, pid: u32) {
+    if let Ok(mut pids) = registry.lock() {
+        pids.remove(&pid);
+    }
+}
+
+fn render_screen(parser: &Parser, area: Rect, buffer: &mut Buffer) {
+    let screen = parser.screen();
+    for row in 0..area.height {
+        for column in 0..area.width {
+            let Some(source) = screen.cell(row, column) else {
+                continue;
+            };
+            if source.is_wide_continuation() {
+                continue;
+            }
+            let symbol = source.contents();
+            let symbol = if symbol.is_empty() { " " } else { &symbol };
+            buffer[(area.x + column, area.y + row)]
+                .set_symbol(symbol)
+                .set_style(cell_style(source));
+        }
+    }
+}
+
+fn cell_style(cell: &vt100::Cell) -> Style {
+    let mut style = Style::default();
+    if let Some(color) = terminal_color(cell.fgcolor()) {
+        style = style.fg(color);
+    }
+    if let Some(color) = terminal_color(cell.bgcolor()) {
+        style = style.bg(color);
+    }
+    if cell.bold() {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    if cell.italic() {
+        style = style.add_modifier(Modifier::ITALIC);
+    }
+    if cell.underline() {
+        style = style.add_modifier(Modifier::UNDERLINED);
+    }
+    if cell.inverse() {
+        style = style.add_modifier(Modifier::REVERSED);
+    }
+    style
+}
+
+fn terminal_color(color: vt100::Color) -> Option<Color> {
+    match color {
+        vt100::Color::Default => None,
+        vt100::Color::Idx(index) => Some(Color::Indexed(index)),
+        vt100::Color::Rgb(red, green, blue) => Some(Color::Rgb(red, green, blue)),
+    }
+}
+
+fn contains(rect: Rect, x: u16, y: u16) -> bool {
+    x >= rect.x && x < rect.right() && y >= rect.y && y < rect.bottom()
+}
+
+fn is_leader(key: KeyEvent, leader: Leader) -> bool {
+    match leader {
+        Leader::AltJ => {
+            matches!(key.code, KeyCode::Char('j' | 'J'))
+                && (key.modifiers == KeyModifiers::ALT
+                    || key.modifiers == KeyModifiers::ALT | KeyModifiers::SHIFT)
+        }
+        Leader::Tab => key.code == KeyCode::Tab && !key.modifiers.contains(KeyModifiers::CONTROL),
+        Leader::CtrlB => {
+            matches!(key.code, KeyCode::Char('b' | 'B'))
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+        }
+        Leader::CtrlQ => {
+            matches!(key.code, KeyCode::Char('q' | 'Q'))
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+        }
+        Leader::CtrlBackslash => {
+            key.code == KeyCode::Char('\\') && key.modifiers.contains(KeyModifiers::CONTROL)
+        }
+    }
+}
+
+fn is_legacy_alt_j(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('j' | 'J'))
+        && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+}
+
+fn encode_key(key: KeyEvent, application_cursor: bool) -> Vec<u8> {
+    let cursor_key = matches!(
+        key.code,
+        KeyCode::Up | KeyCode::Down | KeyCode::Right | KeyCode::Left | KeyCode::Home | KeyCode::End
+    );
+    let sequence = match key.code {
+        KeyCode::Char(character) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let upper = character.to_ascii_uppercase() as u32;
+            if (64..=95).contains(&upper) {
+                vec![(upper as u8) & 0x1f]
+            } else if character == '?' {
+                vec![0x7f]
+            } else if character == ' ' {
+                vec![0]
+            } else {
+                return Vec::new();
+            }
+        }
+        KeyCode::Char(character) => character.to_string().into_bytes(),
+        KeyCode::Enter => b"\r".to_vec(),
+        KeyCode::Backspace => vec![0x7f],
+        KeyCode::Tab => b"\t".to_vec(),
+        KeyCode::BackTab => b"\x1b[Z".to_vec(),
+        KeyCode::Esc => vec![0x1b],
+        KeyCode::Up => cursor_sequence(b'A', application_cursor, key.modifiers),
+        KeyCode::Down => cursor_sequence(b'B', application_cursor, key.modifiers),
+        KeyCode::Right => cursor_sequence(b'C', application_cursor, key.modifiers),
+        KeyCode::Left => cursor_sequence(b'D', application_cursor, key.modifiers),
+        KeyCode::Home => cursor_sequence(b'H', application_cursor, key.modifiers),
+        KeyCode::End => cursor_sequence(b'F', application_cursor, key.modifiers),
+        KeyCode::Insert => b"\x1b[2~".to_vec(),
+        KeyCode::Delete => b"\x1b[3~".to_vec(),
+        KeyCode::PageUp => b"\x1b[5~".to_vec(),
+        KeyCode::PageDown => b"\x1b[6~".to_vec(),
+        KeyCode::F(number) => function_key_sequence(number),
+        _ => Vec::new(),
+    };
+
+    if key.modifiers.contains(KeyModifiers::ALT) && !cursor_key && !sequence.is_empty() {
+        let mut with_alt = Vec::with_capacity(sequence.len() + 1);
+        with_alt.push(0x1b);
+        with_alt.extend(sequence);
+        with_alt
+    } else {
+        sequence
+    }
+}
+
+fn cursor_sequence(final_byte: u8, application_cursor: bool, modifiers: KeyModifiers) -> Vec<u8> {
+    let modifiers = modifiers & (KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL);
+    if modifiers.is_empty() {
+        return vec![
+            0x1b,
+            if application_cursor { b'O' } else { b'[' },
+            final_byte,
+        ];
+    }
+
+    let mut modifier = 1;
+    if modifiers.contains(KeyModifiers::SHIFT) {
+        modifier += 1;
+    }
+    if modifiers.contains(KeyModifiers::ALT) {
+        modifier += 2;
+    }
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        modifier += 4;
+    }
+    format!("\x1b[1;{modifier}{}", char::from(final_byte)).into_bytes()
+}
+
+fn function_key_sequence(number: u8) -> Vec<u8> {
+    match number {
+        1 => b"\x1bOP".to_vec(),
+        2 => b"\x1bOQ".to_vec(),
+        3 => b"\x1bOR".to_vec(),
+        4 => b"\x1bOS".to_vec(),
+        5 => b"\x1b[15~".to_vec(),
+        6 => b"\x1b[17~".to_vec(),
+        7 => b"\x1b[18~".to_vec(),
+        8 => b"\x1b[19~".to_vec(),
+        9 => b"\x1b[20~".to_vec(),
+        10 => b"\x1b[21~".to_vec(),
+        11 => b"\x1b[23~".to_vec(),
+        12 => b"\x1b[24~".to_vec(),
+        _ => Vec::new(),
+    }
+}
+
+fn should_forward_mouse(kind: MouseEventKind, mode: MouseProtocolMode) -> bool {
+    match kind {
+        MouseEventKind::Moved => mode == MouseProtocolMode::AnyMotion,
+        MouseEventKind::Drag(_) => matches!(
+            mode,
+            MouseProtocolMode::ButtonMotion | MouseProtocolMode::AnyMotion
+        ),
+        MouseEventKind::Up(_) => mode != MouseProtocolMode::Press,
+        _ => true,
+    }
+}
+
+fn encode_mouse(mouse: MouseEvent, x: u16, y: u16, encoding: MouseProtocolEncoding) -> Vec<u8> {
+    let base_code = match mouse.kind {
+        MouseEventKind::Down(button) | MouseEventKind::Up(button) => mouse_button_code(button),
+        MouseEventKind::Drag(button) => mouse_button_code(button) + 32,
+        MouseEventKind::Moved => 35,
+        MouseEventKind::ScrollUp => 64,
+        MouseEventKind::ScrollDown => 65,
+        MouseEventKind::ScrollLeft => 66,
+        MouseEventKind::ScrollRight => 67,
+    };
+    let mut modifier_code = 0;
+    if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+        modifier_code += 4;
+    }
+    if mouse.modifiers.contains(KeyModifiers::ALT) {
+        modifier_code += 8;
+    }
+    if mouse.modifiers.contains(KeyModifiers::CONTROL) {
+        modifier_code += 16;
+    }
+
+    if encoding == MouseProtocolEncoding::Sgr {
+        let code = base_code + modifier_code;
+        let final_byte = if matches!(mouse.kind, MouseEventKind::Up(_)) {
+            'm'
+        } else {
+            'M'
+        };
+        format!("\x1b[<{code};{x};{y}{final_byte}").into_bytes()
+    } else {
+        let code = if matches!(mouse.kind, MouseEventKind::Up(_)) {
+            3 + modifier_code
+        } else {
+            base_code + modifier_code
+        };
+        let values = [code + 32, u32::from(x) + 32, u32::from(y) + 32];
+        let mut bytes = b"\x1b[M".to_vec();
+        if encoding == MouseProtocolEncoding::Utf8 {
+            for value in values {
+                let character = char::from_u32(value).unwrap_or('\u{fffd}');
+                let mut encoded = [0_u8; 4];
+                bytes.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+            }
+        } else {
+            bytes.extend(values.map(|value| value.min(255) as u8));
+        }
+        bytes
+    }
+}
+
+fn mouse_button_code(button: MouseButton) -> u32 {
+    match button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeMap, path::PathBuf};
+
+    use crate::config::{Config, Settings};
+
+    use super::*;
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn recognizes_configured_leaders() {
+        assert!(is_leader(
+            key(KeyCode::Char('j'), KeyModifiers::ALT),
+            Leader::AltJ
+        ));
+        assert!(is_leader(
+            key(KeyCode::Char('J'), KeyModifiers::ALT | KeyModifiers::SHIFT),
+            Leader::AltJ
+        ));
+        assert!(!is_leader(
+            key(
+                KeyCode::Char('j'),
+                KeyModifiers::ALT | KeyModifiers::CONTROL
+            ),
+            Leader::AltJ
+        ));
+        assert!(is_leader(
+            key(KeyCode::Tab, KeyModifiers::NONE),
+            Leader::Tab
+        ));
+        assert!(is_leader(
+            key(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            Leader::CtrlB
+        ));
+        assert!(!is_leader(
+            key(KeyCode::Char('b'), KeyModifiers::NONE),
+            Leader::CtrlB
+        ));
+    }
+
+    #[test]
+    fn recognizes_legacy_escape_encoded_alt_j() {
+        let mut app = test_app();
+
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('j'), KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(app.mode, AppMode::Command);
+        assert!(app.pending_escape.is_none());
+    }
+
+    #[test]
+    fn encodes_basic_terminal_keys() {
+        assert_eq!(
+            encode_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), false),
+            vec![3]
+        );
+        assert_eq!(
+            encode_key(key(KeyCode::Up, KeyModifiers::NONE), false),
+            b"\x1b[A"
+        );
+        assert_eq!(
+            encode_key(key(KeyCode::Up, KeyModifiers::NONE), true),
+            b"\x1bOA"
+        );
+        assert_eq!(
+            encode_key(key(KeyCode::Left, KeyModifiers::CONTROL), false),
+            b"\x1b[1;5D"
+        );
+    }
+
+    #[test]
+    fn encodes_sgr_mouse_events() {
+        let event = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            encode_mouse(event, 3, 4, MouseProtocolEncoding::Sgr),
+            b"\x1b[<0;3;4M"
+        );
+    }
+
+    #[test]
+    fn encodes_utf8_mouse_coordinates() {
+        let event = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 100,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            encode_mouse(event, 100, 4, MouseProtocolEncoding::Utf8),
+            [b"\x1b[M".as_slice(), &[97], "\u{84}".as_bytes(), &[36]].concat()
+        );
+    }
+
+    #[test]
+    fn clear_blanks_the_visible_screen() {
+        let mut task = TaskRuntime::new(test_task("one"), PathBuf::from("."));
+        task.parser.process(b"visible output");
+        assert!(task.parser.screen().cell(0, 0).unwrap().has_contents());
+
+        task.clear();
+
+        assert!(!task.parser.screen().cell(0, 0).unwrap().has_contents());
+    }
+
+    #[test]
+    fn pane_clicks_preserve_mode_and_footer_button_toggles_it() {
+        let mut app = test_app();
+        app.update_layout(Rect::new(0, 0, 100, 20));
+        app.mode = AppMode::Command;
+
+        let second = app.content_rects[1];
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: second.x,
+            row: second.y,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+
+        assert_eq!(app.focus, 1);
+        assert_eq!(app.mode, AppMode::Command);
+
+        let button = app.mode_button_rect.unwrap();
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: button.x,
+            row: button.y,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+
+        assert_eq!(app.mode, AppMode::Input);
+    }
+
+    fn test_task(name: &str) -> Task {
+        Task {
+            name: name.to_owned(),
+            command: TaskCommand::Shell("echo ready".to_owned()),
+            cwd: PathBuf::from("."),
+            env: BTreeMap::new(),
+            watch: None,
+            run_on_change: None,
+            repeat: None,
+        }
+    }
+
+    fn test_app() -> App {
+        let loaded = LoadedConfig {
+            path: PathBuf::from("/tmp/demons.toml"),
+            root: PathBuf::from("."),
+            config: Config {
+                settings: Settings::default(),
+                tasks: vec![test_task("one"), test_task("two")],
+            },
+        };
+        let (tx, rx) = mpsc::sync_channel(8);
+        App::new(loaded, tx, rx, Arc::new(Mutex::new(HashSet::new())))
+    }
+}

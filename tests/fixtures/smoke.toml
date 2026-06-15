@@ -1,0 +1,19 @@
+[[task]]
+name = "restartable"
+command = """
+printf 'demon %s\n' "$PPID" >> /tmp/demons-smoke.log
+printf 'shell %s\n' "$$" >> /tmp/demons-smoke.log
+sleep 3600 &
+child=$!
+printf 'child %s\n' "$child" >> /tmp/demons-smoke.log
+trap 'exit 0' TERM INT
+wait "$child"
+"""
+
+[[task]]
+name = "ansi"
+command = [
+  "sh",
+  "-c",
+  "printf '\\033[31mred\\033[0m\\n'; trap 'exit 0' TERM INT; while :; do sleep 1; done",
+]
