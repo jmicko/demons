@@ -163,8 +163,16 @@ rendered.
 ## Development
 
 ```sh
-make test
-make build
+make test      # format, clippy, and tests
+make build     # release build
+```
+
+Before publishing or cutting a release, run the packaging check. It runs the
+full test suite and then validates `cargo package` in an isolated target
+directory so the workspace `target/` is never polluted by the package build:
+
+```sh
+make release-check
 ```
 
 See [SPEC.md](SPEC.md) for the v1 behavior and product boundaries.
