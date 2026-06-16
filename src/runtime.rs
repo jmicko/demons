@@ -753,18 +753,11 @@ impl TaskRuntime {
         }
 
         registry_insert(&registry, pid);
-        self.pid = Some(pid);
-        self.writer = Some(writer);
-        self.master = Some(pair.master);
-        self.status = TaskStatus::Running;
-
-        thread::Builder::new()
+        let child_guard = ChildGuard::new(child, pid, Arc::clone(&registry));
+        if let Err(error) = thread::Builder::new()
             .name(format!("demons-wait-{}", self.task.name))
             .spawn(move || {
-                let status = child
-                    .wait()
-                    .unwrap_or_else(|_| ExitStatus::with_exit_code(1));
-                registry_remove(&registry, pid);
+                let status = child_guard.wait();
                 tx.send(ProcessEvent::Exited {
                     task: task_index,
                     generation,
@@ -772,7 +765,14 @@ impl TaskRuntime {
                 })
                 .ok();
             })
-            .unwrap_or_else(|error| panic!("failed to start child wait thread: {error}"));
+        {
+            return Err(error).context("failed to start child wait thread");
+        }
+
+        self.pid = Some(pid);
+        self.writer = Some(writer);
+        self.master = Some(pair.master);
+        self.status = TaskStatus::Running;
         Ok(())
     }
 
@@ -1029,6 +1029,45 @@ fn terminate_unmanaged_child(child: &mut Box<dyn Child + Send + Sync>, pid: u32)
     signal_process_group(pid, libc::SIGKILL).ok();
     child.kill().ok();
     child.wait().ok();
+}
+
+struct ChildGuard {
+    child: Option<Box<dyn Child + Send + Sync>>,
+    pid: u32,
+    registry: ProcessRegistry,
+}
+
+impl ChildGuard {
+    fn new(child: Box<dyn Child + Send + Sync>, pid: u32, registry: ProcessRegistry) -> Self {
+        Self {
+            child: Some(child),
+            pid,
+            registry,
+        }
+    }
+
+    fn wait(mut self) -> ExitStatus {
+        let Some(mut child) = self.child.take() else {
+            registry_remove(&self.registry, self.pid);
+            return ExitStatus::with_exit_code(1);
+        };
+        let status = child
+            .wait()
+            .unwrap_or_else(|_| ExitStatus::with_exit_code(1));
+        registry_remove(&self.registry, self.pid);
+        status
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            signal_process_group(self.pid, libc::SIGKILL).ok();
+            child.kill().ok();
+            child.wait().ok();
+        }
+        registry_remove(&self.registry, self.pid);
+    }
 }
 
 fn registry_insert(registry: &ProcessRegistry, pid: u32) {
