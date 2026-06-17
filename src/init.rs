@@ -104,14 +104,14 @@ fn run_flow(
             )?;
             match choice.to_ascii_lowercase().as_str() {
                 "e" => break edit_config(input, output, config)?,
-                "f" => break new_config(input, output)?,
+                "f" => break new_config(input, output, config_root(&path))?,
                 "a" => {
                     return Ok(InitResult { path, start: false });
                 }
                 _ => writeln!(output, "Please choose E, F, or A.")?,
             }
         },
-        None => new_config(input, output)?,
+        None => new_config(input, output, config_root(&path))?,
     };
 
     validate_for_path(&config, &path)?;
@@ -128,10 +128,15 @@ fn run_flow(
     Ok(InitResult { path, start })
 }
 
-fn new_config(input: &mut impl PromptSource, output: &mut impl Write) -> Result<Config> {
+fn new_config(
+    input: &mut impl PromptSource,
+    output: &mut impl Write,
+    root: &Path,
+) -> Result<Config> {
     writeln!(output, "Create a demons configuration.\n")?;
     let settings = prompt_settings(input, output, &Settings::default())?;
-    let mut tasks = vec![prompt_task(input, output, None, 1)?];
+    let first_task = prompt_detected_task(input, output, detected_task_templates(root))?;
+    let mut tasks = vec![prompt_task(input, output, first_task.as_ref(), 1)?];
     while prompt_yes_no_with(input, output, "Add another task?", true)? {
         let number = tasks.len() + 1;
         tasks.push(prompt_task(input, output, None, number)?);
@@ -174,6 +179,87 @@ fn edit_config(
         bail!("a configuration must contain at least one task");
     }
     Ok(Config { settings, tasks })
+}
+
+fn config_root(path: &Path) -> &Path {
+    path.parent().unwrap_or_else(|| Path::new("."))
+}
+
+fn detected_task_templates(root: &Path) -> Vec<Task> {
+    let mut tasks = Vec::new();
+    if root.join("Cargo.toml").is_file() {
+        tasks.push(template_task("server", "cargo run"));
+    }
+
+    let package_json = root.join("package.json");
+    if package_json.is_file()
+        && fs::read_to_string(&package_json)
+            .map(|source| source.contains("\"dev\""))
+            .unwrap_or(false)
+    {
+        let command = if root.join("pnpm-lock.yaml").is_file() {
+            "pnpm run dev"
+        } else if root.join("yarn.lock").is_file() {
+            "yarn dev"
+        } else if root.join("bun.lock").is_file() || root.join("bun.lockb").is_file() {
+            "bun dev"
+        } else {
+            "npm run dev"
+        };
+        tasks.push(template_task("web", command));
+    }
+
+    if root.join("Makefile").is_file() || root.join("makefile").is_file() {
+        tasks.push(template_task("make", "make"));
+    }
+    tasks
+}
+
+fn template_task(name: &str, command: &str) -> Task {
+    Task {
+        name: name.to_owned(),
+        command: TaskCommand::Shell(command.to_owned()),
+        cwd: PathBuf::from("."),
+        env: BTreeMap::new(),
+        watch: None,
+        run_on_change: None,
+        repeat: None,
+    }
+}
+
+fn prompt_detected_task(
+    input: &mut impl PromptSource,
+    output: &mut impl Write,
+    tasks: Vec<Task>,
+) -> Result<Option<Task>> {
+    if tasks.is_empty() {
+        return Ok(None);
+    }
+
+    writeln!(output, "Detected task starters:")?;
+    for (index, task) in tasks.iter().enumerate() {
+        writeln!(
+            output,
+            "  {}. {} ({})",
+            index + 1,
+            task.name,
+            task.command.display()
+        )?;
+    }
+    writeln!(output, "  {}. Custom task", tasks.len() + 1)?;
+
+    loop {
+        let answer = prompt(input, output, "Choose first task", "1")?;
+        if let Ok(number) = answer.parse::<usize>() {
+            if (1..=tasks.len()).contains(&number) {
+                return Ok(Some(tasks[number - 1].clone()));
+            }
+            if number == tasks.len() + 1 {
+                return Ok(None);
+            }
+        }
+        writeln!(output, "Please choose one of the listed task starters.")?;
+    }
 }
 
 fn prompt_settings(
@@ -634,5 +720,28 @@ mod tests {
 
         let config = parse_file(&path).unwrap();
         assert_eq!(config.settings.leader, Leader::CtrlB);
+    }
+
+    #[test]
+    fn offers_detected_cargo_task_as_first_task_default() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\n",
+        )
+        .unwrap();
+        let path = temp.path().join(crate::config::CONFIG_FILE);
+        let answers = b"\n\n\n\n\n\n\nn\n\nn\n";
+        let mut input = Cursor::new(answers);
+        let mut output = Vec::new();
+
+        run_with_io(path.clone(), &mut input, &mut output).unwrap();
+
+        let config = parse_file(&path).unwrap();
+        assert_eq!(config.tasks[0].name, "server");
+        assert!(matches!(
+            config.tasks[0].command,
+            TaskCommand::Shell(ref command) if command == "cargo run"
+        ));
     }
 }

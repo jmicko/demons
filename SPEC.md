@@ -102,7 +102,11 @@ If stdin or stdout is not a TTY, `demons init` errors out: `init requires an int
 #### 4.3.1 New config (no file present)
 
 1. **Project settings** — `layout` and `leader`. Fixed options are selected from numbered choices. Reserved settings are not prompted.
-2. **First task** — name, command, cwd, env. (v1 skips `watch` / `run_on_change` / `repeat`; the wizard will add them in v2.) Each shows a default (cwd default: `.`; env: skip).
+2. **First task** — if common project files are detected, offer starter task
+   defaults such as `cargo run`, a package-manager `dev` script, or `make`.
+   Then prompt for name, command, cwd, and env. (v1 skips `watch` /
+   `run_on_change` / `repeat`; the wizard will add them in v2.) Each shows a
+   default (cwd default: `.`; env: skip).
 3. **Add another task?** `[Y/n]`. If yes, loop to step 2.
 4. **Review** — print the resulting `demons.toml` and ask `Write to ./demons.toml? [Y/n]`. On yes, write. On no, exit without writing.
 5. **Next step** — print `Run 'demons' to start.` and prompt `Start demons now? [Y/n]`. On yes, start the just-written config.
