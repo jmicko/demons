@@ -329,11 +329,7 @@ impl App {
                 .as_ref()
                 .filter(|_| self.mode == AppMode::Search)
             {
-                (
-                    "SEARCH",
-                    Color::Magenta,
-                    format!(" /{}  Enter: jump | Esc: cancel ", search.query),
-                )
+                ("SEARCH", Color::Magenta, search_footer_text(search))
             } else if let Some(notice) = self.active_notice(Instant::now()) {
                 let mode_label = match self.mode {
                     AppMode::Input => "INPUT MODE",
@@ -2402,6 +2398,13 @@ fn search_needle(query: &str) -> Option<String> {
     (!needle.is_empty()).then_some(needle)
 }
 
+fn search_footer_text(search: &SearchState) -> String {
+    let mut query = search.query.clone();
+    let cursor = byte_index_for_char(&query, search.cursor);
+    query.insert(cursor, '|');
+    format!(" /{query}  Enter: jump | Esc: cancel ")
+}
+
 #[cfg(test)]
 fn write_osc52_clipboard(_text: &str) -> io::Result<()> {
     Ok(())
@@ -2872,6 +2875,20 @@ mod tests {
         assert_eq!(history.find_line_before("error", 2), Some(1));
         assert_eq!(history.find_line_after("error", 1), Some(2));
         assert_eq!(history.find_last_line("missing"), None);
+    }
+
+    #[test]
+    fn search_footer_marks_the_edit_cursor() {
+        let search = SearchState {
+            pane: 0,
+            query: "eror".to_owned(),
+            cursor: 2,
+        };
+
+        assert_eq!(
+            search_footer_text(&search),
+            " /er|or  Enter: jump | Esc: cancel "
+        );
     }
 
     #[test]
