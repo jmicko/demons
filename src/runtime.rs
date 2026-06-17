@@ -601,6 +601,14 @@ impl App {
                 }
                 true
             }
+            MouseEventKind::ScrollUp => {
+                self.scroll_selection_from_mouse(mouse.column, mouse.row, true);
+                true
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll_selection_from_mouse(mouse.column, mouse.row, false);
+                true
+            }
             _ => true,
         }
     }
@@ -619,6 +627,30 @@ impl App {
         };
         if let Some(selection) = self.selection.as_mut() {
             selection.cursor = point;
+        }
+    }
+
+    fn scroll_selection_from_mouse(&mut self, x: u16, y: u16, up: bool) {
+        let Some(pane) = self.selection.as_ref().map(|selection| selection.pane) else {
+            return;
+        };
+        if let Some(selection) = self.selection.as_mut() {
+            selection.last_mouse = Some((x, y));
+            selection.dragged = true;
+        }
+        let changed = if up {
+            self.tasks[pane].scroll_up(3)
+        } else {
+            self.tasks[pane].scroll_down(3)
+        };
+        if changed {
+            let Some(point) = self.selection_point_for_mouse(pane, x, y) else {
+                return;
+            };
+            if let Some(selection) = self.selection.as_mut() {
+                selection.cursor = point;
+                selection.last_scroll = Instant::now();
+            }
         }
     }
 
@@ -2356,6 +2388,41 @@ mod tests {
         assert_eq!(app.selection.as_ref().unwrap().pane, 0);
         assert!(app.tasks[0].scroll_offset > 0);
         assert_eq!(app.tasks[1].scroll_offset, 0);
+    }
+
+    #[test]
+    fn wheel_during_selection_scrolls_original_pane() {
+        let mut app = test_app();
+        app.update_layout(Rect::new(0, 0, 100, 20));
+        for line in 0..40 {
+            app.tasks[0].process_output(format!("line {line}\n").as_bytes());
+        }
+
+        let first = app.content_rects[0];
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: first.x,
+            row: first.bottom() - 1,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: first.x + 2,
+            row: first.bottom() - 1,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: first.x + 2,
+            row: first.y,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+
+        assert_eq!(app.selection.as_ref().unwrap().pane, 0);
+        assert!(app.tasks[0].scroll_offset > 0);
     }
 
     #[test]
