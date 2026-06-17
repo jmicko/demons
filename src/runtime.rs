@@ -337,10 +337,7 @@ impl App {
                 .alignment(ratatui::layout::Alignment::Center)
                 .style(Style::default().fg(Color::Black).bg(mode_color))
                 .render(button_area, buffer);
-            Paragraph::new(help)
-                .style(Style::default().fg(Color::White).bg(Color::DarkGray))
-                .wrap(Wrap { trim: false })
-                .render(help_area, buffer);
+            render_footer_text(&help, help_area, buffer);
         }
 
         if self.show_help {
@@ -1307,7 +1304,7 @@ impl App {
             return 1;
         }
         let (_, _, help) = self.footer_parts(Instant::now());
-        let line_count = wrapped_line_count(&help, help_width);
+        let line_count = footer_line_count(&help, help_width);
         line_count.min(terminal_height.saturating_sub(3).max(1))
     }
 
@@ -2444,6 +2441,46 @@ fn render_selection(
     }
 }
 
+fn render_footer_text(text: &str, area: Rect, buffer: &mut Buffer) {
+    for row in 0..area.height {
+        for column in 0..area.width {
+            buffer[(area.x + column, area.y + row)]
+                .set_symbol(" ")
+                .set_style(Style::default().fg(Color::White).bg(Color::DarkGray));
+        }
+    }
+
+    let mut row = 0_u16;
+    let mut column = 0_u16;
+    for chunk in footer_chunks(text, area.width) {
+        if row >= area.height {
+            break;
+        }
+        if column > 0 && column.saturating_add(chunk.width) > area.width {
+            row += 1;
+            column = 0;
+        }
+        if row >= area.height {
+            break;
+        }
+
+        for character in chunk.text.chars() {
+            if column >= area.width {
+                row += 1;
+                column = 0;
+                if row >= area.height {
+                    break;
+                }
+            }
+            let mut encoded = [0_u8; 4];
+            buffer[(area.x + column, area.y + row)]
+                .set_symbol(character.encode_utf8(&mut encoded))
+                .set_style(Style::default().fg(Color::White).bg(Color::DarkGray));
+            column += 1;
+        }
+    }
+}
+
 fn render_command_help(area: Rect, buffer: &mut Buffer, leader: &str) {
     let popup = command_help_rect(area);
     if popup.width == 0 || popup.height == 0 {
@@ -2652,12 +2689,65 @@ fn search_footer_text(search: &SearchState) -> String {
     format!(" /{query}  Enter: jump | Esc: cancel ")
 }
 
-fn wrapped_line_count(text: &str, width: u16) -> u16 {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FooterChunk {
+    text: String,
+    width: u16,
+}
+
+fn footer_chunks(text: &str, width: u16) -> Vec<FooterChunk> {
     let width = usize::from(width.max(1));
-    let mut lines = 0_u16;
-    for line in text.split('\n') {
-        let chars = char_count(line).max(1);
-        lines = lines.saturating_add(chars.div_ceil(width).min(usize::from(u16::MAX)) as u16);
+    if text.contains(" | ") {
+        return text
+            .trim()
+            .split(" | ")
+            .enumerate()
+            .flat_map(|(index, segment)| {
+                let prefix = if index == 0 { " " } else { " | " };
+                split_footer_chunk(&format!("{prefix}{segment}"), width)
+            })
+            .collect();
+    }
+
+    split_footer_chunk(text, width)
+}
+
+fn split_footer_chunk(text: &str, width: usize) -> Vec<FooterChunk> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for character in text.chars() {
+        if char_count(&current) >= width {
+            chunks.push(FooterChunk {
+                width: char_count(&current).min(usize::from(u16::MAX)) as u16,
+                text: std::mem::take(&mut current),
+            });
+        }
+        current.push(character);
+    }
+    if !current.is_empty() || chunks.is_empty() {
+        chunks.push(FooterChunk {
+            width: char_count(&current).min(usize::from(u16::MAX)) as u16,
+            text: current,
+        });
+    }
+    chunks
+}
+
+fn footer_line_count(text: &str, width: u16) -> u16 {
+    let mut lines = 1_u16;
+    let mut column = 0_u16;
+    for chunk in footer_chunks(text, width) {
+        if column > 0 && column.saturating_add(chunk.width) > width {
+            lines = lines.saturating_add(1);
+            column = 0;
+        }
+        if chunk.width > width {
+            let extra = chunk.width.saturating_sub(1) / width.max(1);
+            lines = lines.saturating_add(extra);
+            column = chunk.width % width.max(1);
+        } else {
+            column = column.saturating_add(chunk.width);
+        }
     }
     lines.max(1)
 }
@@ -3197,6 +3287,15 @@ mod tests {
 
         assert_eq!(app.footer_height(240, 24), 1);
         assert!(app.footer_height(45, 24) > 1);
+    }
+
+    #[test]
+    fn footer_chunks_keep_commands_together() {
+        let chunks = footer_chunks(" a: one | ?: help | q: quit ", 80);
+
+        assert!(chunks.iter().any(|chunk| chunk.text == " | ?: help"));
+        assert!(!chunks.iter().any(|chunk| chunk.text == "?:"));
+        assert_eq!(footer_line_count(" a: one | ?: help | q: quit ", 14), 3);
     }
 
     #[test]
