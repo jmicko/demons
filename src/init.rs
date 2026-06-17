@@ -750,4 +750,24 @@ mod tests {
             TaskCommand::Shell(ref command) if command == "cargo run"
         ));
     }
+
+    #[test]
+    fn detects_package_manager_dev_script_starter() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("package.json"),
+            r#"{"scripts":{"dev":"vite"}}"#,
+        )
+        .unwrap();
+        fs::write(temp.path().join("pnpm-lock.yaml"), "").unwrap();
+
+        let templates = detected_task_templates(temp.path());
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].name, "web");
+        assert!(matches!(
+            templates[0].command,
+            TaskCommand::Shell(ref command) if command == "pnpm run dev"
+        ));
+    }
 }
