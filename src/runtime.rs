@@ -130,6 +130,7 @@ struct App {
     notice: Option<Notice>,
     fullscreen: bool,
     search: Option<SearchState>,
+    last_search: Option<String>,
 }
 
 impl App {
@@ -172,6 +173,7 @@ impl App {
             notice: None,
             fullscreen: false,
             search: None,
+            last_search: None,
         }
     }
 
@@ -359,7 +361,7 @@ impl App {
                         "COMMAND MODE",
                         Color::Yellow,
                         format!(
-                            " arrows/hjkl: move | f: fullscreen | y/Y: copy | r: restart | R: all | c: clear | q: quit | {}: input ",
+                            " arrows/hjkl: move | f: fullscreen | / n/N: find | y/Y: copy | r: restart | R: all | c: clear | q: quit | {}: input ",
                             self.loaded.config.settings.leader.label()
                         ),
                     ),
@@ -478,6 +480,8 @@ impl App {
             }
             KeyCode::Char('f') => self.fullscreen = !self.fullscreen,
             KeyCode::Char('/') => self.start_search(),
+            KeyCode::Char('n') => self.repeat_search(SearchDirection::Older),
+            KeyCode::Char('N') => self.repeat_search(SearchDirection::Newer),
             KeyCode::Char('y') => self.copy_focused_visible(),
             KeyCode::Char('Y') => self.copy_focused_history(),
             KeyCode::Char('r') => self.request_restart(self.focus),
@@ -584,33 +588,83 @@ impl App {
             return;
         };
         self.mode = AppMode::Command;
-        let query = search.query.trim();
+        let query = search.query.trim().to_owned();
         if query.is_empty() {
             self.set_notice("Search cancelled.".to_owned());
             return;
         }
 
-        let Some(line) = self.tasks[search.pane].history.find_last_line(query) else {
+        let Some(line) = self.tasks[search.pane].history.find_last_line(&query) else {
             self.set_notice(format!("No matches for {query:?}."));
             return;
         };
 
-        self.focus = search.pane;
+        self.last_search = Some(query.clone());
+        self.jump_to_search_line(search.pane, line, &query);
+    }
+
+    fn repeat_search(&mut self, direction: SearchDirection) {
+        let Some(query) = self.last_search.clone() else {
+            self.set_notice("No previous search.".to_owned());
+            return;
+        };
+        let pane = self.focus;
+        let current_line = self.search_anchor_line(pane);
+        let history = &self.tasks[pane].history;
+        let line = match direction {
+            SearchDirection::Older => history
+                .find_line_before(&query, current_line)
+                .or_else(|| history.find_last_line(&query)),
+            SearchDirection::Newer => history
+                .find_line_after(&query, current_line)
+                .or_else(|| history.find_first_line(&query)),
+        };
+        let Some(line) = line else {
+            self.set_notice(format!("No matches for {query:?}."));
+            return;
+        };
+
+        self.jump_to_search_line(pane, line, &query);
+    }
+
+    fn search_anchor_line(&self, pane: usize) -> u64 {
+        if let Some(selection) = self
+            .selection
+            .as_ref()
+            .filter(|selection| selection.pane == pane)
+        {
+            return selection.ordered_points().0.line;
+        }
+
         let height = self
             .content_rects
-            .get(search.pane)
+            .get(pane)
             .map(|rect| rect.height)
-            .unwrap_or(self.tasks[search.pane].pty_size.rows);
-        self.tasks[search.pane].scroll_to_history_line(line, height);
+            .unwrap_or(self.tasks[pane].pty_size.rows);
+        self.tasks[pane]
+            .history
+            .visible_start(height, self.tasks[pane].scroll_offset)
+            .saturating_add(u64::from(height / 2))
+            .min(self.tasks[pane].history.line_count().saturating_sub(1))
+    }
 
-        let end_column = self.tasks[search.pane]
+    fn jump_to_search_line(&mut self, pane: usize, line: u64, query: &str) {
+        self.focus = pane;
+        let height = self
+            .content_rects
+            .get(pane)
+            .map(|rect| rect.height)
+            .unwrap_or(self.tasks[pane].pty_size.rows);
+        self.tasks[pane].scroll_to_history_line(line, height);
+
+        let end_column = self.tasks[pane]
             .history
             .line_char_count(line)
             .unwrap_or(1)
             .saturating_sub(1)
             .min(usize::from(u16::MAX)) as u16;
         self.selection = Some(Selection {
-            pane: search.pane,
+            pane,
             anchor: SelectionPoint { line, column: 0 },
             cursor: SelectionPoint {
                 line,
@@ -623,7 +677,7 @@ impl App {
         });
         self.set_notice(format!(
             "Found {query:?} in {}.",
-            self.tasks[search.pane].task.name
+            self.tasks[pane].task.name
         ));
     }
 
@@ -1940,21 +1994,43 @@ impl TextHistory {
     }
 
     fn find_last_line(&self, query: &str) -> Option<u64> {
-        let needle = query.to_ascii_lowercase();
-        if needle.is_empty() {
-            return None;
-        }
+        let needle = search_needle(query)?;
 
         (self.first_index..self.line_count())
             .rev()
-            .find(|line_index| {
-                self.line(*line_index)
-                    .is_some_and(|line| line.text.to_ascii_lowercase().contains(needle.as_str()))
-            })
+            .find(|line_index| self.line_matches(*line_index, &needle))
+    }
+
+    fn find_first_line(&self, query: &str) -> Option<u64> {
+        let needle = search_needle(query)?;
+
+        (self.first_index..self.line_count())
+            .find(|line_index| self.line_matches(*line_index, &needle))
+    }
+
+    fn find_line_before(&self, query: &str, before: u64) -> Option<u64> {
+        let needle = search_needle(query)?;
+        let end = before.min(self.line_count());
+
+        (self.first_index..end)
+            .rev()
+            .find(|line_index| self.line_matches(*line_index, &needle))
+    }
+
+    fn find_line_after(&self, query: &str, after: u64) -> Option<u64> {
+        let needle = search_needle(query)?;
+        let start = after.saturating_add(1).max(self.first_index);
+
+        (start..self.line_count()).find(|line_index| self.line_matches(*line_index, &needle))
     }
 
     fn line_char_count(&self, index: u64) -> Option<usize> {
         self.line(index).map(|line| char_count(&line.text))
+    }
+
+    fn line_matches(&self, index: u64, needle: &str) -> bool {
+        self.line(index)
+            .is_some_and(|line| line.text.to_ascii_lowercase().contains(needle))
     }
 }
 
@@ -1998,6 +2074,12 @@ struct SearchState {
     pane: usize,
     query: String,
     cursor: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SearchDirection {
+    Older,
+    Newer,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2313,6 +2395,11 @@ fn first_csi_param(value: &str) -> Option<usize> {
             !param.is_empty() && param.chars().all(|character| character.is_ascii_digit())
         })
         .and_then(|param| param.parse().ok())
+}
+
+fn search_needle(query: &str) -> Option<String> {
+    let needle = query.trim().to_ascii_lowercase();
+    (!needle.is_empty()).then_some(needle)
 }
 
 #[cfg(test)]
@@ -2780,7 +2867,10 @@ mod tests {
         let mut history = TextHistory::new(80, 100);
         history.process(b"alpha\nerror one\nERROR two\n");
 
+        assert_eq!(history.find_first_line("error"), Some(1));
         assert_eq!(history.find_last_line("error"), Some(2));
+        assert_eq!(history.find_line_before("error", 2), Some(1));
+        assert_eq!(history.find_line_after("error", 1), Some(2));
         assert_eq!(history.find_last_line("missing"), None);
     }
 
@@ -3064,6 +3154,46 @@ mod tests {
                 .as_ref()
                 .is_some_and(|notice| notice.text.contains("No matches"))
         );
+    }
+
+    #[test]
+    fn command_mode_repeats_previous_search_with_wraparound() {
+        let mut app = test_app();
+        app.update_layout(Rect::new(0, 0, 100, 8));
+        app.mode = AppMode::Command;
+        for line in 0..35 {
+            if matches!(line, 5 | 15 | 25) {
+                app.tasks[0].process_output(format!("error {line}\n").as_bytes());
+            } else {
+                app.tasks[0].process_output(format!("line {line}\n").as_bytes());
+            }
+        }
+
+        app.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE))
+            .unwrap();
+        for character in "error".chars() {
+            app.handle_key(key(KeyCode::Char(character), KeyModifiers::NONE))
+                .unwrap();
+        }
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.selected_text().unwrap(), "error 25");
+
+        app.handle_key(key(KeyCode::Char('n'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.selected_text().unwrap(), "error 15");
+
+        app.handle_key(key(KeyCode::Char('n'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.selected_text().unwrap(), "error 5");
+
+        app.handle_key(key(KeyCode::Char('n'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.selected_text().unwrap(), "error 25");
+
+        app.handle_key(key(KeyCode::Char('N'), KeyModifiers::SHIFT))
+            .unwrap();
+        assert_eq!(app.selected_text().unwrap(), "error 5");
     }
 
     #[test]

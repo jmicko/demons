@@ -215,6 +215,7 @@ The configured leader key (default `Alt+J`) toggles between two modes.
 - `Y`: copy the focused pane's full scrollback.
 - `/`: search the focused pane's scrollback and jump to the newest matching
   line.
+- `n` / `N`: repeat the previous search older / newer in the focused pane.
 - `r`: restart focused pane.
 - `R`: restart all panes.
 - `c`: clear the focused pane and its scrollback.

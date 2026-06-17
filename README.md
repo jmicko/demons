@@ -94,6 +94,7 @@ changing modes.
 | `y` | Copy the focused pane's visible text |
 | `Y` | Copy the focused pane's full scrollback |
 | `/` | Search the focused pane's scrollback |
+| `n` / `N` | Repeat the previous search older / newer |
 | `r` | Restart the focused task |
 | `R` | Restart every task |
 | `c` | Clear the focused pane and its scrollback |
@@ -115,7 +116,8 @@ input mode.
 
 In command mode, `y` copies the focused pane's visible text and `Y` copies its
 full scrollback. `/` opens a focused-pane search prompt; press Enter to jump to
-the newest matching history line or Esc to cancel.
+the newest matching history line or Esc to cancel. After a search, `n` jumps to
+the next older match and `N` jumps newer.
 
 Because the leader is intercepted, it cannot be sent to a child while in input
 mode. Set a different leader if an application or window manager needs
