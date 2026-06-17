@@ -2369,6 +2369,9 @@ fn render_selection(
 
 fn render_command_help(area: Rect, buffer: &mut Buffer, leader: &str) {
     let popup = centered_rect(area, 74, 16);
+    if popup.width == 0 || popup.height == 0 {
+        return;
+    }
     Clear.render(popup, buffer);
     let lines = vec![
         Line::styled(
@@ -2405,6 +2408,9 @@ fn render_command_help(area: Rect, buffer: &mut Buffer, leader: &str) {
 }
 
 fn centered_rect(area: Rect, preferred_width: u16, preferred_height: u16) -> Rect {
+    if area.width == 0 || area.height == 0 {
+        return Rect::new(area.x, area.y, 0, 0);
+    }
     let width = preferred_width.min(area.width.saturating_sub(2)).max(1);
     let height = preferred_height.min(area.height.saturating_sub(2)).max(1);
     Rect::new(
@@ -2990,6 +2996,10 @@ mod tests {
         assert_eq!(
             centered_rect(Rect::new(0, 0, 10, 5), 74, 16),
             Rect::new(1, 1, 8, 3)
+        );
+        assert_eq!(
+            centered_rect(Rect::new(0, 0, 0, 0), 74, 16),
+            Rect::new(0, 0, 0, 0)
         );
     }
 
