@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     env,
     io::{self, Read, Stdout, Write},
     path::PathBuf,
@@ -45,6 +45,8 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const EVENT_INTERVAL: Duration = Duration::from_millis(25);
 const ALT_ESCAPE_TIMEOUT: Duration = Duration::from_millis(50);
 const MODE_BUTTON_WIDTH: u16 = 13;
+const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(45);
+const NOTICE_DURATION: Duration = Duration::from_secs(3);
 
 type ProcessRegistry = Arc<Mutex<HashSet<u32>>>;
 
@@ -122,6 +124,9 @@ struct App {
     registry: ProcessRegistry,
     stopping: bool,
     pending_escape: Option<Instant>,
+    selection: Option<Selection>,
+    clipboard: String,
+    notice: Option<Notice>,
 }
 
 impl App {
@@ -159,6 +164,9 @@ impl App {
             registry,
             stopping: false,
             pending_escape: None,
+            selection: None,
+            clipboard: String::new(),
+            notice: None,
         }
     }
 
@@ -262,7 +270,19 @@ impl App {
                 .title(restart);
             block.render(area, buffer);
 
-            render_screen(&self.tasks[index].parser, content, buffer);
+            if self.tasks[index].scroll_offset == 0 {
+                render_screen(&self.tasks[index].parser, content, buffer);
+            } else {
+                render_history(&self.tasks[index], content, buffer);
+            }
+            render_selection(
+                self.selection
+                    .as_ref()
+                    .filter(|selection| selection.pane == index && selection.dragged),
+                &self.tasks[index],
+                content,
+                buffer,
+            );
         }
 
         if let (Some(footer_area), Some(button_area)) = (self.footer_rect, self.mode_button_rect) {
@@ -272,24 +292,38 @@ impl App {
                 footer_area.width.saturating_sub(button_area.width),
                 1,
             );
-            let (mode_label, mode_color, help) = match self.mode {
-                AppMode::Input => (
-                    "INPUT MODE",
-                    Color::Cyan,
-                    format!(
-                        " {} | {}: command mode ",
-                        self.tasks[self.focus].task.name,
-                        self.loaded.config.settings.leader.label()
+            let (mode_label, mode_color, help) = if let Some(notice) =
+                self.active_notice(Instant::now())
+            {
+                let mode_label = match self.mode {
+                    AppMode::Input => "INPUT MODE",
+                    AppMode::Command => "COMMAND MODE",
+                };
+                let mode_color = match self.mode {
+                    AppMode::Input => Color::Cyan,
+                    AppMode::Command => Color::Yellow,
+                };
+                (mode_label, mode_color, format!(" {notice} "))
+            } else {
+                match self.mode {
+                    AppMode::Input => (
+                        "INPUT MODE",
+                        Color::Cyan,
+                        format!(
+                            " {} | {}: command mode | drag: select | right-click/Ctrl-Shift-C: copy ",
+                            self.tasks[self.focus].task.name,
+                            self.loaded.config.settings.leader.label()
+                        ),
                     ),
-                ),
-                AppMode::Command => (
-                    "COMMAND MODE",
-                    Color::Yellow,
-                    format!(
-                        " arrows/hjkl: move | r: restart | R: all | c: clear | q: quit | {}: input ",
-                        self.loaded.config.settings.leader.label()
+                    AppMode::Command => (
+                        "COMMAND MODE",
+                        Color::Yellow,
+                        format!(
+                            " arrows/hjkl: move | r: restart | R: all | c: clear | q: quit | {}: input ",
+                            self.loaded.config.settings.leader.label()
+                        ),
                     ),
-                ),
+                }
             };
             Paragraph::new(mode_label)
                 .alignment(ratatui::layout::Alignment::Center)
@@ -320,14 +354,7 @@ impl App {
             Event::Mouse(mouse) => self.handle_mouse(mouse),
             Event::Paste(text) => {
                 if self.mode == AppMode::Input {
-                    let bracketed = self.tasks[self.focus].parser.screen().bracketed_paste();
-                    if bracketed {
-                        self.tasks[self.focus].write_input(b"\x1b[200~")?;
-                    }
-                    self.tasks[self.focus].write_input(text.as_bytes())?;
-                    if bracketed {
-                        self.tasks[self.focus].write_input(b"\x1b[201~")?;
-                    }
+                    self.paste_text_to_task(self.focus, &text)?;
                 }
                 Ok(Action::Continue)
             }
@@ -337,6 +364,15 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<Action> {
+        if is_copy_key(key) {
+            self.copy_selection();
+            return Ok(Action::Continue);
+        }
+        if is_paste_key(key) {
+            self.paste_clipboard_to_focus()?;
+            return Ok(Action::Continue);
+        }
+
         let leader = self.loaded.config.settings.leader;
         if leader == Leader::AltJ {
             if let Some(started) = self.pending_escape.take() {
@@ -367,6 +403,7 @@ impl App {
         }
 
         match key.code {
+            KeyCode::Esc if self.selection.is_some() => self.selection = None,
             KeyCode::Esc => self.mode = AppMode::Input,
             KeyCode::Tab => self.cycle_focus(1),
             KeyCode::BackTab => self.cycle_focus(-1),
@@ -398,6 +435,14 @@ impl App {
             return Ok(Action::Continue);
         }
 
+        if self.handle_selection_drag(mouse) {
+            return Ok(Action::Continue);
+        }
+
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) && self.copy_selection() {
+            return Ok(Action::Continue);
+        }
+
         let Some(index) = self.pane_at(mouse.column, mouse.row) else {
             return Ok(Action::Continue);
         };
@@ -406,6 +451,7 @@ impl App {
             && self.restart_hit(index, mouse.column, mouse.row)
         {
             self.focus = index;
+            self.selection = None;
             self.request_restart(index);
             return Ok(Action::Continue);
         }
@@ -416,14 +462,40 @@ impl App {
 
         let content = self.content_rects[index];
         if !contains(content, mouse.column, mouse.row) {
+            if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                self.selection = None;
+            }
             return Ok(Action::Continue);
         }
 
         let mouse_mode = self.tasks[index].parser.screen().mouse_protocol_mode();
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && self.should_start_selection(index, mouse)
+        {
+            self.start_selection(index, mouse);
+            return Ok(Action::Continue);
+        }
+
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) {
+            if self.paste_clipboard_to_task(index)? {
+                return Ok(Action::Continue);
+            }
+        }
+
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Middle)) {
+            if self.paste_clipboard_to_task(index)? {
+                return Ok(Action::Continue);
+            }
+        }
+
         if self.mode == AppMode::Command || mouse_mode == MouseProtocolMode::None {
             match mouse.kind {
-                MouseEventKind::ScrollUp => self.tasks[index].scroll_up(3),
-                MouseEventKind::ScrollDown => self.tasks[index].scroll_down(3),
+                MouseEventKind::ScrollUp => {
+                    self.tasks[index].scroll_up(3);
+                }
+                MouseEventKind::ScrollDown => {
+                    self.tasks[index].scroll_down(3);
+                }
                 _ => {}
             }
             return Ok(Action::Continue);
@@ -463,6 +535,205 @@ impl App {
             && y == area.y
             && x >= area.right().saturating_sub(4)
             && x < area.right().saturating_sub(1)
+    }
+
+    fn should_start_selection(&self, index: usize, mouse: MouseEvent) -> bool {
+        self.mode == AppMode::Command
+            || mouse.modifiers.contains(KeyModifiers::SHIFT)
+            || self.tasks[index].parser.screen().mouse_protocol_mode() == MouseProtocolMode::None
+    }
+
+    fn start_selection(&mut self, index: usize, mouse: MouseEvent) {
+        let Some(point) = self.selection_point_for_mouse(index, mouse.column, mouse.row) else {
+            return;
+        };
+        self.focus = index;
+        self.selection = Some(Selection {
+            pane: index,
+            anchor: point,
+            cursor: point,
+            dragging: true,
+            dragged: false,
+            last_mouse: Some((mouse.column, mouse.row)),
+            last_scroll: Instant::now(),
+        });
+    }
+
+    fn handle_selection_drag(&mut self, mouse: MouseEvent) -> bool {
+        if !self
+            .selection
+            .as_ref()
+            .is_some_and(|selection| selection.dragging)
+        {
+            return false;
+        }
+
+        match mouse.kind {
+            MouseEventKind::Drag(MouseButton::Left) => {
+                self.update_selection_from_mouse(mouse.column, mouse.row, true);
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.update_selection_from_mouse(mouse.column, mouse.row, false);
+                if let Some(selection) = self.selection.as_mut() {
+                    if selection.dragged {
+                        selection.dragging = false;
+                    } else {
+                        self.selection = None;
+                    }
+                }
+                true
+            }
+            _ => true,
+        }
+    }
+
+    fn update_selection_from_mouse(&mut self, x: u16, y: u16, dragged: bool) {
+        let Some(pane) = self.selection.as_ref().map(|selection| selection.pane) else {
+            return;
+        };
+        if let Some(selection) = self.selection.as_mut() {
+            selection.last_mouse = Some((x, y));
+            selection.dragged |= dragged;
+        }
+        self.autoscroll_selection(Instant::now(), true);
+        let Some(point) = self.selection_point_for_mouse(pane, x, y) else {
+            return;
+        };
+        if let Some(selection) = self.selection.as_mut() {
+            selection.cursor = point;
+        }
+    }
+
+    fn selection_point_for_mouse(&self, pane: usize, x: u16, y: u16) -> Option<SelectionPoint> {
+        let content = *self.content_rects.get(pane)?;
+        if content.width == 0 || content.height == 0 {
+            return None;
+        }
+        let column = if x < content.x {
+            0
+        } else if x >= content.right() {
+            content.width.saturating_sub(1)
+        } else {
+            x - content.x
+        };
+        let row = if y < content.y {
+            0
+        } else if y >= content.bottom() {
+            content.height.saturating_sub(1)
+        } else {
+            y - content.y
+        };
+        Some(SelectionPoint {
+            line: self.tasks[pane].history_index_for_visible_row(row, content.height),
+            column,
+        })
+    }
+
+    fn autoscroll_selection(&mut self, now: Instant, force: bool) -> bool {
+        let Some((pane, x, y, last_scroll)) = self.selection.as_ref().and_then(|selection| {
+            selection
+                .last_mouse
+                .map(|(x, y)| (selection.pane, x, y, selection.last_scroll))
+        }) else {
+            return false;
+        };
+        if !force && now.duration_since(last_scroll) < SELECTION_AUTOSCROLL_INTERVAL {
+            return false;
+        }
+        let content = self.content_rects[pane];
+        let step = selection_scroll_step(content, y);
+        let changed = if y < content.y {
+            self.tasks[pane].scroll_up(step)
+        } else if y >= content.bottom() {
+            self.tasks[pane].scroll_down(step)
+        } else {
+            false
+        };
+        if changed {
+            if let Some(selection) = self.selection.as_mut() {
+                selection.last_scroll = now;
+            }
+            if let Some(point) = self.selection_point_for_mouse(pane, x, y) {
+                if let Some(selection) = self.selection.as_mut() {
+                    selection.cursor = point;
+                }
+            }
+        }
+        changed
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        let selection = self.selection.as_ref()?;
+        if !selection.dragged {
+            return None;
+        }
+        Some(
+            self.tasks[selection.pane]
+                .history
+                .text_between(selection.anchor, selection.cursor),
+        )
+        .filter(|text| !text.is_empty())
+    }
+
+    fn copy_selection(&mut self) -> bool {
+        let Some(text) = self.selected_text() else {
+            return false;
+        };
+        let pane = self.selection.as_ref().map(|selection| selection.pane);
+        self.clipboard = text.clone();
+        let copied_to_terminal = write_osc52_clipboard(&text).is_ok();
+        let chars = text.chars().count();
+        let suffix = pane
+            .and_then(|pane| self.tasks.get(pane))
+            .map(|task| format!(" from {}", task.task.name))
+            .unwrap_or_default();
+        if copied_to_terminal {
+            self.set_notice(format!("Copied {chars} characters{suffix}."));
+        } else {
+            self.set_notice(format!("Copied {chars} characters internally{suffix}."));
+        }
+        true
+    }
+
+    fn paste_clipboard_to_focus(&mut self) -> Result<bool> {
+        self.paste_clipboard_to_task(self.focus)
+    }
+
+    fn paste_clipboard_to_task(&mut self, index: usize) -> Result<bool> {
+        if self.clipboard.is_empty() || self.mode != AppMode::Input {
+            return Ok(false);
+        }
+        let text = self.clipboard.clone();
+        self.paste_text_to_task(index, &text)?;
+        self.set_notice(format!("Pasted {} characters.", text.chars().count()));
+        Ok(true)
+    }
+
+    fn paste_text_to_task(&mut self, index: usize, text: &str) -> Result<()> {
+        let bracketed = self.tasks[index].parser.screen().bracketed_paste();
+        if bracketed {
+            self.tasks[index].write_input(b"\x1b[200~")?;
+        }
+        self.tasks[index].write_input(text.as_bytes())?;
+        if bracketed {
+            self.tasks[index].write_input(b"\x1b[201~")?;
+        }
+        Ok(())
+    }
+
+    fn set_notice(&mut self, text: String) {
+        self.notice = Some(Notice {
+            text,
+            until: Instant::now() + NOTICE_DURATION,
+        });
+    }
+
+    fn active_notice(&self, now: Instant) -> Option<&str> {
+        self.notice
+            .as_ref()
+            .filter(|notice| notice.until > now)
+            .map(|notice| notice.text.as_str())
     }
 
     fn cycle_focus(&mut self, delta: isize) {
@@ -523,11 +794,7 @@ impl App {
                 generation,
                 bytes,
             } if self.tasks[task].generation == generation => {
-                self.tasks[task].parser.process(&bytes);
-                let scroll_offset = self.tasks[task].scroll_offset;
-                if scroll_offset > 0 {
-                    self.tasks[task].parser.set_scrollback(scroll_offset);
-                }
+                self.tasks[task].process_output(&bytes);
             }
             ProcessEvent::Exited {
                 task,
@@ -571,6 +838,17 @@ impl App {
         {
             self.pending_escape = None;
             self.apply_escape()?;
+            changed = true;
+        }
+        if self.autoscroll_selection(now, false) {
+            changed = true;
+        }
+        if self
+            .notice
+            .as_ref()
+            .is_some_and(|notice| notice.until <= now)
+        {
+            self.notice = None;
             changed = true;
         }
         for task in &mut self.tasks {
@@ -652,6 +930,7 @@ struct TaskRuntime {
     kill_deadline: Option<Instant>,
     pty_size: PtySize,
     scroll_offset: usize,
+    history: TextHistory,
 }
 
 impl TaskRuntime {
@@ -675,6 +954,7 @@ impl TaskRuntime {
             kill_deadline: None,
             pty_size,
             scroll_offset: 0,
+            history: TextHistory::new(pty_size.cols, SCROLLBACK_LINES),
         }
     }
 
@@ -689,7 +969,6 @@ impl TaskRuntime {
         let generation = self.generation;
         self.status = TaskStatus::Starting;
         self.scroll_offset = 0;
-        self.parser.set_scrollback(0);
 
         let pair = native_pty_system()
             .openpty(size)
@@ -808,6 +1087,7 @@ impl TaskRuntime {
             return;
         }
         self.pty_size = size;
+        self.history.set_width(size.cols);
         self.parser.set_size(size.rows, size.cols);
         if let Some(master) = &self.master {
             master.resize(size).ok();
@@ -831,25 +1111,52 @@ impl TaskRuntime {
     fn clear(&mut self) {
         self.parser = Parser::new(self.pty_size.rows, self.pty_size.cols, SCROLLBACK_LINES);
         self.scroll_offset = 0;
+        self.history.clear();
     }
 
-    fn scroll_up(&mut self, rows: usize) {
+    fn scroll_up(&mut self, rows: usize) -> bool {
+        let previous = self.scroll_offset;
         self.scroll_offset = self
             .scroll_offset
             .saturating_add(rows)
-            .min(SCROLLBACK_LINES);
-        self.parser.set_scrollback(self.scroll_offset);
+            .min(self.max_scroll_offset());
+        self.scroll_offset != previous
     }
 
-    fn scroll_down(&mut self, rows: usize) {
+    fn scroll_down(&mut self, rows: usize) -> bool {
+        let previous = self.scroll_offset;
         self.scroll_offset = self.scroll_offset.saturating_sub(rows);
-        self.parser.set_scrollback(self.scroll_offset);
+        self.scroll_offset != previous
+    }
+
+    fn max_scroll_offset(&self) -> usize {
+        self.history
+            .line_count()
+            .saturating_sub(u64::from(self.pty_size.rows))
+            .min(usize::MAX as u64) as usize
     }
 
     fn message(&mut self, message: &str) {
-        self.parser.set_scrollback(0);
         self.scroll_offset = 0;
+        self.history.process(message.as_bytes());
         self.parser.process(message.as_bytes());
+    }
+
+    fn process_output(&mut self, bytes: &[u8]) {
+        let added_rows = self.history.process(bytes);
+        self.parser.process(bytes);
+        if self.scroll_offset > 0 && added_rows > 0 {
+            self.scroll_offset = self
+                .scroll_offset
+                .saturating_add(added_rows)
+                .min(self.max_scroll_offset());
+        }
+    }
+
+    fn history_index_for_visible_row(&self, row: u16, height: u16) -> u64 {
+        self.history
+            .visible_start(height, self.scroll_offset)
+            .saturating_add(u64::from(row))
     }
 
     fn record_spawn_error(&mut self, error: &anyhow::Error) {
@@ -884,6 +1191,271 @@ impl TaskRuntime {
                 }
             }
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SelectionPoint {
+    line: u64,
+    column: u16,
+}
+
+#[derive(Clone, Debug)]
+struct Selection {
+    pane: usize,
+    anchor: SelectionPoint,
+    cursor: SelectionPoint,
+    dragging: bool,
+    dragged: bool,
+    last_mouse: Option<(u16, u16)>,
+    last_scroll: Instant,
+}
+
+impl Selection {
+    fn ordered_points(&self) -> (SelectionPoint, SelectionPoint) {
+        if self.anchor <= self.cursor {
+            (self.anchor, self.cursor)
+        } else {
+            (self.cursor, self.anchor)
+        }
+    }
+
+    fn columns_for_line(&self, line: u64, width: u16) -> Option<(u16, u16)> {
+        if !self.dragged || width == 0 {
+            return None;
+        }
+        let (start, end) = self.ordered_points();
+        if line < start.line || line > end.line {
+            return None;
+        }
+
+        let range = if start.line == end.line {
+            (
+                start.column.min(width),
+                end.column.saturating_add(1).min(width),
+            )
+        } else if line == start.line {
+            (start.column.min(width), width)
+        } else if line == end.line {
+            (0, end.column.saturating_add(1).min(width))
+        } else {
+            (0, width)
+        };
+        (range.0 < range.1).then_some(range)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Notice {
+    text: String,
+    until: Instant,
+}
+
+#[derive(Clone, Debug, Default)]
+struct HistoryLine {
+    text: String,
+    wrapped: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum TextParserState {
+    #[default]
+    Ground,
+    Escape,
+    Csi,
+    Osc,
+    OscEscape,
+    StringControl,
+    StringEscape,
+}
+
+#[derive(Clone, Debug)]
+struct TextHistory {
+    lines: VecDeque<HistoryLine>,
+    first_index: u64,
+    current: HistoryLine,
+    column: usize,
+    pending_wrap: bool,
+    width: u16,
+    max_lines: usize,
+    state: TextParserState,
+}
+
+impl TextHistory {
+    fn new(width: u16, max_lines: usize) -> Self {
+        Self {
+            lines: VecDeque::new(),
+            first_index: 0,
+            current: HistoryLine::default(),
+            column: 0,
+            pending_wrap: false,
+            width: width.max(1),
+            max_lines,
+            state: TextParserState::Ground,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.lines.clear();
+        self.first_index = 0;
+        self.current = HistoryLine::default();
+        self.column = 0;
+        self.pending_wrap = false;
+        self.state = TextParserState::Ground;
+    }
+
+    fn set_width(&mut self, width: u16) {
+        self.width = width.max(1);
+        if self.column >= usize::from(self.width) {
+            self.column = usize::from(self.width.saturating_sub(1));
+            self.pending_wrap = false;
+        }
+    }
+
+    fn line_count(&self) -> u64 {
+        self.first_index
+            .saturating_add(self.lines.len() as u64)
+            .saturating_add(1)
+    }
+
+    fn visible_start(&self, height: u16, scroll_offset: usize) -> u64 {
+        self.line_count()
+            .saturating_sub(u64::from(height).saturating_add(scroll_offset as u64))
+    }
+
+    fn line(&self, index: u64) -> Option<&HistoryLine> {
+        let offset = index.checked_sub(self.first_index)?;
+        if offset < self.lines.len() as u64 {
+            return self.lines.get(offset as usize);
+        }
+        (offset == self.lines.len() as u64).then_some(&self.current)
+    }
+
+    fn process(&mut self, bytes: &[u8]) -> usize {
+        let mut added_rows = 0;
+        for character in String::from_utf8_lossy(bytes).chars() {
+            match self.state {
+                TextParserState::Ground => match character {
+                    '\x1b' => self.state = TextParserState::Escape,
+                    '\n' => added_rows += self.push_current(false),
+                    '\r' => {
+                        self.column = 0;
+                        self.pending_wrap = false;
+                    }
+                    '\x08' => {
+                        if self.pending_wrap {
+                            self.pending_wrap = false;
+                        }
+                        self.column = self.column.saturating_sub(1);
+                    }
+                    '\t' => {
+                        let spaces = 8 - (self.column % 8);
+                        for _ in 0..spaces {
+                            added_rows += self.put_char(' ');
+                        }
+                    }
+                    character if character.is_control() => {}
+                    character => added_rows += self.put_char(character),
+                },
+                TextParserState::Escape => match character {
+                    '[' => self.state = TextParserState::Csi,
+                    ']' => self.state = TextParserState::Osc,
+                    'P' | '^' | '_' => self.state = TextParserState::StringControl,
+                    _ => self.state = TextParserState::Ground,
+                },
+                TextParserState::Csi => {
+                    if ('@'..='~').contains(&character) {
+                        self.state = TextParserState::Ground;
+                    }
+                }
+                TextParserState::Osc => match character {
+                    '\x07' => self.state = TextParserState::Ground,
+                    '\x1b' => self.state = TextParserState::OscEscape,
+                    _ => {}
+                },
+                TextParserState::OscEscape => {
+                    self.state = if character == '\\' {
+                        TextParserState::Ground
+                    } else {
+                        TextParserState::Osc
+                    };
+                }
+                TextParserState::StringControl => {
+                    if character == '\x1b' {
+                        self.state = TextParserState::StringEscape;
+                    }
+                }
+                TextParserState::StringEscape => {
+                    self.state = if character == '\\' {
+                        TextParserState::Ground
+                    } else {
+                        TextParserState::StringControl
+                    };
+                }
+            }
+        }
+        added_rows
+    }
+
+    fn put_char(&mut self, character: char) -> usize {
+        let mut added_rows = 0;
+        if self.pending_wrap {
+            added_rows += self.push_current(true);
+            self.pending_wrap = false;
+        }
+        while char_count(&self.current.text) < self.column {
+            self.current.text.push(' ');
+        }
+
+        replace_char(&mut self.current.text, self.column, character);
+        self.column += 1;
+        if self.column >= usize::from(self.width) {
+            self.pending_wrap = true;
+        }
+        added_rows
+    }
+
+    fn push_current(&mut self, wrapped: bool) -> usize {
+        let mut line = std::mem::take(&mut self.current);
+        line.text.truncate(line.text.trim_end().len());
+        line.wrapped = wrapped;
+        self.lines.push_back(line);
+        while self.lines.len() > self.max_lines {
+            self.lines.pop_front();
+            self.first_index = self.first_index.saturating_add(1);
+        }
+        self.column = 0;
+        self.pending_wrap = false;
+        1
+    }
+
+    fn text_between(&self, anchor: SelectionPoint, cursor: SelectionPoint) -> String {
+        let (start, end) = if anchor <= cursor {
+            (anchor, cursor)
+        } else {
+            (cursor, anchor)
+        };
+        let mut text = String::new();
+        for line_index in start.line..=end.line {
+            let Some(line) = self.line(line_index) else {
+                continue;
+            };
+            let start_column = if line_index == start.line {
+                usize::from(start.column)
+            } else {
+                0
+            };
+            let end_column = if line_index == end.line {
+                usize::from(end.column.saturating_add(1))
+            } else {
+                usize::MAX
+            };
+            text.push_str(&slice_chars(&line.text, start_column, end_column));
+            if line_index != end.line && !line.wrapped {
+                text.push('\n');
+            }
+        }
+        text
     }
 }
 
@@ -1082,6 +1654,25 @@ fn registry_remove(registry: &ProcessRegistry, pid: u32) {
     }
 }
 
+fn render_history(task: &TaskRuntime, area: Rect, buffer: &mut Buffer) {
+    let start = task.history.visible_start(area.height, task.scroll_offset);
+    for row in 0..area.height {
+        for column in 0..area.width {
+            buffer[(area.x + column, area.y + row)].reset();
+        }
+
+        let Some(line) = task.history.line(start.saturating_add(u64::from(row))) else {
+            continue;
+        };
+        for (column, character) in line.text.chars().take(usize::from(area.width)).enumerate() {
+            let mut encoded = [0_u8; 4];
+            buffer[(area.x + column as u16, area.y + row)]
+                .set_symbol(character.encode_utf8(&mut encoded))
+                .set_style(Style::default().fg(Color::White));
+        }
+    }
+}
+
 fn render_screen(parser: &Parser, area: Rect, buffer: &mut Buffer) {
     let screen = parser.screen();
     for row in 0..area.height {
@@ -1097,6 +1688,27 @@ fn render_screen(parser: &Parser, area: Rect, buffer: &mut Buffer) {
             buffer[(area.x + column, area.y + row)]
                 .set_symbol(symbol)
                 .set_style(cell_style(source));
+        }
+    }
+}
+
+fn render_selection(
+    selection: Option<&Selection>,
+    task: &TaskRuntime,
+    area: Rect,
+    buffer: &mut Buffer,
+) {
+    let Some(selection) = selection else {
+        return;
+    };
+    for row in 0..area.height {
+        let line = task.history_index_for_visible_row(row, area.height);
+        let Some((start, end)) = selection.columns_for_line(line, area.width) else {
+            continue;
+        };
+        for column in start..end {
+            buffer[(area.x + column, area.y + row)]
+                .set_style(Style::default().fg(Color::Black).bg(Color::White));
         }
     }
 }
@@ -1134,6 +1746,88 @@ fn terminal_color(color: vt100::Color) -> Option<Color> {
 
 fn contains(rect: Rect, x: u16, y: u16) -> bool {
     x >= rect.x && x < rect.right() && y >= rect.y && y < rect.bottom()
+}
+
+fn selection_scroll_step(rect: Rect, y: u16) -> usize {
+    let distance = if y < rect.y {
+        rect.y.saturating_sub(y)
+    } else if y >= rect.bottom() {
+        y.saturating_sub(rect.bottom()).saturating_add(1)
+    } else {
+        0
+    };
+    usize::from(1 + distance / 3)
+}
+
+fn char_count(value: &str) -> usize {
+    value.chars().count()
+}
+
+fn replace_char(value: &mut String, index: usize, character: char) {
+    let mut indices = value.char_indices().map(|(offset, _)| offset);
+    let Some(start) = indices.nth(index) else {
+        value.push(character);
+        return;
+    };
+    let end = value[start..]
+        .char_indices()
+        .nth(1)
+        .map(|(offset, _)| start + offset)
+        .unwrap_or(value.len());
+    value.replace_range(start..end, character.encode_utf8(&mut [0_u8; 4]));
+}
+
+fn slice_chars(value: &str, start: usize, end: usize) -> String {
+    value
+        .chars()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .collect()
+}
+
+fn write_osc52_clipboard(text: &str) -> io::Result<()> {
+    let encoded = base64_encode(text.as_bytes());
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(b"\x1b]52;c;")?;
+    stdout.write_all(encoded.as_bytes())?;
+    stdout.write_all(b"\x07")?;
+    stdout.flush()
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        let triple = (u32::from(first) << 16) | (u32::from(second) << 8) | u32::from(third);
+        encoded.push(TABLE[((triple >> 18) & 0x3f) as usize] as char);
+        encoded.push(TABLE[((triple >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            encoded.push(TABLE[((triple >> 6) & 0x3f) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+        if chunk.len() > 2 {
+            encoded.push(TABLE[(triple & 0x3f) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+    }
+    encoded
+}
+
+fn is_copy_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('c' | 'C'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.modifiers.contains(KeyModifiers::SHIFT)
+}
+
+fn is_paste_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('v' | 'V'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.modifiers.contains(KeyModifiers::SHIFT)
 }
 
 fn is_leader(key: KeyEvent, leader: Leader) -> bool {
@@ -1465,6 +2159,88 @@ mod tests {
         .unwrap();
 
         assert_eq!(app.mode, AppMode::Input);
+    }
+
+    #[test]
+    fn text_history_copies_wrapped_rows_without_extra_newlines() {
+        let mut history = TextHistory::new(5, 100);
+        history.process(b"alpha\nbravocharlie\nz");
+
+        let text = history.text_between(
+            SelectionPoint { line: 1, column: 0 },
+            SelectionPoint { line: 3, column: 1 },
+        );
+
+        assert_eq!(text, "bravocharlie");
+    }
+
+    #[test]
+    fn drag_selection_stays_with_original_pane() {
+        let mut app = test_app();
+        app.update_layout(Rect::new(0, 0, 100, 20));
+        app.tasks[0].process_output(b"line one\nline two\n");
+        app.tasks[1].process_output(b"other pane\n");
+
+        let first = app.content_rects[0];
+        let second = app.content_rects[1];
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: first.x,
+            row: first.y,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: second.x + 5,
+            row: first.y,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: second.x + 5,
+            row: first.y,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+
+        let selection = app.selection.as_ref().unwrap();
+        assert_eq!(selection.pane, 0);
+        assert_eq!(app.selected_text().unwrap(), "line one");
+    }
+
+    #[test]
+    fn selection_autoscrolls_only_the_original_pane() {
+        let mut app = test_app();
+        app.update_layout(Rect::new(0, 0, 100, 20));
+        for line in 0..40 {
+            app.tasks[0].process_output(format!("line {line}\n").as_bytes());
+        }
+        for line in 0..40 {
+            app.tasks[1].process_output(format!("other {line}\n").as_bytes());
+        }
+
+        let first = app.content_rects[0];
+        let second = app.content_rects[1];
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: first.x,
+            row: first.bottom() - 1,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: second.x,
+            row: first.y.saturating_sub(2),
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+
+        assert_eq!(app.selection.as_ref().unwrap().pane, 0);
+        assert!(app.tasks[0].scroll_offset > 0);
+        assert_eq!(app.tasks[1].scroll_offset, 0);
     }
 
     fn test_task(name: &str) -> Task {
