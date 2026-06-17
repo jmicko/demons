@@ -22,6 +22,15 @@ pub struct InitResult {
 
 trait PromptSource {
     fn prompt(&mut self, output: &mut impl Write, label: &str, default: &str) -> Result<String>;
+
+    fn prompt_with_default(
+        &mut self,
+        output: &mut impl Write,
+        label: &str,
+        default: &str,
+    ) -> Result<String> {
+        self.prompt(output, label, default)
+    }
 }
 
 struct LinePrompt<'a, R: BufRead> {
@@ -53,7 +62,24 @@ impl PromptSource for TerminalPrompt {
         let prefix = prompt_prefix(label, default);
         write!(output, "{prefix}")?;
         output.flush()?;
-        let value = read_edited_line(output, &prefix)?;
+        let value = read_edited_line(output, &prefix, "")?;
+        Ok(if value.trim().is_empty() {
+            default.to_owned()
+        } else {
+            value.trim().to_owned()
+        })
+    }
+
+    fn prompt_with_default(
+        &mut self,
+        output: &mut impl Write,
+        label: &str,
+        default: &str,
+    ) -> Result<String> {
+        let prefix = prompt_prefix(label, default);
+        write!(output, "{prefix}{default}")?;
+        output.flush()?;
+        let value = read_edited_line(output, &prefix, default)?;
         Ok(if value.trim().is_empty() {
             default.to_owned()
         } else {
@@ -322,29 +348,38 @@ fn prompt_task(
     number: usize,
 ) -> Result<Task> {
     writeln!(output, "\nTask {number}:")?;
-    let name = required_prompt(
-        input,
-        output,
-        "Name",
-        current.map(|task| task.name.as_str()).unwrap_or(""),
-    )?;
+    let name_default = current.map(|task| task.name.as_str()).unwrap_or("");
+    let name = required_task_prompt(input, output, "Name", name_default, current.is_some())?;
     let command_default = current
         .map(|task| task.command.display())
         .unwrap_or_default();
-    let command = required_prompt(input, output, "Command", &command_default)?;
+    let command = required_task_prompt(
+        input,
+        output,
+        "Command",
+        &command_default,
+        current.is_some(),
+    )?;
     let cwd_default = current
         .map(|task| task.cwd.to_string_lossy().into_owned())
         .unwrap_or_else(|| ".".to_owned());
-    let cwd = PathBuf::from(prompt(input, output, "Working directory", &cwd_default)?);
+    let cwd = PathBuf::from(task_prompt(
+        input,
+        output,
+        "Working directory",
+        &cwd_default,
+        current.is_some(),
+    )?);
 
     let env_default = current
         .map(|task| format_env(&task.env))
         .unwrap_or_default();
-    let env_text = prompt(
+    let env_text = task_prompt(
         input,
         output,
         "Environment (KEY=value, comma-separated; '-' to clear)",
         &env_default,
+        current.is_some() && !env_default.is_empty(),
     )?;
     let env = if env_text == "-" {
         BTreeMap::new()
@@ -377,14 +412,29 @@ fn prompt(
     input.prompt(output, label, default)
 }
 
-fn required_prompt(
+fn task_prompt(
     input: &mut impl PromptSource,
     output: &mut impl Write,
     label: &str,
     default: &str,
+    prefill_default: bool,
+) -> Result<String> {
+    if prefill_default {
+        input.prompt_with_default(output, label, default)
+    } else {
+        prompt(input, output, label, default)
+    }
+}
+
+fn required_task_prompt(
+    input: &mut impl PromptSource,
+    output: &mut impl Write,
+    label: &str,
+    default: &str,
+    prefill_default: bool,
 ) -> Result<String> {
     loop {
-        let value = prompt(input, output, label, default)?;
+        let value = task_prompt(input, output, label, default, prefill_default)?;
         if !value.trim().is_empty() {
             return Ok(value);
         }
@@ -484,10 +534,10 @@ fn prompt_prefix(label: &str, default: &str) -> String {
     }
 }
 
-fn read_edited_line(output: &mut impl Write, prefix: &str) -> Result<String> {
+fn read_edited_line(output: &mut impl Write, prefix: &str, initial: &str) -> Result<String> {
     let _guard = RawModeGuard::enter()?;
-    let mut buffer = String::new();
-    let mut cursor = 0_usize;
+    let mut buffer = initial.to_owned();
+    let mut cursor = char_len(&buffer);
 
     loop {
         let event = event::read().context("failed to read terminal input")?;
