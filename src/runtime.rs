@@ -720,12 +720,44 @@ impl App {
         if !selection.dragged {
             return None;
         }
+        if let Some(text) = self.visible_selection_text(selection) {
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
         Some(
             self.tasks[selection.pane]
                 .history
                 .text_between(selection.anchor, selection.cursor),
         )
         .filter(|text| !text.is_empty())
+    }
+
+    fn visible_selection_text(&self, selection: &Selection) -> Option<String> {
+        let task = self.tasks.get(selection.pane)?;
+        if task.scroll_offset != 0 {
+            return None;
+        }
+        let area = *self.content_rects.get(selection.pane)?;
+        if area.width == 0 || area.height == 0 {
+            return None;
+        }
+        let visible_start = task.history.visible_start(area.height, 0);
+        let visible_end = visible_start.saturating_add(u64::from(area.height));
+        let (start, end) = selection.ordered_points();
+        if start.line < visible_start || end.line >= visible_end {
+            return None;
+        }
+
+        let start_row = (start.line - visible_start) as u16;
+        let end_row = (end.line - visible_start) as u16;
+        let end_column = end.column.saturating_add(1).min(area.width);
+        Some(task.parser.screen().contents_between(
+            start_row,
+            start.column.min(area.width),
+            end_row,
+            end_column,
+        ))
     }
 
     fn copy_selection(&mut self) -> bool {
@@ -2322,6 +2354,24 @@ mod tests {
         );
 
         assert_eq!(text, "done");
+    }
+
+    #[test]
+    fn visible_selection_uses_terminal_screen_contents() {
+        let mut app = test_app();
+        app.update_layout(Rect::new(0, 0, 100, 20));
+        app.tasks[0].process_output(b"hello\x1b[1GXY");
+        app.selection = Some(Selection {
+            pane: 0,
+            anchor: SelectionPoint { line: 0, column: 0 },
+            cursor: SelectionPoint { line: 0, column: 4 },
+            dragging: false,
+            dragged: true,
+            last_mouse: None,
+            last_scroll: Instant::now(),
+        });
+
+        assert_eq!(app.selected_text().unwrap(), "XYllo");
     }
 
     #[test]
