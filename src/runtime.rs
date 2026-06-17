@@ -452,6 +452,7 @@ impl App {
                 self.tasks[self.focus].scroll_to_bottom();
             }
             KeyCode::Char('f') => self.fullscreen = !self.fullscreen,
+            KeyCode::Char('y') => self.copy_focused_visible(),
             KeyCode::Char('r') => self.request_restart(self.focus),
             KeyCode::Char('R') => {
                 for index in 0..self.tasks.len() {
@@ -805,6 +806,47 @@ impl App {
             self.set_notice(format!("Copied {chars} characters internally{suffix}."));
         }
         true
+    }
+
+    fn copy_focused_visible(&mut self) {
+        let Some(text) = self
+            .visible_pane_text(self.focus)
+            .filter(|text| !text.is_empty())
+        else {
+            self.set_notice("Focused pane has no visible text.".to_owned());
+            return;
+        };
+        self.clipboard = text.clone();
+        let copied_to_terminal = write_osc52_clipboard(&text).is_ok();
+        let chars = text.chars().count();
+        if copied_to_terminal {
+            self.set_notice(format!("Copied {chars} visible characters."));
+        } else {
+            self.set_notice(format!("Copied {chars} visible characters internally."));
+        }
+    }
+
+    fn visible_pane_text(&self, index: usize) -> Option<String> {
+        let task = self.tasks.get(index)?;
+        let area = *self.content_rects.get(index)?;
+        if area.width == 0 || area.height == 0 {
+            return None;
+        }
+        if task.scroll_offset == 0 {
+            return Some(task.parser.screen().contents());
+        }
+
+        let start = task.history.visible_start(area.height, task.scroll_offset);
+        Some(task.history.text_between(
+            SelectionPoint {
+                line: start,
+                column: 0,
+            },
+            SelectionPoint {
+                line: start.saturating_add(u64::from(area.height.saturating_sub(1))),
+                column: area.width.saturating_sub(1),
+            },
+        ))
     }
 
     fn paste_clipboard_to_focus(&mut self) -> Result<bool> {
@@ -1986,6 +2028,12 @@ fn first_csi_param(value: &str) -> Option<usize> {
         .and_then(|param| param.parse().ok())
 }
 
+#[cfg(test)]
+fn write_osc52_clipboard(_text: &str) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(test))]
 fn write_osc52_clipboard(text: &str) -> io::Result<()> {
     let encoded = base64_encode(text.as_bytes());
     let mut stdout = io::stdout().lock();
@@ -1995,6 +2043,7 @@ fn write_osc52_clipboard(text: &str) -> io::Result<()> {
     stdout.flush()
 }
 
+#[cfg(not(test))]
 fn base64_encode(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -2571,6 +2620,37 @@ mod tests {
         app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
             .unwrap();
         assert_eq!(app.tasks[0].scroll_offset, 0);
+    }
+
+    #[test]
+    fn command_mode_y_copies_focused_visible_screen() {
+        let mut app = test_app();
+        app.update_layout(Rect::new(0, 0, 100, 20));
+        app.mode = AppMode::Command;
+        app.tasks[0].process_output(b"hello\x1b[1GXY");
+
+        app.handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(app.clipboard, "XYllo");
+    }
+
+    #[test]
+    fn command_mode_y_copies_scrolled_history_window() {
+        let mut app = test_app();
+        app.update_layout(Rect::new(0, 0, 100, 8));
+        app.mode = AppMode::Command;
+        for line in 0..20 {
+            app.tasks[0].process_output(format!("line {line}\n").as_bytes());
+        }
+
+        app.tasks[0].scroll_up(10);
+        app.handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE))
+            .unwrap();
+
+        assert!(app.clipboard.contains("line 6"));
+        assert!(app.clipboard.contains("line 10"));
+        assert!(!app.clipboard.contains("line 19"));
     }
 
     #[test]

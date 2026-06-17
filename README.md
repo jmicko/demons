@@ -90,6 +90,7 @@ changing modes.
 | `f` | Toggle fullscreen for the focused pane |
 | `PageUp` / `PageDown` | Scroll the focused pane by one page |
 | `Home` / `End` | Jump to the top or bottom of focused pane history |
+| `y` | Copy the focused pane's visible text |
 | `r` | Restart the focused task |
 | `R` | Restart every task |
 | `c` | Clear the focused pane and its scrollback |
