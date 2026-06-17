@@ -51,7 +51,7 @@ Demons is intentionally minimal: it is **not** a session manager, a process supe
 # based on terminal aspect ratio. v2 may add "tabs".
 layout = "grid"
 # Leader key to toggle command mode.
-# Options: "alt-j" (default), "tab", "ctrl-b", "ctrl-q", "ctrl-\".
+# Options: "alt-j" (default), "alt-backtick", "tab", "ctrl-b", "ctrl-q", "ctrl-\".
 leader = "alt-j"
 # Reserved for v2. It must remain false in v1.
 logging = false
@@ -195,6 +195,8 @@ The configured leader key (default `Alt+J`) toggles between two modes.
   Demons clipboard.
 - `Ctrl+Shift+V`, middle-click, or right-click without a current selection:
   pastes the internal Demons clipboard into the selected pane in input mode.
+- `q` or `Ctrl+C` opens quit confirmation only when the focused pane can no
+  longer accept input; otherwise those keys are sent to the child.
 - Click on a pane: selects that pane without changing modes.
 - Click on a `[↻]` button: restarts that pane.
 - Mouse events inside a child that has enabled terminal mouse reporting are
@@ -222,14 +224,15 @@ The configured leader key (default `Alt+J`) toggles between two modes.
 - `R`: restart all panes.
 - `c`: clear the focused pane and its scrollback.
 - `?`: show command help.
-- `q` or `Ctrl+C`: quit (sends SIGTERM, waits 2s, then SIGKILL).
+- `q` or `Ctrl+C`: show quit confirmation. Press `q` or `Ctrl+C` again to
+  quit (sends SIGTERM, waits 2s, then SIGKILL) or `Esc` to cancel.
 - Press the leader, click the footer mode button, or press `Esc` → return to
   input mode.
 - Clicking a pane selects it without leaving command mode.
 
 The leader is configurable in `[settings].leader`. Allowed values: `alt-j`
-(default), `tab`, `ctrl-b`, `ctrl-q`, `ctrl-\`. The leader is intercepted in
-input mode and cannot be sent to the child.
+(default), `alt-backtick`, `tab`, `ctrl-b`, `ctrl-q`, `ctrl-\`. The leader is
+intercepted in input mode and cannot be sent to the child.
 
 ### 6.4 Process lifecycle
 

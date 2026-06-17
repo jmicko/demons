@@ -56,6 +56,8 @@ pub enum Leader {
     #[serde(rename = "alt-j")]
     #[default]
     AltJ,
+    #[serde(rename = "alt-backtick")]
+    AltBacktick,
     Tab,
     CtrlB,
     CtrlQ,
@@ -67,11 +69,16 @@ impl Leader {
     pub fn label(self) -> &'static str {
         match self {
             Self::AltJ => "Alt-J",
+            Self::AltBacktick => "Alt-`",
             Self::Tab => "Tab",
             Self::CtrlB => "Ctrl-B",
             Self::CtrlQ => "Ctrl-Q",
             Self::CtrlBackslash => "Ctrl-\\",
         }
+    }
+
+    pub fn uses_escape_alt_encoding(self) -> bool {
+        matches!(self, Self::AltJ | Self::AltBacktick)
     }
 }
 
@@ -416,5 +423,23 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.settings.leader, Leader::AltJ);
+    }
+
+    #[test]
+    fn parses_alt_backtick_leader() {
+        let config: Config = toml::from_str(
+            r#"
+                [settings]
+                leader = "alt-backtick"
+
+                [[task]]
+                name = "server"
+                command = "echo ready"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.settings.leader, Leader::AltBacktick);
+        assert_eq!(config.settings.leader.label(), "Alt-`");
     }
 }

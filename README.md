@@ -100,7 +100,7 @@ changing modes.
 | `R` | Restart every task |
 | `c` | Clear the focused pane and its scrollback |
 | `?` | Show command help |
-| `q` or `Ctrl+C` | Stop all tasks and quit |
+| `q` or `Ctrl+C` | Ask to close Demons |
 | Leader or `Esc` | Return to input mode |
 
 Click a pane to focus it. Click `[↻]` in a pane header to restart that task.
@@ -122,13 +122,18 @@ and copies the file path. `/` opens a focused-pane search prompt; press Enter to
 jump to the newest matching history line or Esc to cancel. After a search, `n`
 jumps to the next older match and `N` jumps newer.
 
+Closing Demons is confirmed: press `q` or `Ctrl+C`, then press it again to
+close, or `Esc` to cancel. In input mode, those keys still go to a running
+child process; once the focused pane can no longer accept input, they open the
+same close confirmation.
+
 Because the leader is intercepted, it cannot be sent to a child while in input
 mode. Set a different leader if an application or window manager needs
 `Alt+J`:
 
 ```toml
 [settings]
-leader = "ctrl-b" # also: "tab", "ctrl-q", "ctrl-\\"
+leader = "alt-backtick" # also: "tab", "ctrl-b", "ctrl-q", "ctrl-\\"
 ```
 
 ## Testing The Wizard

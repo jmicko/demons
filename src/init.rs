@@ -337,10 +337,11 @@ fn prompt_settings(
 
     let leader_default = match current.leader {
         Leader::AltJ => 0,
-        Leader::Tab => 1,
-        Leader::CtrlB => 2,
-        Leader::CtrlQ => 3,
-        Leader::CtrlBackslash => 4,
+        Leader::AltBacktick => 1,
+        Leader::Tab => 2,
+        Leader::CtrlB => 3,
+        Leader::CtrlQ => 4,
+        Leader::CtrlBackslash => 5,
     };
     let leader_choice = prompt_choice(
         input,
@@ -348,6 +349,7 @@ fn prompt_settings(
         "Leader key",
         &[
             ("alt-j", "Alt-J"),
+            ("alt-backtick", "Alt-`"),
             ("tab", "Tab"),
             ("ctrl-b", "Ctrl-B"),
             ("ctrl-q", "Ctrl-Q"),
@@ -357,11 +359,12 @@ fn prompt_settings(
     )?;
     let leader = match leader_choice.as_str() {
         "alt-j" => Leader::AltJ,
+        "alt-backtick" => Leader::AltBacktick,
         "tab" => Leader::Tab,
         "ctrl-b" => Leader::CtrlB,
         "ctrl-q" => Leader::CtrlQ,
         "ctrl-\\" => Leader::CtrlBackslash,
-        _ => bail!("leader must be one of: alt-j, tab, ctrl-b, ctrl-q, ctrl-\\"),
+        _ => bail!("leader must be one of: alt-j, alt-backtick, tab, ctrl-b, ctrl-q, ctrl-\\"),
     };
 
     Ok(Settings {
@@ -798,7 +801,7 @@ mod tests {
     fn creates_a_config_with_numbered_setting_choices() {
         let temp = tempdir().unwrap();
         let path = temp.path().join(crate::config::CONFIG_FILE);
-        let answers = b"\n3\nserver\necho ready\n\n\nn\n\nn\n";
+        let answers = b"\n4\nserver\necho ready\n\n\nn\n\nn\n";
         let mut input = Cursor::new(answers);
         let mut output = Vec::new();
 

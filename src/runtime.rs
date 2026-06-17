@@ -132,6 +132,8 @@ struct App {
     search: Option<SearchState>,
     last_search: Option<String>,
     show_help: bool,
+    help_close_rect: Option<Rect>,
+    confirm_quit: bool,
 }
 
 impl App {
@@ -176,6 +178,8 @@ impl App {
             search: None,
             last_search: None,
             show_help: false,
+            help_close_rect: None,
+            confirm_quit: false,
         }
     }
 
@@ -195,19 +199,20 @@ impl App {
     }
 
     fn update_layout(&mut self, terminal_area: Rect) {
-        let (pane_area, footer_rect) = if terminal_area.height > 3 {
+        let footer_height = self.footer_height(terminal_area.width, terminal_area.height);
+        let (pane_area, footer_rect) = if footer_height > 0 {
             (
                 Rect::new(
                     terminal_area.x,
                     terminal_area.y,
                     terminal_area.width,
-                    terminal_area.height - 1,
+                    terminal_area.height.saturating_sub(footer_height),
                 ),
                 Some(Rect::new(
                     terminal_area.x,
-                    terminal_area.bottom() - 1,
+                    terminal_area.bottom().saturating_sub(footer_height),
                     terminal_area.width,
-                    1,
+                    footer_height,
                 )),
             )
         } else {
@@ -267,6 +272,7 @@ impl App {
         let frame_area = frame.area();
         self.update_layout(frame_area);
         let buffer = frame.buffer_mut();
+        self.help_close_rect = None;
 
         for index in 0..self.tasks.len() {
             let area = self.pane_rects[index];
@@ -324,67 +330,30 @@ impl App {
                 button_area.right(),
                 footer_area.y,
                 footer_area.width.saturating_sub(button_area.width),
-                1,
+                footer_area.height,
             );
-            let (mode_label, mode_color, help) = if let Some(search) = self
-                .search
-                .as_ref()
-                .filter(|_| self.mode == AppMode::Search)
-            {
-                ("SEARCH", Color::Magenta, search_footer_text(search))
-            } else if let Some(notice) = self.active_notice(Instant::now()) {
-                let mode_label = match self.mode {
-                    AppMode::Input => "INPUT MODE",
-                    AppMode::Command => "COMMAND MODE",
-                    AppMode::Search => "SEARCH",
-                };
-                let mode_color = match self.mode {
-                    AppMode::Input => Color::Cyan,
-                    AppMode::Command => Color::Yellow,
-                    AppMode::Search => Color::Magenta,
-                };
-                (mode_label, mode_color, format!(" {notice} "))
-            } else {
-                match self.mode {
-                    AppMode::Input => (
-                        "INPUT MODE",
-                        Color::Cyan,
-                        format!(
-                            " {} | {}: command | drag: select | right-click: copy ",
-                            self.tasks[self.focus].task.name,
-                            self.loaded.config.settings.leader.label()
-                        ),
-                    ),
-                    AppMode::Command => (
-                        "COMMAND MODE",
-                        Color::Yellow,
-                        format!(
-                            " arrows/hjkl: move | f: fullscreen | / n/N: find | y/Y: copy | S: save | r: restart | R: all | c: clear | q: quit | {}: input ",
-                            self.loaded.config.settings.leader.label()
-                        ),
-                    ),
-                    AppMode::Search => (
-                        "SEARCH",
-                        Color::Magenta,
-                        " /  Enter: jump | Esc: cancel ".to_owned(),
-                    ),
-                }
-            };
+            let (mode_label, mode_color, help) = self.footer_parts(Instant::now());
             Paragraph::new(mode_label)
                 .alignment(ratatui::layout::Alignment::Center)
                 .style(Style::default().fg(Color::Black).bg(mode_color))
                 .render(button_area, buffer);
             Paragraph::new(help)
                 .style(Style::default().fg(Color::White).bg(Color::DarkGray))
+                .wrap(Wrap { trim: false })
                 .render(help_area, buffer);
         }
 
         if self.show_help {
+            self.help_close_rect = command_help_close_rect(frame_area);
             render_command_help(
                 frame_area,
                 buffer,
                 self.loaded.config.settings.leader.label(),
             );
+        }
+
+        if self.confirm_quit {
+            render_quit_confirm(frame_area, buffer);
         }
 
         if self.mode == AppMode::Input {
@@ -428,14 +397,18 @@ impl App {
             return Ok(Action::Continue);
         }
 
+        if self.confirm_quit {
+            return self.handle_quit_confirm_key(key);
+        }
+
         if self.show_help {
             return self.handle_help_key(key);
         }
 
         let leader = self.loaded.config.settings.leader;
-        if leader == Leader::AltJ {
+        if leader.uses_escape_alt_encoding() {
             if let Some(started) = self.pending_escape.take() {
-                if started.elapsed() <= ALT_ESCAPE_TIMEOUT && is_legacy_alt_j(key) {
+                if started.elapsed() <= ALT_ESCAPE_TIMEOUT && is_legacy_alt_leader(key, leader) {
                     self.toggle_mode();
                     return Ok(Action::Continue);
                 }
@@ -457,6 +430,9 @@ impl App {
         }
 
         if self.mode == AppMode::Input {
+            if is_quit_key(key) && !self.focused_task_accepts_input() {
+                return Ok(self.request_quit());
+            }
             let application_cursor = self.tasks[self.focus].parser.screen().application_cursor();
             let bytes = encode_key(key, application_cursor);
             if !bytes.is_empty() {
@@ -502,13 +478,36 @@ impl App {
                     self.request_restart(index);
                 }
             }
-            KeyCode::Char('q') => return Ok(Action::Quit),
+            KeyCode::Char('q') => return Ok(self.request_quit()),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                return Ok(Action::Quit);
+                return Ok(self.request_quit());
             }
             KeyCode::Char('c') => {
                 self.tasks[self.focus].clear();
                 self.clear_selection_for(self.focus);
+            }
+            _ => {}
+        }
+        Ok(Action::Continue)
+    }
+
+    fn request_quit(&mut self) -> Action {
+        if self.confirm_quit {
+            return Action::Quit;
+        }
+        self.confirm_quit = true;
+        self.show_help = false;
+        self.search = None;
+        self.notice = None;
+        Action::Continue
+    }
+
+    fn handle_quit_confirm_key(&mut self, key: KeyEvent) -> Result<Action> {
+        match key.code {
+            KeyCode::Esc => self.confirm_quit = false,
+            KeyCode::Char('q') => return Ok(Action::Quit),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Ok(Action::Quit);
             }
             _ => {}
         }
@@ -747,8 +746,18 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<Action> {
+        if self.confirm_quit {
+            return Ok(Action::Continue);
+        }
+
         if self.show_help {
-            self.show_help = false;
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                && self
+                    .help_close_rect
+                    .is_some_and(|rect| contains(rect, mouse.column, mouse.row))
+            {
+                self.show_help = false;
+            }
             return Ok(Action::Continue);
         }
 
@@ -1286,6 +1295,74 @@ impl App {
             .get(self.focus)
             .map(|rect| usize::from(rect.height.saturating_sub(1).max(1)))
             .unwrap_or(1)
+    }
+
+    fn footer_height(&self, terminal_width: u16, terminal_height: u16) -> u16 {
+        if terminal_height <= 3 || terminal_width == 0 {
+            return 0;
+        }
+        let button_width = terminal_width.min(MODE_BUTTON_WIDTH);
+        let help_width = terminal_width.saturating_sub(button_width);
+        if help_width == 0 {
+            return 1;
+        }
+        let (_, _, help) = self.footer_parts(Instant::now());
+        let line_count = wrapped_line_count(&help, help_width);
+        line_count.min(terminal_height.saturating_sub(3).max(1))
+    }
+
+    fn footer_parts(&self, now: Instant) -> (&'static str, Color, String) {
+        if let Some(search) = self
+            .search
+            .as_ref()
+            .filter(|_| self.mode == AppMode::Search)
+        {
+            return ("SEARCH", Color::Magenta, search_footer_text(search));
+        }
+
+        if let Some(notice) = self.active_notice(now) {
+            let (label, color) = self.mode_label_color();
+            return (label, color, format!(" {notice} "));
+        }
+
+        match self.mode {
+            AppMode::Input => (
+                "INPUT MODE",
+                Color::Cyan,
+                format!(
+                    " {} | {}: command | drag: select | right-click: copy ",
+                    self.tasks[self.focus].task.name,
+                    self.loaded.config.settings.leader.label()
+                ),
+            ),
+            AppMode::Command => (
+                "COMMAND MODE",
+                Color::Yellow,
+                format!(
+                    " arrows/hjkl: move | f: fullscreen | / n/N: find | y/Y: copy | S: save | ?: help | r: restart | R: all | c: clear | q: quit | {}: input ",
+                    self.loaded.config.settings.leader.label()
+                ),
+            ),
+            AppMode::Search => (
+                "SEARCH",
+                Color::Magenta,
+                " /  Enter: jump | Esc: cancel ".to_owned(),
+            ),
+        }
+    }
+
+    fn mode_label_color(&self) -> (&'static str, Color) {
+        match self.mode {
+            AppMode::Input => ("INPUT MODE", Color::Cyan),
+            AppMode::Command => ("COMMAND MODE", Color::Yellow),
+            AppMode::Search => ("SEARCH", Color::Magenta),
+        }
+    }
+
+    fn focused_task_accepts_input(&self) -> bool {
+        self.tasks
+            .get(self.focus)
+            .is_some_and(|task| task.writer.is_some())
     }
 
     fn request_restart(&mut self, index: usize) {
@@ -2368,7 +2445,7 @@ fn render_selection(
 }
 
 fn render_command_help(area: Rect, buffer: &mut Buffer, leader: &str) {
-    let popup = centered_rect(area, 74, 16);
+    let popup = command_help_rect(area);
     if popup.width == 0 || popup.height == 0 {
         return;
     }
@@ -2405,6 +2482,53 @@ fn render_command_help(area: Rect, buffer: &mut Buffer, leader: &str) {
         )
         .wrap(Wrap { trim: false })
         .render(popup, buffer);
+    if let Some(close) = command_help_close_rect(area) {
+        Paragraph::new(" x ")
+            .alignment(ratatui::layout::Alignment::Center)
+            .style(Style::default().fg(Color::Black).bg(Color::Yellow))
+            .render(close, buffer);
+    }
+}
+
+fn command_help_rect(area: Rect) -> Rect {
+    centered_rect(area, 74, 16)
+}
+
+fn command_help_close_rect(area: Rect) -> Option<Rect> {
+    let popup = command_help_rect(area);
+    (popup.width >= 6 && popup.height > 0).then(|| {
+        Rect::new(
+            popup.right().saturating_sub(5),
+            popup.y,
+            3.min(popup.width),
+            1,
+        )
+    })
+}
+
+fn render_quit_confirm(area: Rect, buffer: &mut Buffer) {
+    let popup = centered_rect(area, 56, 7);
+    if popup.width == 0 || popup.height == 0 {
+        return;
+    }
+    Clear.render(popup, buffer);
+    Paragraph::new(vec![
+        Line::styled(
+            "Close Demons?",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+        Line::raw("Press Ctrl-C or q again to close Demons."),
+        Line::raw("Press Esc to keep the panes running."),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Red))
+            .style(Style::default().fg(Color::White).bg(Color::Black)),
+    )
+    .wrap(Wrap { trim: false })
+    .render(popup, buffer);
 }
 
 fn centered_rect(area: Rect, preferred_width: u16, preferred_height: u16) -> Rect {
@@ -2528,6 +2652,16 @@ fn search_footer_text(search: &SearchState) -> String {
     format!(" /{query}  Enter: jump | Esc: cancel ")
 }
 
+fn wrapped_line_count(text: &str, width: u16) -> u16 {
+    let width = usize::from(width.max(1));
+    let mut lines = 0_u16;
+    for line in text.split('\n') {
+        let chars = char_count(line).max(1);
+        lines = lines.saturating_add(chars.div_ceil(width).min(usize::from(u16::MAX)) as u16);
+    }
+    lines.max(1)
+}
+
 fn write_history_log(dir: &Path, task_name: &str, text: &str) -> Result<PathBuf> {
     fs::create_dir_all(dir)
         .with_context(|| format!("failed to create log directory {}", dir.display()))?;
@@ -2638,6 +2772,12 @@ fn is_paste_key(key: KeyEvent) -> bool {
         && key.modifiers.contains(KeyModifiers::SHIFT)
 }
 
+fn is_quit_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('q'))
+        || (matches!(key.code, KeyCode::Char('c' | 'C'))
+            && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
 fn is_leader(key: KeyEvent, leader: Leader) -> bool {
     match leader {
         Leader::AltJ => {
@@ -2645,6 +2785,7 @@ fn is_leader(key: KeyEvent, leader: Leader) -> bool {
                 && (key.modifiers == KeyModifiers::ALT
                     || key.modifiers == KeyModifiers::ALT | KeyModifiers::SHIFT)
         }
+        Leader::AltBacktick => key.code == KeyCode::Char('`') && key.modifiers == KeyModifiers::ALT,
         Leader::Tab => key.code == KeyCode::Tab && !key.modifiers.contains(KeyModifiers::CONTROL),
         Leader::CtrlB => {
             matches!(key.code, KeyCode::Char('b' | 'B'))
@@ -2660,9 +2801,15 @@ fn is_leader(key: KeyEvent, leader: Leader) -> bool {
     }
 }
 
-fn is_legacy_alt_j(key: KeyEvent) -> bool {
-    matches!(key.code, KeyCode::Char('j' | 'J'))
-        && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+fn is_legacy_alt_leader(key: KeyEvent, leader: Leader) -> bool {
+    match leader {
+        Leader::AltJ => {
+            matches!(key.code, KeyCode::Char('j' | 'J'))
+                && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+        }
+        Leader::AltBacktick => key.code == KeyCode::Char('`') && key.modifiers.is_empty(),
+        _ => false,
+    }
 }
 
 fn encode_key(key: KeyEvent, application_cursor: bool) -> Vec<u8> {
@@ -2847,6 +2994,10 @@ mod tests {
             key(KeyCode::Char('J'), KeyModifiers::ALT | KeyModifiers::SHIFT),
             Leader::AltJ
         ));
+        assert!(is_leader(
+            key(KeyCode::Char('`'), KeyModifiers::ALT),
+            Leader::AltBacktick
+        ));
         assert!(!is_leader(
             key(
                 KeyCode::Char('j'),
@@ -2875,6 +3026,20 @@ mod tests {
         app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
             .unwrap();
         app.handle_key(key(KeyCode::Char('j'), KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(app.mode, AppMode::Command);
+        assert!(app.pending_escape.is_none());
+    }
+
+    #[test]
+    fn recognizes_legacy_escape_encoded_alt_backtick() {
+        let mut app = test_app();
+        app.loaded.config.settings.leader = Leader::AltBacktick;
+
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('`'), KeyModifiers::NONE))
             .unwrap();
 
         assert_eq!(app.mode, AppMode::Command);
@@ -2989,6 +3154,49 @@ mod tests {
             .unwrap();
         assert!(!app.show_help);
         assert_eq!(app.mode, AppMode::Command);
+    }
+
+    #[test]
+    fn help_overlay_stays_open_for_mouse_movement_and_closes_on_x() {
+        let mut app = test_app();
+        app.update_layout(Rect::new(0, 0, 100, 20));
+        app.mode = AppMode::Command;
+        app.show_help = true;
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 20));
+        app.help_close_rect = command_help_close_rect(Rect::new(0, 0, 100, 20));
+        render_command_help(
+            Rect::new(0, 0, 100, 20),
+            &mut buffer,
+            app.loaded.config.settings.leader.label(),
+        );
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+        assert!(app.show_help);
+
+        let close = app.help_close_rect.unwrap();
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: close.x,
+            row: close.y,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+        assert!(!app.show_help);
+    }
+
+    #[test]
+    fn footer_height_wraps_long_command_help() {
+        let mut app = test_app();
+        app.mode = AppMode::Command;
+
+        assert_eq!(app.footer_height(240, 24), 1);
+        assert!(app.footer_height(45, 24) > 1);
     }
 
     #[test]
@@ -3335,6 +3543,68 @@ mod tests {
 
         assert_eq!(app.clipboard.lines().next(), Some("line 0"));
         assert!(app.clipboard.contains("line 19"));
+    }
+
+    #[test]
+    fn command_mode_quit_requires_confirmation() {
+        let mut app = test_app();
+        app.mode = AppMode::Command;
+
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('q'), KeyModifiers::NONE))
+                .unwrap(),
+            Action::Continue
+        );
+        assert!(app.confirm_quit);
+
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(!app.confirm_quit);
+
+        app.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert!(app.confirm_quit);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL))
+                .unwrap(),
+            Action::Quit
+        );
+    }
+
+    #[test]
+    fn quit_confirmation_ignores_mouse_events_behind_it() {
+        let mut app = test_app();
+        app.update_layout(Rect::new(0, 0, 100, 20));
+        app.mode = AppMode::Command;
+        app.confirm_quit = true;
+        let second = app.content_rects[1];
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: second.x,
+            row: second.y,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+
+        assert_eq!(app.focus, 0);
+        assert!(app.confirm_quit);
+    }
+
+    #[test]
+    fn input_mode_quit_keys_confirm_only_when_focused_pane_cannot_accept_input() {
+        let mut app = test_app();
+        app.mode = AppMode::Input;
+
+        app.tasks[0].writer = Some(Box::new(io::sink()));
+        app.handle_key(key(KeyCode::Char('q'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(!app.confirm_quit);
+
+        app.tasks[0].writer = None;
+        app.handle_key(key(KeyCode::Char('q'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.confirm_quit);
     }
 
     #[test]
