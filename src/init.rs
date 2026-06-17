@@ -407,7 +407,7 @@ fn read_edited_line(output: &mut impl Write, prefix: &str) -> Result<String> {
         }
 
         match key.code {
-            KeyCode::Enter => {
+            KeyCode::Enter | KeyCode::Char('\n' | '\r') => {
                 writeln!(output, "\r")?;
                 output.flush()?;
                 return Ok(buffer);
