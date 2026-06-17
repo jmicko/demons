@@ -103,7 +103,7 @@ fn run_flow(
                 0,
             )?;
             match choice.to_ascii_lowercase().as_str() {
-                "e" => break edit_config(input, output, config)?,
+                "e" => break edit_config(input, output, config, config_root(&path))?,
                 "f" => break new_config(input, output, config_root(&path))?,
                 "a" => {
                     return Ok(InitResult { path, start: false });
@@ -148,6 +148,7 @@ fn edit_config(
     input: &mut impl PromptSource,
     output: &mut impl Write,
     config: Config,
+    root: &Path,
 ) -> Result<Config> {
     let settings = prompt_settings(input, output, &config.settings)?;
     let mut tasks = Vec::with_capacity(config.tasks.len());
@@ -156,7 +157,12 @@ fn edit_config(
     }
     while prompt_yes_no_with(input, output, "Add a new task?", true)? {
         let number = tasks.len() + 1;
-        tasks.push(prompt_task(input, output, None, number)?);
+        let detected = detected_task_templates(root)
+            .into_iter()
+            .filter(|candidate| !tasks.iter().any(|task| task.name == candidate.name))
+            .collect();
+        let task = prompt_detected_task(input, output, detected)?;
+        tasks.push(prompt_task(input, output, task.as_ref(), number)?);
     }
 
     if tasks.len() > 1 {

@@ -115,7 +115,11 @@ If stdin or stdout is not a TTY, `demons init` errors out: `init requires an int
 
 1. Parse the existing file. On error, print a clear message with line number and exit.
 2. Ask the user to choose from `Edit existing`, `Fresh start`, and `Abort`. `Edit existing` walks through every existing value as a default; `Fresh start` runs the new-config flow (overwriting); `Abort` exits without changes.
-3. In `Edit` mode, after the per-task walkthrough, offer `Add a new task? [Y/n]` and a numbered task-removal list. Removals may be entered as comma-separated numbers or names, and blank keeps all tasks.
+3. In `Edit` mode, after the per-task walkthrough, offer `Add a new task? [Y/n]`.
+   New tasks may use the same detected starters as the new-config flow, excluding
+   starter names already present. Then offer a numbered task-removal list.
+   Removals may be entered as comma-separated numbers or names, and blank keeps
+   all tasks.
 4. Review and write, then offer to start (same as new config).
 
 ## 5. CLI
