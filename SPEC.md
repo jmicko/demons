@@ -91,13 +91,17 @@ Validation rules (enforced at startup, fail loudly):
 
 ### 4.3 `demons init` wizard
 
-`demons init` is an interactive, line-based wizard. It uses simple stdin prompts, so it works in any terminal without needing a TUI. Every prompt shows the current value (if any) as the default, and `Enter` accepts it.
+`demons init` is an interactive wizard. It uses terminal prompts rather than a
+full TUI, so it works in ordinary terminals while still supporting line editing
+keys for text entry. Every prompt shows the current value (if any) as the
+default, and `Enter` accepts it. Fixed option prompts are presented as numbered
+choices while still accepting their textual values.
 
-If stdin is not a TTY, `demons init` errors out: `init requires an interactive terminal`.
+If stdin or stdout is not a TTY, `demons init` errors out: `init requires an interactive terminal`.
 
 #### 4.3.1 New config (no file present)
 
-1. **Project settings** — `layout` and `leader`. Each prompt shows the default; Enter to keep, type to change. Reserved settings are not prompted.
+1. **Project settings** — `layout` and `leader`. Fixed options are selected from numbered choices. Reserved settings are not prompted.
 2. **First task** — name, command, cwd, env. (v1 skips `watch` / `run_on_change` / `repeat`; the wizard will add them in v2.) Each shows a default (cwd default: `.`; env: skip).
 3. **Add another task?** `[Y/n]`. If yes, loop to step 2.
 4. **Review** — print the resulting `demons.toml` and ask `Write to ./demons.toml? [Y/n]`. On yes, write. On no, exit without writing.
@@ -106,8 +110,8 @@ If stdin is not a TTY, `demons init` errors out: `init requires an interactive t
 #### 4.3.2 Existing config (file present)
 
 1. Parse the existing file. On error, print a clear message with line number and exit.
-2. Ask `A file already exists at ./demons.toml. [E]dit existing, [F]resh start, [A]bort? [E]`. `E` walks through every existing value as a default; `F` runs the new-config flow (overwriting); `A` exits without changes.
-3. In `Edit` mode, after the per-task walkthrough, offer `Add a new task? [Y/n]` and `Remove a task? [name1, name2, ...]` (multi-select by name, blank to skip).
+2. Ask the user to choose from `Edit existing`, `Fresh start`, and `Abort`. `Edit existing` walks through every existing value as a default; `Fresh start` runs the new-config flow (overwriting); `Abort` exits without changes.
+3. In `Edit` mode, after the per-task walkthrough, offer `Add a new task? [Y/n]` and a numbered task-removal list. Removals may be entered as comma-separated numbers or names, and blank keeps all tasks.
 4. Review and write, then offer to start (same as new config).
 
 ## 5. CLI
@@ -154,6 +158,8 @@ Each pane has:
 
 - A 1-line header with: task name, status icon (`●` running, `✓` exited 0, `✗` exited N, `⏸` not yet started), and a clickable `[↻]` restart button on the right.
 - A scrollback buffer (default 10,000 lines; configurable in v2).
+- A pane-local text selection buffer derived from task output, used for deep
+  scrollback selection and clipboard copy.
 - A PTY-backed child process.
 - Visible focus state: the selected pane's border is cyan in input mode and
   yellow in command mode.
@@ -169,6 +175,16 @@ The configured leader key (default `Alt+J`) toggles between two modes.
 
 - Keyboard input goes to the selected pane.
 - Mouse scroll: scrolls the pane under the pointer.
+- Mouse drag: selects text in the pane under the pointer when the child is not
+  using mouse reporting. If the child is using mouse reporting, `Shift`-drag
+  selects text and plain mouse events continue to go to the child.
+- Dragging above or below the selected pane scrolls that pane's history and
+  never expands the selection into neighboring panes.
+- Right-click or `Ctrl+Shift+C`: copies the current selection. Copy uses OSC 52
+  for terminals that support clipboard writes and also stores an internal
+  Demons clipboard.
+- `Ctrl+Shift+V`, middle-click, or right-click without a current selection:
+  pastes the internal Demons clipboard into the selected pane in input mode.
 - Click on a pane: selects that pane without changing modes.
 - Click on a `[↻]` button: restarts that pane.
 - Mouse events inside a child that has enabled terminal mouse reporting are

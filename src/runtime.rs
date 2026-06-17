@@ -476,16 +476,16 @@ impl App {
             return Ok(Action::Continue);
         }
 
-        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) {
-            if self.paste_clipboard_to_task(index)? {
-                return Ok(Action::Continue);
-            }
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
+            && self.paste_clipboard_to_task(index)?
+        {
+            return Ok(Action::Continue);
         }
 
-        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Middle)) {
-            if self.paste_clipboard_to_task(index)? {
-                return Ok(Action::Continue);
-            }
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Middle))
+            && self.paste_clipboard_to_task(index)?
+        {
+            return Ok(Action::Continue);
         }
 
         if self.mode == AppMode::Command || mouse_mode == MouseProtocolMode::None {

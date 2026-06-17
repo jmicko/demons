@@ -45,6 +45,9 @@ Run the interactive setup from a project root:
 demons init
 ```
 
+The wizard uses numbered choices for fixed options and supports normal line
+editing keys while entering text.
+
 Or create `demons.toml` yourself:
 
 ```toml
@@ -92,6 +95,15 @@ changing modes.
 Click a pane to focus it. Click `[↻]` in a pane header to restart that task.
 The mouse wheel scrolls pane history unless the child application has enabled
 terminal mouse reporting in input mode.
+
+Drag inside a pane to select text. If the child application has enabled mouse
+reporting, use `Shift`-drag to select instead of sending the drag to the child.
+Dragging above or below the pane scrolls that pane's history while keeping the
+selection inside the original pane. Right-click or press `Ctrl+Shift+C` to copy
+the selection; terminals that support OSC 52 receive it on the system
+clipboard. `Ctrl+Shift+V`, middle-click, or right-click with no active
+selection pastes the last copied Demons selection back to the focused pane in
+input mode.
 
 Because the leader is intercepted, it cannot be sent to a child while in input
 mode. Set a different leader if an application or window manager needs
