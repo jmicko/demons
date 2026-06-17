@@ -837,15 +837,19 @@ impl App {
     }
 
     fn footer_action_at(&self, mouse: MouseEvent) -> Option<FooterAction> {
-        let action = match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) => |hit: &FooterHit| hit.left,
-            MouseEventKind::Down(MouseButton::Right) => |hit: &FooterHit| hit.right,
-            _ => return None,
-        };
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return None;
+        }
         self.footer_hits
             .iter()
             .find(|hit| contains(hit.rect, mouse.column, mouse.row))
-            .and_then(action)
+            .and_then(|hit| {
+                if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                    hit.alternate.or(hit.primary)
+                } else {
+                    hit.primary
+                }
+            })
     }
 
     fn apply_footer_action(&mut self, action: FooterAction) -> Result<Action> {
@@ -2541,6 +2545,7 @@ fn render_command_help(area: Rect, buffer: &mut Buffer, leader: &str) {
         Line::raw("PageUp/PageDown        Scroll focused pane"),
         Line::raw("Home/End               Jump to top/bottom of history"),
         Line::raw("drag / right-click     Select and copy pane text"),
+        Line::raw("footer click/Shift     Run default / alternate command"),
         Line::raw("y / Y                  Copy visible text / full scrollback"),
         Line::raw("S                      Save full scrollback to a temp log"),
         Line::raw("/                      Search focused pane"),
@@ -2569,7 +2574,7 @@ fn render_command_help(area: Rect, buffer: &mut Buffer, leader: &str) {
 }
 
 fn command_help_rect(area: Rect) -> Rect {
-    centered_rect(area, 74, 16)
+    centered_rect(area, 74, 17)
 }
 
 fn command_help_close_rect(area: Rect) -> Option<Rect> {
@@ -2739,8 +2744,8 @@ fn search_footer_text(search: &SearchState) -> String {
 struct FooterChunk {
     text: String,
     width: u16,
-    left: Option<FooterAction>,
-    right: Option<FooterAction>,
+    primary: Option<FooterAction>,
+    alternate: Option<FooterAction>,
 }
 
 impl FooterChunk {
@@ -2752,7 +2757,7 @@ impl FooterChunk {
         end_row: u16,
         end_column: u16,
     ) -> Option<FooterHit> {
-        if self.left.is_none() || start_row != end_row || end_column <= start_column {
+        if self.primary.is_none() || start_row != end_row || end_column <= start_column {
             return None;
         }
         Some(FooterHit {
@@ -2762,8 +2767,8 @@ impl FooterChunk {
                 end_column - start_column,
                 1,
             ),
-            left: self.left,
-            right: self.right.or(self.left),
+            primary: self.primary,
+            alternate: self.alternate.or(self.primary),
         })
     }
 }
@@ -2771,8 +2776,8 @@ impl FooterChunk {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FooterHit {
     rect: Rect,
-    left: Option<FooterAction>,
-    right: Option<FooterAction>,
+    primary: Option<FooterAction>,
+    alternate: Option<FooterAction>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2802,8 +2807,8 @@ fn footer_chunks(text: &str, width: u16) -> Vec<FooterChunk> {
             .enumerate()
             .flat_map(|(index, segment)| {
                 let prefix = if index == 0 { " " } else { " | " };
-                let (left, right) = footer_actions_for_segment(segment);
-                split_footer_chunk(&format!("{prefix}{segment}"), width, left, right)
+                let (primary, alternate) = footer_actions_for_segment(segment);
+                split_footer_chunk(&format!("{prefix}{segment}"), width, primary, alternate)
             })
             .collect();
     }
@@ -2814,8 +2819,8 @@ fn footer_chunks(text: &str, width: u16) -> Vec<FooterChunk> {
 fn split_footer_chunk(
     text: &str,
     width: usize,
-    left: Option<FooterAction>,
-    right: Option<FooterAction>,
+    primary: Option<FooterAction>,
+    alternate: Option<FooterAction>,
 ) -> Vec<FooterChunk> {
     let mut chunks = Vec::new();
     let mut current = String::new();
@@ -2824,8 +2829,8 @@ fn split_footer_chunk(
             chunks.push(FooterChunk {
                 width: char_count(&current).min(usize::from(u16::MAX)) as u16,
                 text: std::mem::take(&mut current),
-                left,
-                right,
+                primary,
+                alternate,
             });
         }
         current.push(character);
@@ -2834,8 +2839,8 @@ fn split_footer_chunk(
         chunks.push(FooterChunk {
             width: char_count(&current).min(usize::from(u16::MAX)) as u16,
             text: current,
-            left,
-            right,
+            primary,
+            alternate,
         });
     }
     chunks
@@ -3431,22 +3436,22 @@ mod tests {
     }
 
     #[test]
-    fn footer_chunks_keep_compact_left_and_right_actions() {
+    fn footer_chunks_keep_compact_primary_and_alternate_actions() {
         let chunks = footer_chunks(" y/Y: copy | r/R: restart ", 80);
 
         let copy = chunks
             .iter()
             .find(|chunk| chunk.text == " y/Y: copy")
             .unwrap();
-        assert_eq!(copy.left, Some(FooterAction::CopyVisible));
-        assert_eq!(copy.right, Some(FooterAction::CopyHistory));
+        assert_eq!(copy.primary, Some(FooterAction::CopyVisible));
+        assert_eq!(copy.alternate, Some(FooterAction::CopyHistory));
 
         let restart = chunks
             .iter()
             .find(|chunk| chunk.text == " | r/R: restart")
             .unwrap();
-        assert_eq!(restart.left, Some(FooterAction::RestartFocused));
-        assert_eq!(restart.right, Some(FooterAction::RestartAll));
+        assert_eq!(restart.primary, Some(FooterAction::RestartFocused));
+        assert_eq!(restart.alternate, Some(FooterAction::RestartAll));
     }
 
     #[test]
@@ -3567,11 +3572,14 @@ mod tests {
     }
 
     #[test]
-    fn footer_right_click_uses_alternate_action() {
+    fn footer_click_uses_primary_action_and_shift_click_uses_alternate() {
         let mut app = test_app();
-        app.update_layout(Rect::new(0, 0, 120, 20));
+        app.update_layout(Rect::new(0, 0, 100, 8));
         app.mode = AppMode::Command;
-        app.tasks[0].process_output(b"alpha\n");
+        for line in 0..20 {
+            app.tasks[0].process_output(format!("line {line}\n").as_bytes());
+        }
+        app.tasks[0].scroll_up(10);
 
         let mut buffer = Buffer::empty(Rect::new(0, 0, 120, 2));
         app.footer_hits = render_footer_text(
@@ -3582,19 +3590,76 @@ mod tests {
         let copy = app
             .footer_hits
             .iter()
-            .find(|hit| hit.right == Some(FooterAction::CopyHistory))
+            .find(|hit| hit.alternate == Some(FooterAction::CopyHistory))
             .unwrap()
             .rect;
 
         app.handle_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Right),
+            kind: MouseEventKind::Down(MouseButton::Left),
             column: copy.x,
             row: copy.y,
             modifiers: KeyModifiers::NONE,
         })
         .unwrap();
+        assert!(app.clipboard.contains("line 6"));
+        assert!(!app.clipboard.contains("line 19"));
 
-        assert_eq!(app.clipboard, "alpha\n");
+        app.clipboard.clear();
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: copy.x,
+            row: copy.y,
+            modifiers: KeyModifiers::SHIFT,
+        })
+        .unwrap();
+        assert_eq!(app.clipboard.lines().next(), Some("line 0"));
+        assert!(app.clipboard.contains("line 19"));
+    }
+
+    #[test]
+    fn footer_shift_click_uses_restart_all_and_right_click_is_ignored() {
+        let mut app = test_app();
+        app.update_layout(Rect::new(0, 0, 120, 20));
+        app.mode = AppMode::Command;
+        for (index, task) in app.tasks.iter_mut().enumerate() {
+            task.pid = Some(1000 + index as u32);
+        }
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 120, 2));
+        app.footer_hits = render_footer_text(
+            " y/Y: copy | r/R: restart ",
+            Rect::new(0, 0, 120, 2),
+            &mut buffer,
+        );
+        let restart = app
+            .footer_hits
+            .iter()
+            .find(|hit| hit.alternate == Some(FooterAction::RestartAll))
+            .unwrap()
+            .rect;
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: restart.x,
+            row: restart.y,
+            modifiers: KeyModifiers::SHIFT,
+        })
+        .unwrap();
+
+        assert!(app.tasks.iter().all(|task| task.restart_requested));
+
+        for task in &mut app.tasks {
+            task.restart_requested = false;
+        }
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: restart.x,
+            row: restart.y,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+
+        assert!(app.tasks.iter().all(|task| !task.restart_requested));
     }
 
     #[test]
