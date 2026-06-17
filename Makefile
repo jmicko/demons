@@ -14,7 +14,7 @@ test: check
 	cargo test --all-targets --all-features --locked
 
 release-check: test
-	CARGO_TARGET_DIR="$(RELEASE_TARGET_DIR)" cargo package --allow-dirty
+	CARGO_TARGET_DIR="$(RELEASE_TARGET_DIR)" cargo package --locked --allow-dirty
 
 install:
 	CARGO_INSTALL_ROOT="$(PREFIX)" cargo install --path . --locked --force

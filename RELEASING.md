@@ -26,7 +26,7 @@ then runs `cargo check --locked`.
 5. Inspect the package contents if anything about packaging changed:
 
    ```sh
-   cargo package --list
+   cargo package --locked --list
    ```
 
 6. Commit the version bump:
