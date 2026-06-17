@@ -120,6 +120,7 @@ struct App {
     content_rects: Vec<Rect>,
     footer_rect: Option<Rect>,
     mode_button_rect: Option<Rect>,
+    footer_hits: Vec<FooterHit>,
     tx: SyncSender<ProcessEvent>,
     rx: Receiver<ProcessEvent>,
     registry: ProcessRegistry,
@@ -130,7 +131,6 @@ struct App {
     notice: Option<Notice>,
     fullscreen: bool,
     search: Option<SearchState>,
-    last_search: Option<String>,
     show_help: bool,
     help_close_rect: Option<Rect>,
     confirm_quit: bool,
@@ -166,6 +166,7 @@ impl App {
             content_rects: Vec::new(),
             footer_rect: None,
             mode_button_rect: None,
+            footer_hits: Vec::new(),
             tx,
             rx,
             registry,
@@ -176,7 +177,6 @@ impl App {
             notice: None,
             fullscreen: false,
             search: None,
-            last_search: None,
             show_help: false,
             help_close_rect: None,
             confirm_quit: false,
@@ -273,6 +273,7 @@ impl App {
         self.update_layout(frame_area);
         let buffer = frame.buffer_mut();
         self.help_close_rect = None;
+        self.footer_hits.clear();
 
         for index in 0..self.tasks.len() {
             let area = self.pane_rects[index];
@@ -337,7 +338,7 @@ impl App {
                 .alignment(ratatui::layout::Alignment::Center)
                 .style(Style::default().fg(Color::Black).bg(mode_color))
                 .render(button_area, buffer);
-            render_footer_text(&help, help_area, buffer);
+            self.footer_hits = render_footer_text(&help, help_area, buffer);
         }
 
         if self.show_help {
@@ -464,8 +465,6 @@ impl App {
             KeyCode::Char('?') => self.show_help = true,
             KeyCode::Char('f') => self.fullscreen = !self.fullscreen,
             KeyCode::Char('/') => self.start_search(),
-            KeyCode::Char('n') => self.repeat_search(SearchDirection::Older),
-            KeyCode::Char('N') => self.repeat_search(SearchDirection::Newer),
             KeyCode::Char('y') => self.copy_focused_visible(),
             KeyCode::Char('Y') => self.copy_focused_history(),
             KeyCode::Char('S') => self.save_focused_history()?,
@@ -526,7 +525,16 @@ impl App {
     fn handle_search_key(&mut self, key: KeyEvent) -> Result<Action> {
         match key.code {
             KeyCode::Esc => self.cancel_search(),
-            KeyCode::Enter | KeyCode::Char('\n' | '\r') => self.finish_search(),
+            KeyCode::Enter | KeyCode::Char('\n' | '\r')
+                if key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                self.submit_search(SearchDirection::Newer)
+            }
+            KeyCode::Enter | KeyCode::Char('\n' | '\r') => {
+                self.submit_search(SearchDirection::Older)
+            }
+            KeyCode::Char('n') => self.submit_search(SearchDirection::Older),
+            KeyCode::Char('N') => self.submit_search(SearchDirection::Newer),
             KeyCode::Char('c' | 'C') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.cancel_search()
             }
@@ -591,6 +599,8 @@ impl App {
             pane: self.focus,
             query: String::new(),
             cursor: 0,
+            current: None,
+            message: None,
         });
         self.selection = None;
         self.notice = None;
@@ -603,70 +613,44 @@ impl App {
         self.mode = AppMode::Command;
     }
 
-    fn finish_search(&mut self) {
-        let Some(search) = self.search.take() else {
-            self.mode = AppMode::Command;
+    fn submit_search(&mut self, direction: SearchDirection) {
+        let Some(search) = self.search.as_ref() else {
             return;
         };
-        self.mode = AppMode::Command;
+        let pane = search.pane;
         let query = search.query.trim().to_owned();
+        let current = search.current;
         if query.is_empty() {
-            self.set_notice("Search cancelled.".to_owned());
+            if let Some(search) = self.search.as_mut() {
+                search.message = Some("type a query".to_owned());
+            }
             return;
         }
-
-        let Some(line) = self.tasks[search.pane].history.find_last_line(&query) else {
-            self.set_notice(format!("No matches for {query:?}."));
-            return;
-        };
-
-        self.last_search = Some(query.clone());
-        self.jump_to_search_line(search.pane, line, &query);
-    }
-
-    fn repeat_search(&mut self, direction: SearchDirection) {
-        let Some(query) = self.last_search.clone() else {
-            self.set_notice("No previous search.".to_owned());
-            return;
-        };
-        let pane = self.focus;
-        let current_line = self.search_anchor_line(pane);
         let history = &self.tasks[pane].history;
         let line = match direction {
-            SearchDirection::Older => history
-                .find_line_before(&query, current_line)
+            SearchDirection::Older => current
+                .and_then(|line| history.find_line_before(&query, line))
                 .or_else(|| history.find_last_line(&query)),
-            SearchDirection::Newer => history
-                .find_line_after(&query, current_line)
+            SearchDirection::Newer => current
+                .and_then(|line| history.find_line_after(&query, line))
                 .or_else(|| history.find_first_line(&query)),
         };
         let Some(line) = line else {
-            self.set_notice(format!("No matches for {query:?}."));
+            if let Some(search) = self.search.as_mut() {
+                search.current = None;
+                search.message = Some("no matches".to_owned());
+            }
             return;
         };
 
         self.jump_to_search_line(pane, line, &query);
-    }
-
-    fn search_anchor_line(&self, pane: usize) -> u64 {
-        if let Some(selection) = self
-            .selection
-            .as_ref()
-            .filter(|selection| selection.pane == pane)
-        {
-            return selection.ordered_points().0.line;
+        if let Some(search) = self.search.as_mut() {
+            search.current = Some(line);
+            search.message = Some(match direction {
+                SearchDirection::Older => "older match".to_owned(),
+                SearchDirection::Newer => "newer match".to_owned(),
+            });
         }
-
-        let height = self
-            .content_rects
-            .get(pane)
-            .map(|rect| rect.height)
-            .unwrap_or(self.tasks[pane].pty_size.rows);
-        self.tasks[pane]
-            .history
-            .visible_start(height, self.tasks[pane].scroll_offset)
-            .saturating_add(u64::from(height / 2))
-            .min(self.tasks[pane].history.line_count().saturating_sub(1))
     }
 
     fn jump_to_search_line(&mut self, pane: usize, line: u64, query: &str) {
@@ -765,6 +749,10 @@ impl App {
             return Ok(Action::Continue);
         }
 
+        if let Some(action) = self.footer_action_at(mouse) {
+            return self.apply_footer_action(action);
+        }
+
         if self.mode == AppMode::Search {
             self.cancel_search();
         }
@@ -844,6 +832,49 @@ impl App {
             let encoding = self.tasks[index].parser.screen().mouse_protocol_encoding();
             let bytes = encode_mouse(mouse, local_x, local_y, encoding);
             self.tasks[index].write_input(&bytes)?;
+        }
+        Ok(Action::Continue)
+    }
+
+    fn footer_action_at(&self, mouse: MouseEvent) -> Option<FooterAction> {
+        let action = match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => |hit: &FooterHit| hit.left,
+            MouseEventKind::Down(MouseButton::Right) => |hit: &FooterHit| hit.right,
+            _ => return None,
+        };
+        self.footer_hits
+            .iter()
+            .find(|hit| contains(hit.rect, mouse.column, mouse.row))
+            .and_then(action)
+    }
+
+    fn apply_footer_action(&mut self, action: FooterAction) -> Result<Action> {
+        match action {
+            FooterAction::ToggleFullscreen => self.fullscreen = !self.fullscreen,
+            FooterAction::StartSearch => self.start_search(),
+            FooterAction::SearchOlder => self.submit_search(SearchDirection::Older),
+            FooterAction::SearchNewer => self.submit_search(SearchDirection::Newer),
+            FooterAction::SearchDone => self.cancel_search(),
+            FooterAction::CopyVisible => self.copy_focused_visible(),
+            FooterAction::CopyHistory => self.copy_focused_history(),
+            FooterAction::SaveHistory => self.save_focused_history()?,
+            FooterAction::ShowHelp => self.show_help = true,
+            FooterAction::RestartFocused => self.request_restart(self.focus),
+            FooterAction::RestartAll => {
+                for index in 0..self.tasks.len() {
+                    self.request_restart(index);
+                }
+            }
+            FooterAction::ClearFocused => {
+                self.tasks[self.focus].clear();
+                self.clear_selection_for(self.focus);
+            }
+            FooterAction::Quit => return Ok(self.request_quit()),
+            FooterAction::ReturnInput => {
+                self.search = None;
+                self.show_help = false;
+                self.mode = AppMode::Input;
+            }
         }
         Ok(Action::Continue)
     }
@@ -1336,7 +1367,7 @@ impl App {
                 "COMMAND MODE",
                 Color::Yellow,
                 format!(
-                    " arrows/hjkl: move | f: fullscreen | / n/N: find | y/Y: copy | S: save | ?: help | r: restart | R: all | c: clear | q: quit | {}: input ",
+                    " arrows/hjkl: move | f: fullscreen | /: search | y/Y: copy | S: save | ?: help | r/R: restart | c: clear | q: quit | {}: input ",
                     self.loaded.config.settings.leader.label()
                 ),
             ),
@@ -2213,6 +2244,8 @@ struct SearchState {
     pane: usize,
     query: String,
     cursor: usize,
+    current: Option<u64>,
+    message: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2441,7 +2474,7 @@ fn render_selection(
     }
 }
 
-fn render_footer_text(text: &str, area: Rect, buffer: &mut Buffer) {
+fn render_footer_text(text: &str, area: Rect, buffer: &mut Buffer) -> Vec<FooterHit> {
     for row in 0..area.height {
         for column in 0..area.width {
             buffer[(area.x + column, area.y + row)]
@@ -2450,6 +2483,7 @@ fn render_footer_text(text: &str, area: Rect, buffer: &mut Buffer) {
         }
     }
 
+    let mut hits = Vec::new();
     let mut row = 0_u16;
     let mut column = 0_u16;
     for chunk in footer_chunks(text, area.width) {
@@ -2464,6 +2498,8 @@ fn render_footer_text(text: &str, area: Rect, buffer: &mut Buffer) {
             break;
         }
 
+        let start_row = row;
+        let start_column = column;
         for character in chunk.text.chars() {
             if column >= area.width {
                 row += 1;
@@ -2478,7 +2514,11 @@ fn render_footer_text(text: &str, area: Rect, buffer: &mut Buffer) {
                 .set_style(Style::default().fg(Color::White).bg(Color::DarkGray));
             column += 1;
         }
+        if let Some(hit) = chunk.hit_rect(area, start_row, start_column, row, column) {
+            hits.push(hit);
+        }
     }
+    hits
 }
 
 fn render_command_help(area: Rect, buffer: &mut Buffer, leader: &str) {
@@ -2503,7 +2543,8 @@ fn render_command_help(area: Rect, buffer: &mut Buffer, leader: &str) {
         Line::raw("drag / right-click     Select and copy pane text"),
         Line::raw("y / Y                  Copy visible text / full scrollback"),
         Line::raw("S                      Save full scrollback to a temp log"),
-        Line::raw("/, n, N                Search, repeat older, repeat newer"),
+        Line::raw("/                      Search focused pane"),
+        Line::raw("Enter / Shift-Enter    Search older / newer while searching"),
         Line::raw("r / R                  Restart focused task / all tasks"),
         Line::raw("c                      Clear focused pane"),
         Line::raw("q or Ctrl-C            Quit"),
@@ -2686,13 +2727,70 @@ fn search_footer_text(search: &SearchState) -> String {
     let mut query = search.query.clone();
     let cursor = byte_index_for_char(&query, search.cursor);
     query.insert(cursor, '|');
-    format!(" /{query}  Enter: jump | Esc: cancel ")
+    let suffix = search
+        .message
+        .as_ref()
+        .map(|message| format!(" | {message}"))
+        .unwrap_or_default();
+    format!(" /{query} | Enter: older | Shift+Enter: newer | Esc: done{suffix} ")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FooterChunk {
     text: String,
     width: u16,
+    left: Option<FooterAction>,
+    right: Option<FooterAction>,
+}
+
+impl FooterChunk {
+    fn hit_rect(
+        &self,
+        area: Rect,
+        start_row: u16,
+        start_column: u16,
+        end_row: u16,
+        end_column: u16,
+    ) -> Option<FooterHit> {
+        if self.left.is_none() || start_row != end_row || end_column <= start_column {
+            return None;
+        }
+        Some(FooterHit {
+            rect: Rect::new(
+                area.x + start_column,
+                area.y + start_row,
+                end_column - start_column,
+                1,
+            ),
+            left: self.left,
+            right: self.right.or(self.left),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FooterHit {
+    rect: Rect,
+    left: Option<FooterAction>,
+    right: Option<FooterAction>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FooterAction {
+    ToggleFullscreen,
+    StartSearch,
+    SearchOlder,
+    SearchNewer,
+    SearchDone,
+    CopyVisible,
+    CopyHistory,
+    SaveHistory,
+    ShowHelp,
+    RestartFocused,
+    RestartAll,
+    ClearFocused,
+    Quit,
+    ReturnInput,
 }
 
 fn footer_chunks(text: &str, width: u16) -> Vec<FooterChunk> {
@@ -2704,15 +2802,21 @@ fn footer_chunks(text: &str, width: u16) -> Vec<FooterChunk> {
             .enumerate()
             .flat_map(|(index, segment)| {
                 let prefix = if index == 0 { " " } else { " | " };
-                split_footer_chunk(&format!("{prefix}{segment}"), width)
+                let (left, right) = footer_actions_for_segment(segment);
+                split_footer_chunk(&format!("{prefix}{segment}"), width, left, right)
             })
             .collect();
     }
 
-    split_footer_chunk(text, width)
+    split_footer_chunk(text, width, None, None)
 }
 
-fn split_footer_chunk(text: &str, width: usize) -> Vec<FooterChunk> {
+fn split_footer_chunk(
+    text: &str,
+    width: usize,
+    left: Option<FooterAction>,
+    right: Option<FooterAction>,
+) -> Vec<FooterChunk> {
     let mut chunks = Vec::new();
     let mut current = String::new();
     for character in text.chars() {
@@ -2720,6 +2824,8 @@ fn split_footer_chunk(text: &str, width: usize) -> Vec<FooterChunk> {
             chunks.push(FooterChunk {
                 width: char_count(&current).min(usize::from(u16::MAX)) as u16,
                 text: std::mem::take(&mut current),
+                left,
+                right,
             });
         }
         current.push(character);
@@ -2728,9 +2834,35 @@ fn split_footer_chunk(text: &str, width: usize) -> Vec<FooterChunk> {
         chunks.push(FooterChunk {
             width: char_count(&current).min(usize::from(u16::MAX)) as u16,
             text: current,
+            left,
+            right,
         });
     }
     chunks
+}
+
+fn footer_actions_for_segment(segment: &str) -> (Option<FooterAction>, Option<FooterAction>) {
+    match segment.trim() {
+        "f: fullscreen" => (Some(FooterAction::ToggleFullscreen), None),
+        "/: search" => (Some(FooterAction::StartSearch), None),
+        "Enter: older" => (Some(FooterAction::SearchOlder), None),
+        "Shift+Enter: newer" => (Some(FooterAction::SearchNewer), None),
+        "Esc: done" => (Some(FooterAction::SearchDone), None),
+        "y/Y: copy" => (
+            Some(FooterAction::CopyVisible),
+            Some(FooterAction::CopyHistory),
+        ),
+        "S: save" => (Some(FooterAction::SaveHistory), None),
+        "?: help" => (Some(FooterAction::ShowHelp), None),
+        "r/R: restart" => (
+            Some(FooterAction::RestartFocused),
+            Some(FooterAction::RestartAll),
+        ),
+        "c: clear" => (Some(FooterAction::ClearFocused), None),
+        "q: quit" => (Some(FooterAction::Quit), None),
+        segment if segment.ends_with(": input") => (Some(FooterAction::ReturnInput), None),
+        _ => (None, None),
+    }
 }
 
 fn footer_line_count(text: &str, width: u16) -> u16 {
@@ -3299,6 +3431,25 @@ mod tests {
     }
 
     #[test]
+    fn footer_chunks_keep_compact_left_and_right_actions() {
+        let chunks = footer_chunks(" y/Y: copy | r/R: restart ", 80);
+
+        let copy = chunks
+            .iter()
+            .find(|chunk| chunk.text == " y/Y: copy")
+            .unwrap();
+        assert_eq!(copy.left, Some(FooterAction::CopyVisible));
+        assert_eq!(copy.right, Some(FooterAction::CopyHistory));
+
+        let restart = chunks
+            .iter()
+            .find(|chunk| chunk.text == " | r/R: restart")
+            .unwrap();
+        assert_eq!(restart.left, Some(FooterAction::RestartFocused));
+        assert_eq!(restart.right, Some(FooterAction::RestartAll));
+    }
+
+    #[test]
     fn centered_rect_clamps_to_small_areas() {
         assert_eq!(
             centered_rect(Rect::new(0, 0, 10, 5), 74, 16),
@@ -3405,12 +3556,45 @@ mod tests {
             pane: 0,
             query: "eror".to_owned(),
             cursor: 2,
+            current: None,
+            message: None,
         };
 
         assert_eq!(
             search_footer_text(&search),
-            " /er|or  Enter: jump | Esc: cancel "
+            " /er|or | Enter: older | Shift+Enter: newer | Esc: done "
         );
+    }
+
+    #[test]
+    fn footer_right_click_uses_alternate_action() {
+        let mut app = test_app();
+        app.update_layout(Rect::new(0, 0, 120, 20));
+        app.mode = AppMode::Command;
+        app.tasks[0].process_output(b"alpha\n");
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 120, 2));
+        app.footer_hits = render_footer_text(
+            " y/Y: copy | r/R: restart ",
+            Rect::new(0, 0, 120, 2),
+            &mut buffer,
+        );
+        let copy = app
+            .footer_hits
+            .iter()
+            .find(|hit| hit.right == Some(FooterAction::CopyHistory))
+            .unwrap()
+            .rect;
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: copy.x,
+            row: copy.y,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+
+        assert_eq!(app.clipboard, "alpha\n");
     }
 
     #[test]
@@ -3734,7 +3918,8 @@ mod tests {
         app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
 
-        assert_eq!(app.mode, AppMode::Command);
+        assert_eq!(app.mode, AppMode::Search);
+        assert_eq!(app.search.as_ref().unwrap().current, Some(5));
         assert!(app.tasks[0].scroll_offset > 0);
         assert_eq!(app.selection.as_ref().unwrap().pane, 0);
         assert_eq!(app.selected_text().unwrap(), "ERROR target");
@@ -3786,12 +3971,11 @@ mod tests {
         app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
 
-        assert_eq!(app.mode, AppMode::Command);
+        assert_eq!(app.mode, AppMode::Search);
         assert!(app.selection.is_none());
-        assert!(
-            app.notice
-                .as_ref()
-                .is_some_and(|notice| notice.text.contains("No matches"))
+        assert_eq!(
+            app.search.as_ref().unwrap().message.as_deref(),
+            Some("no matches")
         );
     }
 
@@ -3830,7 +4014,7 @@ mod tests {
             .unwrap();
         assert_eq!(app.selected_text().unwrap(), "error 25");
 
-        app.handle_key(key(KeyCode::Char('N'), KeyModifiers::SHIFT))
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::SHIFT))
             .unwrap();
         assert_eq!(app.selected_text().unwrap(), "error 5");
     }
