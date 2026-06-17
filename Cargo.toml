@@ -6,6 +6,7 @@ rust-version = "1.85"
 description = "Run a project's development commands side-by-side in one terminal"
 license = "Apache-2.0"
 readme = "README.md"
+exclude = ["test-demons.toml", "test_commands.sh"]
 documentation = "https://docs.rs/demons"
 repository = "https://github.com/jmicko/demons"
 homepage = "https://github.com/jmicko/demons"
