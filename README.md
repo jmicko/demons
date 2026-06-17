@@ -191,4 +191,5 @@ directory so the workspace `target/` is never polluted by the package build:
 make release-check
 ```
 
+See [RELEASING.md](RELEASING.md) for the version bump and publish checklist.
 See [SPEC.md](SPEC.md) for the v1 behavior and product boundaries.
