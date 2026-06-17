@@ -1312,6 +1312,7 @@ struct TextHistory {
     width: u16,
     max_lines: usize,
     state: TextParserState,
+    csi: String,
 }
 
 impl TextHistory {
@@ -1325,6 +1326,7 @@ impl TextHistory {
             width: width.max(1),
             max_lines,
             state: TextParserState::Ground,
+            csi: String::new(),
         }
     }
 
@@ -1335,6 +1337,7 @@ impl TextHistory {
         self.column = 0;
         self.pending_wrap = false;
         self.state = TextParserState::Ground;
+        self.csi.clear();
     }
 
     fn set_width(&mut self, width: u16) {
@@ -1391,14 +1394,21 @@ impl TextHistory {
                     character => added_rows += self.put_char(character),
                 },
                 TextParserState::Escape => match character {
-                    '[' => self.state = TextParserState::Csi,
+                    '[' => {
+                        self.csi.clear();
+                        self.state = TextParserState::Csi;
+                    }
                     ']' => self.state = TextParserState::Osc,
                     'P' | '^' | '_' => self.state = TextParserState::StringControl,
                     _ => self.state = TextParserState::Ground,
                 },
                 TextParserState::Csi => {
                     if ('@'..='~').contains(&character) {
+                        self.apply_csi(character);
+                        self.csi.clear();
                         self.state = TextParserState::Ground;
+                    } else if self.csi.len() < 32 {
+                        self.csi.push(character);
                     }
                 }
                 TextParserState::Osc => match character {
@@ -1460,6 +1470,25 @@ impl TextHistory {
         self.column = 0;
         self.pending_wrap = false;
         1
+    }
+
+    fn apply_csi(&mut self, final_byte: char) {
+        if final_byte != 'K' {
+            return;
+        }
+        match first_csi_param(&self.csi).unwrap_or(0) {
+            0 => truncate_chars(&mut self.current.text, self.column),
+            1 => {
+                let end = byte_index_for_char(&self.current.text, self.column);
+                self.current.text.replace_range(0..end, "");
+                self.column = 0;
+            }
+            2 => {
+                self.current.text.clear();
+                self.column = 0;
+            }
+            _ => {}
+        }
     }
 
     fn text_between(&self, anchor: SelectionPoint, cursor: SelectionPoint) -> String {
@@ -1810,12 +1839,35 @@ fn replace_char(value: &mut String, index: usize, character: char) {
     value.replace_range(start..end, character.encode_utf8(&mut [0_u8; 4]));
 }
 
+fn truncate_chars(value: &mut String, len: usize) {
+    let index = byte_index_for_char(value, len);
+    value.truncate(index);
+}
+
+fn byte_index_for_char(value: &str, char_index: usize) -> usize {
+    value
+        .char_indices()
+        .nth(char_index)
+        .map(|(index, _)| index)
+        .unwrap_or(value.len())
+}
+
 fn slice_chars(value: &str, start: usize, end: usize) -> String {
     value
         .chars()
         .skip(start)
         .take(end.saturating_sub(start))
         .collect()
+}
+
+fn first_csi_param(value: &str) -> Option<usize> {
+    value
+        .split(';')
+        .next()
+        .filter(|param| {
+            !param.is_empty() && param.chars().all(|character| character.is_ascii_digit())
+        })
+        .and_then(|param| param.parse().ok())
 }
 
 fn write_osc52_clipboard(text: &str) -> io::Result<()> {
@@ -2205,6 +2257,22 @@ mod tests {
         );
 
         assert_eq!(text, "bravocharlie");
+    }
+
+    #[test]
+    fn text_history_honors_erase_line_for_progress_output() {
+        let mut history = TextHistory::new(80, 100);
+        history.process(b"old progress text\r\x1b[Kdone\n");
+
+        let text = history.text_between(
+            SelectionPoint { line: 0, column: 0 },
+            SelectionPoint {
+                line: 0,
+                column: 20,
+            },
+        );
+
+        assert_eq!(text, "done");
     }
 
     #[test]
