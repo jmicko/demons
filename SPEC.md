@@ -212,6 +212,7 @@ The configured leader key (default `Alt+J`) toggles between two modes.
 - `PageUp` / `PageDown`: scroll the focused pane history by one page.
 - `Home` / `End`: jump to the top or bottom of focused pane history.
 - `y`: copy the focused pane's visible text.
+- `Y`: copy the focused pane's full scrollback.
 - `r`: restart focused pane.
 - `R`: restart all panes.
 - `c`: clear the focused pane and its scrollback.

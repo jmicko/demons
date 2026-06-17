@@ -47,6 +47,7 @@ const ALT_ESCAPE_TIMEOUT: Duration = Duration::from_millis(50);
 const MODE_BUTTON_WIDTH: u16 = 13;
 const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(45);
 const NOTICE_DURATION: Duration = Duration::from_secs(3);
+const MAX_FULL_HISTORY_OSC52_BYTES: usize = 512 * 1024;
 
 type ProcessRegistry = Arc<Mutex<HashSet<u32>>>;
 
@@ -345,7 +346,7 @@ impl App {
                         "COMMAND MODE",
                         Color::Yellow,
                         format!(
-                            " arrows/hjkl: move | f: fullscreen | r: restart | R: all | c: clear | q: quit | {}: input ",
+                            " arrows/hjkl: move | f: fullscreen | y/Y: copy | r: restart | R: all | c: clear | q: quit | {}: input ",
                             self.loaded.config.settings.leader.label()
                         ),
                     ),
@@ -453,6 +454,7 @@ impl App {
             }
             KeyCode::Char('f') => self.fullscreen = !self.fullscreen,
             KeyCode::Char('y') => self.copy_focused_visible(),
+            KeyCode::Char('Y') => self.copy_focused_history(),
             KeyCode::Char('r') => self.request_restart(self.focus),
             KeyCode::Char('R') => {
                 for index in 0..self.tasks.len() {
@@ -823,6 +825,39 @@ impl App {
             self.set_notice(format!("Copied {chars} visible characters."));
         } else {
             self.set_notice(format!("Copied {chars} visible characters internally."));
+        }
+    }
+
+    fn copy_focused_history(&mut self) {
+        let Some((task_name, text)) = self
+            .tasks
+            .get(self.focus)
+            .map(|task| (task.task.name.clone(), task.history.all_text()))
+        else {
+            self.set_notice("Focused pane has no scrollback.".to_owned());
+            return;
+        };
+        if text.is_empty() {
+            self.set_notice(format!("{task_name} has no scrollback."));
+            return;
+        }
+
+        self.clipboard = text.clone();
+        let osc52_allowed = text.len() <= MAX_FULL_HISTORY_OSC52_BYTES;
+        let copied_to_terminal = osc52_allowed && write_osc52_clipboard(&text).is_ok();
+        let chars = text.chars().count();
+        if copied_to_terminal {
+            self.set_notice(format!(
+                "Copied {chars} history characters from {task_name}."
+            ));
+        } else if osc52_allowed {
+            self.set_notice(format!(
+                "Copied {chars} history characters from {task_name} internally."
+            ));
+        } else {
+            self.set_notice(format!(
+                "Copied {chars} history characters from {task_name} internally; too large for OSC 52."
+            ));
         }
     }
 
@@ -1677,6 +1712,20 @@ impl TextHistory {
         }
         text
     }
+
+    fn all_text(&self) -> String {
+        let end = self.line_count().saturating_sub(1);
+        self.text_between(
+            SelectionPoint {
+                line: self.first_index,
+                column: 0,
+            },
+            SelectionPoint {
+                line: end,
+                column: u16::MAX,
+            },
+        )
+    }
 }
 
 enum ProcessEvent {
@@ -2478,6 +2527,17 @@ mod tests {
     }
 
     #[test]
+    fn text_history_all_text_preserves_scrollback_text() {
+        let mut history = TextHistory::new(80, 100);
+        history.process(b"alpha\nbravo");
+
+        assert_eq!(history.all_text(), "alpha\nbravo");
+
+        history.process(b"\n");
+        assert_eq!(history.all_text(), "alpha\nbravo\n");
+    }
+
+    #[test]
     fn visible_selection_uses_terminal_screen_contents() {
         let mut app = test_app();
         app.update_layout(Rect::new(0, 0, 100, 20));
@@ -2651,6 +2711,23 @@ mod tests {
         assert!(app.clipboard.contains("line 6"));
         assert!(app.clipboard.contains("line 10"));
         assert!(!app.clipboard.contains("line 19"));
+    }
+
+    #[test]
+    fn command_mode_shift_y_copies_full_focused_history() {
+        let mut app = test_app();
+        app.update_layout(Rect::new(0, 0, 100, 8));
+        app.mode = AppMode::Command;
+        for line in 0..20 {
+            app.tasks[0].process_output(format!("line {line}\n").as_bytes());
+        }
+        app.tasks[0].scroll_up(10);
+
+        app.handle_key(key(KeyCode::Char('Y'), KeyModifiers::SHIFT))
+            .unwrap();
+
+        assert_eq!(app.clipboard.lines().next(), Some("line 0"));
+        assert!(app.clipboard.contains("line 19"));
     }
 
     #[test]

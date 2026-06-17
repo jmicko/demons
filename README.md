@@ -91,6 +91,7 @@ changing modes.
 | `PageUp` / `PageDown` | Scroll the focused pane by one page |
 | `Home` / `End` | Jump to the top or bottom of focused pane history |
 | `y` | Copy the focused pane's visible text |
+| `Y` | Copy the focused pane's full scrollback |
 | `r` | Restart the focused task |
 | `R` | Restart every task |
 | `c` | Clear the focused pane and its scrollback |
@@ -109,6 +110,9 @@ the selection; terminals that support OSC 52 receive it on the system
 clipboard. `Ctrl+Shift+V`, middle-click, or right-click with no active
 selection pastes the last copied Demons selection back to the focused pane in
 input mode.
+
+In command mode, `y` copies the focused pane's visible text and `Y` copies its
+full scrollback.
 
 Because the leader is intercepted, it cannot be sent to a child while in input
 mode. Set a different leader if an application or window manager needs
