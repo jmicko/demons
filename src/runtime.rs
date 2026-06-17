@@ -1109,6 +1109,7 @@ impl TaskRuntime {
         }
         self.pty_size = size;
         self.history.set_width(size.cols);
+        self.scroll_offset = self.scroll_offset.min(self.max_scroll_offset());
         self.parser.set_size(size.rows, size.cols);
         if let Some(master) = &self.master {
             master.resize(size).ok();
@@ -2365,6 +2366,21 @@ mod tests {
         app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
             .unwrap();
         assert_eq!(app.tasks[0].scroll_offset, 0);
+    }
+
+    #[test]
+    fn resize_clamps_scroll_offset_to_available_history() {
+        let mut task = TaskRuntime::new(test_task("one"), PathBuf::from("."));
+        task.resize(40, 5);
+        for line in 0..20 {
+            task.process_output(format!("line {line}\n").as_bytes());
+        }
+        task.scroll_to_top();
+        assert!(task.scroll_offset > 0);
+
+        task.resize(40, 40);
+
+        assert_eq!(task.scroll_offset, 0);
     }
 
     fn test_task(name: &str) -> Task {
