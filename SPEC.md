@@ -197,6 +197,8 @@ The configured leader key (default `Alt+J`) toggles between two modes.
 - `Tab` / `Shift+Tab`: cycle panes, except that `Tab` toggles modes when it is
   configured as the leader. Arrow keys and `h j k l` remain available.
 - Arrow keys or `h j k l`: move focus.
+- `PageUp` / `PageDown`: scroll the focused pane history by one page.
+- `Home` / `End`: jump to the top or bottom of focused pane history.
 - `r`: restart focused pane.
 - `R`: restart all panes.
 - `c`: clear the focused pane and its scrollback.

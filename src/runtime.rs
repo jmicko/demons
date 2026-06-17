@@ -310,7 +310,7 @@ impl App {
                         "INPUT MODE",
                         Color::Cyan,
                         format!(
-                            " {} | {}: command mode | drag: select | right-click/Ctrl-Shift-C: copy ",
+                            " {} | {}: command | drag: select | right-click: copy ",
                             self.tasks[self.focus].task.name,
                             self.loaded.config.settings.leader.label()
                         ),
@@ -411,6 +411,20 @@ impl App {
             KeyCode::Right | KeyCode::Char('l') => self.move_focus(Direction::Right),
             KeyCode::Up | KeyCode::Char('k') => self.move_focus(Direction::Up),
             KeyCode::Down | KeyCode::Char('j') => self.move_focus(Direction::Down),
+            KeyCode::PageUp => {
+                let rows = self.focused_page_rows();
+                self.tasks[self.focus].scroll_up(rows);
+            }
+            KeyCode::PageDown => {
+                let rows = self.focused_page_rows();
+                self.tasks[self.focus].scroll_down(rows);
+            }
+            KeyCode::Home => {
+                self.tasks[self.focus].scroll_to_top();
+            }
+            KeyCode::End => {
+                self.tasks[self.focus].scroll_to_bottom();
+            }
             KeyCode::Char('r') => self.request_restart(self.focus),
             KeyCode::Char('R') => {
                 for index in 0..self.tasks.len() {
@@ -754,6 +768,13 @@ impl App {
         if let Some(next) = next.filter(|index| *index < self.tasks.len()) {
             self.focus = next;
         }
+    }
+
+    fn focused_page_rows(&self) -> usize {
+        self.content_rects
+            .get(self.focus)
+            .map(|rect| usize::from(rect.height.saturating_sub(1).max(1)))
+            .unwrap_or(1)
     }
 
     fn request_restart(&mut self, index: usize) {
@@ -1126,6 +1147,18 @@ impl TaskRuntime {
     fn scroll_down(&mut self, rows: usize) -> bool {
         let previous = self.scroll_offset;
         self.scroll_offset = self.scroll_offset.saturating_sub(rows);
+        self.scroll_offset != previous
+    }
+
+    fn scroll_to_top(&mut self) -> bool {
+        let previous = self.scroll_offset;
+        self.scroll_offset = self.max_scroll_offset();
+        self.scroll_offset != previous
+    }
+
+    fn scroll_to_bottom(&mut self) -> bool {
+        let previous = self.scroll_offset;
+        self.scroll_offset = 0;
         self.scroll_offset != previous
     }
 
@@ -2241,6 +2274,29 @@ mod tests {
         assert_eq!(app.selection.as_ref().unwrap().pane, 0);
         assert!(app.tasks[0].scroll_offset > 0);
         assert_eq!(app.tasks[1].scroll_offset, 0);
+    }
+
+    #[test]
+    fn command_mode_page_keys_scroll_focused_pane() {
+        let mut app = test_app();
+        app.update_layout(Rect::new(0, 0, 100, 20));
+        app.mode = AppMode::Command;
+        for line in 0..40 {
+            app.tasks[0].process_output(format!("line {line}\n").as_bytes());
+        }
+
+        app.handle_key(key(KeyCode::PageUp, KeyModifiers::NONE))
+            .unwrap();
+        let page_offset = app.tasks[0].scroll_offset;
+        assert!(page_offset > 0);
+
+        app.handle_key(key(KeyCode::Home, KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.tasks[0].scroll_offset >= page_offset);
+
+        app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.tasks[0].scroll_offset, 0);
     }
 
     fn test_task(name: &str) -> Task {
