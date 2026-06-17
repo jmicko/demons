@@ -93,6 +93,7 @@ changing modes.
 | `Home` / `End` | Jump to the top or bottom of focused pane history |
 | `y` | Copy the focused pane's visible text |
 | `Y` | Copy the focused pane's full scrollback |
+| `/` | Search the focused pane's scrollback |
 | `r` | Restart the focused task |
 | `R` | Restart every task |
 | `c` | Clear the focused pane and its scrollback |
@@ -113,7 +114,8 @@ selection pastes the last copied Demons selection back to the focused pane in
 input mode.
 
 In command mode, `y` copies the focused pane's visible text and `Y` copies its
-full scrollback.
+full scrollback. `/` opens a focused-pane search prompt; press Enter to jump to
+the newest matching history line or Esc to cancel.
 
 Because the leader is intercepted, it cannot be sent to a child while in input
 mode. Set a different leader if an application or window manager needs

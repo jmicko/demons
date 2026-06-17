@@ -129,6 +129,7 @@ struct App {
     clipboard: String,
     notice: Option<Notice>,
     fullscreen: bool,
+    search: Option<SearchState>,
 }
 
 impl App {
@@ -170,6 +171,7 @@ impl App {
             clipboard: String::new(),
             notice: None,
             fullscreen: false,
+            search: None,
         }
     }
 
@@ -272,6 +274,7 @@ impl App {
             let border_color = match (focused, self.mode) {
                 (true, AppMode::Input) => Color::Cyan,
                 (true, AppMode::Command) => Color::Yellow,
+                (true, AppMode::Search) => Color::Magenta,
                 _ => Color::DarkGray,
             };
             let (status, status_color) = self.tasks[index].status_label();
@@ -319,16 +322,26 @@ impl App {
                 footer_area.width.saturating_sub(button_area.width),
                 1,
             );
-            let (mode_label, mode_color, help) = if let Some(notice) =
-                self.active_notice(Instant::now())
+            let (mode_label, mode_color, help) = if let Some(search) = self
+                .search
+                .as_ref()
+                .filter(|_| self.mode == AppMode::Search)
             {
+                (
+                    "SEARCH",
+                    Color::Magenta,
+                    format!(" /{}  Enter: jump | Esc: cancel ", search.query),
+                )
+            } else if let Some(notice) = self.active_notice(Instant::now()) {
                 let mode_label = match self.mode {
                     AppMode::Input => "INPUT MODE",
                     AppMode::Command => "COMMAND MODE",
+                    AppMode::Search => "SEARCH",
                 };
                 let mode_color = match self.mode {
                     AppMode::Input => Color::Cyan,
                     AppMode::Command => Color::Yellow,
+                    AppMode::Search => Color::Magenta,
                 };
                 (mode_label, mode_color, format!(" {notice} "))
             } else {
@@ -349,6 +362,11 @@ impl App {
                             " arrows/hjkl: move | f: fullscreen | y/Y: copy | r: restart | R: all | c: clear | q: quit | {}: input ",
                             self.loaded.config.settings.leader.label()
                         ),
+                    ),
+                    AppMode::Search => (
+                        "SEARCH",
+                        Color::Magenta,
+                        " /  Enter: jump | Esc: cancel ".to_owned(),
                     ),
                 }
             };
@@ -380,8 +398,10 @@ impl App {
             }
             Event::Mouse(mouse) => self.handle_mouse(mouse),
             Event::Paste(text) => {
-                if self.mode == AppMode::Input {
-                    self.paste_text_to_task(self.focus, &text)?;
+                match self.mode {
+                    AppMode::Input => self.paste_text_to_task(self.focus, &text)?,
+                    AppMode::Search => self.insert_search_text(&text),
+                    AppMode::Command => {}
                 }
                 Ok(Action::Continue)
             }
@@ -420,6 +440,10 @@ impl App {
             return Ok(Action::Continue);
         }
 
+        if self.mode == AppMode::Search {
+            return self.handle_search_key(key);
+        }
+
         if self.mode == AppMode::Input {
             let application_cursor = self.tasks[self.focus].parser.screen().application_cursor();
             let bytes = encode_key(key, application_cursor);
@@ -453,6 +477,7 @@ impl App {
                 self.tasks[self.focus].scroll_to_bottom();
             }
             KeyCode::Char('f') => self.fullscreen = !self.fullscreen,
+            KeyCode::Char('/') => self.start_search(),
             KeyCode::Char('y') => self.copy_focused_visible(),
             KeyCode::Char('Y') => self.copy_focused_history(),
             KeyCode::Char('r') => self.request_restart(self.focus),
@@ -474,12 +499,184 @@ impl App {
         Ok(Action::Continue)
     }
 
+    fn handle_search_key(&mut self, key: KeyEvent) -> Result<Action> {
+        match key.code {
+            KeyCode::Esc => self.cancel_search(),
+            KeyCode::Enter | KeyCode::Char('\n' | '\r') => self.finish_search(),
+            KeyCode::Char('c' | 'C') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cancel_search()
+            }
+            KeyCode::Char('a' | 'A') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(search) = self.search.as_mut() {
+                    search.cursor = 0;
+                }
+            }
+            KeyCode::Char('e' | 'E') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(search) = self.search.as_mut() {
+                    search.cursor = char_count(&search.query);
+                }
+            }
+            KeyCode::Char('u' | 'U') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(search) = self.search.as_mut() {
+                    search.query.clear();
+                    search.cursor = 0;
+                }
+            }
+            KeyCode::Char('k' | 'K') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(search) = self.search.as_mut() {
+                    let index = byte_index_for_char(&search.query, search.cursor);
+                    search.query.truncate(index);
+                }
+            }
+            KeyCode::Backspace => self.delete_search_char_before_cursor(),
+            KeyCode::Delete => self.delete_search_char_at_cursor(),
+            KeyCode::Left => {
+                if let Some(search) = self.search.as_mut() {
+                    search.cursor = search.cursor.saturating_sub(1);
+                }
+            }
+            KeyCode::Right => {
+                if let Some(search) = self.search.as_mut() {
+                    search.cursor = (search.cursor + 1).min(char_count(&search.query));
+                }
+            }
+            KeyCode::Home => {
+                if let Some(search) = self.search.as_mut() {
+                    search.cursor = 0;
+                }
+            }
+            KeyCode::End => {
+                if let Some(search) = self.search.as_mut() {
+                    search.cursor = char_count(&search.query);
+                }
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.insert_search_char(character);
+            }
+            _ => {}
+        }
+        Ok(Action::Continue)
+    }
+
+    fn start_search(&mut self) {
+        self.search = Some(SearchState {
+            pane: self.focus,
+            query: String::new(),
+            cursor: 0,
+        });
+        self.selection = None;
+        self.notice = None;
+        self.mode = AppMode::Search;
+    }
+
+    fn cancel_search(&mut self) {
+        self.search = None;
+        self.mode = AppMode::Command;
+    }
+
+    fn finish_search(&mut self) {
+        let Some(search) = self.search.take() else {
+            self.mode = AppMode::Command;
+            return;
+        };
+        self.mode = AppMode::Command;
+        let query = search.query.trim();
+        if query.is_empty() {
+            self.set_notice("Search cancelled.".to_owned());
+            return;
+        }
+
+        let Some(line) = self.tasks[search.pane].history.find_last_line(query) else {
+            self.set_notice(format!("No matches for {query:?}."));
+            return;
+        };
+
+        self.focus = search.pane;
+        let height = self
+            .content_rects
+            .get(search.pane)
+            .map(|rect| rect.height)
+            .unwrap_or(self.tasks[search.pane].pty_size.rows);
+        self.tasks[search.pane].scroll_to_history_line(line, height);
+
+        let end_column = self.tasks[search.pane]
+            .history
+            .line_char_count(line)
+            .unwrap_or(1)
+            .saturating_sub(1)
+            .min(usize::from(u16::MAX)) as u16;
+        self.selection = Some(Selection {
+            pane: search.pane,
+            anchor: SelectionPoint { line, column: 0 },
+            cursor: SelectionPoint {
+                line,
+                column: end_column,
+            },
+            dragging: false,
+            dragged: true,
+            last_mouse: None,
+            last_scroll: Instant::now(),
+        });
+        self.set_notice(format!(
+            "Found {query:?} in {}.",
+            self.tasks[search.pane].task.name
+        ));
+    }
+
+    fn insert_search_text(&mut self, text: &str) {
+        for character in text.chars().filter(|character| !character.is_control()) {
+            self.insert_search_char(character);
+        }
+    }
+
+    fn insert_search_char(&mut self, character: char) {
+        let Some(search) = self.search.as_mut() else {
+            return;
+        };
+        let index = byte_index_for_char(&search.query, search.cursor);
+        search.query.insert(index, character);
+        search.cursor += 1;
+    }
+
+    fn delete_search_char_before_cursor(&mut self) {
+        let Some(search) = self.search.as_mut() else {
+            return;
+        };
+        if search.cursor == 0 {
+            return;
+        }
+        let start = byte_index_for_char(&search.query, search.cursor - 1);
+        let end = byte_index_for_char(&search.query, search.cursor);
+        search.query.replace_range(start..end, "");
+        search.cursor -= 1;
+    }
+
+    fn delete_search_char_at_cursor(&mut self) {
+        let Some(search) = self.search.as_mut() else {
+            return;
+        };
+        if search.cursor >= char_count(&search.query) {
+            return;
+        }
+        let start = byte_index_for_char(&search.query, search.cursor);
+        let end = byte_index_for_char(&search.query, search.cursor + 1);
+        search.query.replace_range(start..end, "");
+    }
+
     fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<Action> {
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             && self.mode_button_hit(mouse.column, mouse.row)
         {
             self.toggle_mode();
             return Ok(Action::Continue);
+        }
+
+        if self.mode == AppMode::Search {
+            self.cancel_search();
         }
 
         if self.handle_selection_drag(mouse) {
@@ -564,7 +761,10 @@ impl App {
     fn toggle_mode(&mut self) {
         self.mode = match self.mode {
             AppMode::Input => AppMode::Command,
-            AppMode::Command => AppMode::Input,
+            AppMode::Command | AppMode::Search => {
+                self.search = None;
+                AppMode::Input
+            }
         };
     }
 
@@ -1080,6 +1280,7 @@ impl App {
         match self.mode {
             AppMode::Input => self.tasks[self.focus].write_input(b"\x1b")?,
             AppMode::Command => self.mode = AppMode::Input,
+            AppMode::Search => self.cancel_search(),
         }
         Ok(())
     }
@@ -1353,6 +1554,17 @@ impl TaskRuntime {
         let previous = self.scroll_offset;
         self.scroll_offset = 0;
         self.scroll_offset != previous
+    }
+
+    fn scroll_to_history_line(&mut self, line: u64, height: u16) {
+        let line_count = self.history.line_count();
+        let height = u64::from(height.max(1));
+        let max_start = line_count.saturating_sub(height);
+        let target_start = line.saturating_sub(height / 2).min(max_start);
+        let max_offset = line_count.saturating_sub(height);
+        self.scroll_offset = max_offset
+            .saturating_sub(target_start)
+            .min(usize::MAX as u64) as usize;
     }
 
     fn max_scroll_offset(&self) -> usize {
@@ -1726,6 +1938,24 @@ impl TextHistory {
             },
         )
     }
+
+    fn find_last_line(&self, query: &str) -> Option<u64> {
+        let needle = query.to_ascii_lowercase();
+        if needle.is_empty() {
+            return None;
+        }
+
+        (self.first_index..self.line_count())
+            .rev()
+            .find(|line_index| {
+                self.line(*line_index)
+                    .is_some_and(|line| line.text.to_ascii_lowercase().contains(needle.as_str()))
+            })
+    }
+
+    fn line_char_count(&self, index: u64) -> Option<usize> {
+        self.line(index).map(|line| char_count(&line.text))
+    }
 }
 
 enum ProcessEvent {
@@ -1760,6 +1990,14 @@ enum TaskStatus {
 enum AppMode {
     Input,
     Command,
+    Search,
+}
+
+#[derive(Clone, Debug)]
+struct SearchState {
+    pane: usize,
+    query: String,
+    cursor: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2538,6 +2776,15 @@ mod tests {
     }
 
     #[test]
+    fn text_history_finds_latest_matching_line_case_insensitively() {
+        let mut history = TextHistory::new(80, 100);
+        history.process(b"alpha\nerror one\nERROR two\n");
+
+        assert_eq!(history.find_last_line("error"), Some(2));
+        assert_eq!(history.find_last_line("missing"), None);
+    }
+
+    #[test]
     fn visible_selection_uses_terminal_screen_contents() {
         let mut app = test_app();
         app.update_layout(Rect::new(0, 0, 100, 20));
@@ -2728,6 +2975,95 @@ mod tests {
 
         assert_eq!(app.clipboard.lines().next(), Some("line 0"));
         assert!(app.clipboard.contains("line 19"));
+    }
+
+    #[test]
+    fn command_mode_search_jumps_to_matching_history_line() {
+        let mut app = test_app();
+        app.update_layout(Rect::new(0, 0, 100, 8));
+        app.mode = AppMode::Command;
+        for line in 0..40 {
+            if line == 5 {
+                app.tasks[0].process_output(b"ERROR target\n");
+            } else {
+                app.tasks[0].process_output(format!("line {line}\n").as_bytes());
+            }
+        }
+
+        app.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE))
+            .unwrap();
+        for character in "eror".chars() {
+            app.handle_key(key(KeyCode::Char(character), KeyModifiers::NONE))
+                .unwrap();
+        }
+        app.handle_key(key(KeyCode::Left, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Left, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('r'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(app.mode, AppMode::Command);
+        assert!(app.tasks[0].scroll_offset > 0);
+        assert_eq!(app.selection.as_ref().unwrap().pane, 0);
+        assert_eq!(app.selected_text().unwrap(), "ERROR target");
+    }
+
+    #[test]
+    fn command_mode_search_does_not_cross_panes() {
+        let mut app = test_app();
+        app.update_layout(Rect::new(0, 0, 100, 8));
+        app.mode = AppMode::Command;
+        app.tasks[0].process_output(b"ERROR wrong pane\n");
+        for line in 0..30 {
+            if line == 10 {
+                app.tasks[1].process_output(b"error right pane\n");
+            } else {
+                app.tasks[1].process_output(format!("other {line}\n").as_bytes());
+            }
+        }
+        app.focus = 1;
+
+        app.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE))
+            .unwrap();
+        for character in "error".chars() {
+            app.handle_key(key(KeyCode::Char(character), KeyModifiers::NONE))
+                .unwrap();
+        }
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(app.focus, 1);
+        assert_eq!(app.selection.as_ref().unwrap().pane, 1);
+        assert!(app.selected_text().unwrap().contains("right pane"));
+        assert_eq!(app.tasks[0].scroll_offset, 0);
+    }
+
+    #[test]
+    fn command_mode_search_reports_no_match() {
+        let mut app = test_app();
+        app.update_layout(Rect::new(0, 0, 100, 8));
+        app.mode = AppMode::Command;
+        app.tasks[0].process_output(b"ordinary output\n");
+
+        app.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE))
+            .unwrap();
+        for character in "error".chars() {
+            app.handle_key(key(KeyCode::Char(character), KeyModifiers::NONE))
+                .unwrap();
+        }
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(app.mode, AppMode::Command);
+        assert!(app.selection.is_none());
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|notice| notice.text.contains("No matches"))
+        );
     }
 
     #[test]
