@@ -6,6 +6,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    terminal::{disable_raw_mode, enable_raw_mode},
+};
 
 use crate::config::{
     Config, Layout, Leader, Settings, Task, TaskCommand, parse_file, validate_for_path,
@@ -16,19 +20,71 @@ pub struct InitResult {
     pub start: bool,
 }
 
+trait PromptSource {
+    fn prompt(&mut self, output: &mut impl Write, label: &str, default: &str) -> Result<String>;
+}
+
+struct LinePrompt<'a, R: BufRead> {
+    input: &'a mut R,
+}
+
+impl<R: BufRead> PromptSource for LinePrompt<'_, R> {
+    fn prompt(&mut self, output: &mut impl Write, label: &str, default: &str) -> Result<String> {
+        write!(output, "{}", prompt_prefix(label, default))?;
+        output.flush()?;
+
+        let mut line = String::new();
+        if self.input.read_line(&mut line)? == 0 {
+            bail!("input closed");
+        }
+        let value = line.trim().to_owned();
+        Ok(if value.is_empty() {
+            default.to_owned()
+        } else {
+            value
+        })
+    }
+}
+
+struct TerminalPrompt;
+
+impl PromptSource for TerminalPrompt {
+    fn prompt(&mut self, output: &mut impl Write, label: &str, default: &str) -> Result<String> {
+        let prefix = prompt_prefix(label, default);
+        write!(output, "{prefix}")?;
+        output.flush()?;
+        let value = read_edited_line(output, &prefix)?;
+        Ok(if value.trim().is_empty() {
+            default.to_owned()
+        } else {
+            value.trim().to_owned()
+        })
+    }
+}
+
 pub fn run(path: PathBuf) -> Result<InitResult> {
-    if !io::stdin().is_terminal() {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         bail!("init requires an interactive terminal");
     }
 
-    let mut input = io::stdin().lock();
+    let mut input = TerminalPrompt;
     let mut output = io::stdout().lock();
-    run_with_io(path, &mut input, &mut output)
+    run_flow(path, &mut input, &mut output)
 }
 
+#[cfg(test)]
 fn run_with_io(
     path: PathBuf,
     input: &mut impl BufRead,
+    output: &mut impl Write,
+) -> Result<InitResult> {
+    let mut input = LinePrompt { input };
+    run_flow(path, &mut input, output)
+}
+
+fn run_flow(
+    path: PathBuf,
+    input: &mut impl PromptSource,
     output: &mut impl Write,
 ) -> Result<InitResult> {
     let existing = if path.is_file() {
@@ -39,19 +95,17 @@ fn run_with_io(
 
     let config = match existing {
         Some(config) => loop {
-            let choice = prompt(
+            let choice = prompt_choice(
                 input,
                 output,
-                &format!(
-                    "A file already exists at {}. [E]dit existing, [F]resh start, [A]bort?",
-                    path.display()
-                ),
-                "E",
+                &format!("A file already exists at {}.", path.display()),
+                &[("e", "Edit existing"), ("f", "Fresh start"), ("a", "Abort")],
+                0,
             )?;
             match choice.to_ascii_lowercase().as_str() {
-                "" | "e" | "edit" => break edit_config(input, output, config)?,
-                "f" | "fresh" => break new_config(input, output)?,
-                "a" | "abort" => {
+                "e" => break edit_config(input, output, config)?,
+                "f" => break new_config(input, output)?,
+                "a" => {
                     return Ok(InitResult { path, start: false });
                 }
                 _ => writeln!(output, "Please choose E, F, or A.")?,
@@ -63,22 +117,22 @@ fn run_with_io(
     validate_for_path(&config, &path)?;
     let rendered = toml::to_string_pretty(&config).context("failed to render configuration")?;
     writeln!(output, "\n--- {} ---\n{rendered}---", path.display())?;
-    if !prompt_yes_no(input, output, "Write this configuration?", true)? {
+    if !prompt_yes_no_with(input, output, "Write this configuration?", true)? {
         return Ok(InitResult { path, start: false });
     }
 
     write_atomic(&path, rendered.as_bytes())?;
     writeln!(output, "Wrote {}.", path.display())?;
     writeln!(output, "Run 'demons' to start.")?;
-    let start = prompt_yes_no(input, output, "Start demons now?", true)?;
+    let start = prompt_yes_no_with(input, output, "Start demons now?", true)?;
     Ok(InitResult { path, start })
 }
 
-fn new_config(input: &mut impl BufRead, output: &mut impl Write) -> Result<Config> {
+fn new_config(input: &mut impl PromptSource, output: &mut impl Write) -> Result<Config> {
     writeln!(output, "Create a demons configuration.\n")?;
     let settings = prompt_settings(input, output, &Settings::default())?;
     let mut tasks = vec![prompt_task(input, output, None, 1)?];
-    while prompt_yes_no(input, output, "Add another task?", true)? {
+    while prompt_yes_no_with(input, output, "Add another task?", true)? {
         let number = tasks.len() + 1;
         tasks.push(prompt_task(input, output, None, number)?);
     }
@@ -86,7 +140,7 @@ fn new_config(input: &mut impl BufRead, output: &mut impl Write) -> Result<Confi
 }
 
 fn edit_config(
-    input: &mut impl BufRead,
+    input: &mut impl PromptSource,
     output: &mut impl Write,
     config: Config,
 ) -> Result<Config> {
@@ -95,30 +149,25 @@ fn edit_config(
     for (index, task) in config.tasks.iter().enumerate() {
         tasks.push(prompt_task(input, output, Some(task), index + 1)?);
     }
-    while prompt_yes_no(input, output, "Add a new task?", true)? {
+    while prompt_yes_no_with(input, output, "Add a new task?", true)? {
         let number = tasks.len() + 1;
         tasks.push(prompt_task(input, output, None, number)?);
     }
 
     if tasks.len() > 1 {
-        let names = tasks
-            .iter()
-            .map(|task| task.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
+        writeln!(output, "\nRemove tasks:")?;
+        for (index, task) in tasks.iter().enumerate() {
+            writeln!(output, "  {}. {}", index + 1, task.name)?;
+        }
         let remove = prompt(
             input,
             output,
-            &format!("Remove tasks by name, comma-separated [{names}]"),
+            "Remove task numbers/names, comma-separated; blank to keep all",
             "",
         )?;
         if !remove.trim().is_empty() {
-            let removals = remove
-                .split(',')
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .collect::<Vec<_>>();
-            tasks.retain(|task| !removals.contains(&task.name.as_str()));
+            let removals = parse_task_removals(&remove, &tasks)?;
+            tasks.retain(|task| !removals.contains(&task.name));
         }
     }
     if tasks.is_empty() {
@@ -128,24 +177,37 @@ fn edit_config(
 }
 
 fn prompt_settings(
-    input: &mut impl BufRead,
+    input: &mut impl PromptSource,
     output: &mut impl Write,
     current: &Settings,
 ) -> Result<Settings> {
     writeln!(output, "Project settings:")?;
-    let layout = prompt(input, output, "Layout", "grid")?;
+    let layout = prompt_choice(input, output, "Layout", &[("grid", "grid")], 0)?;
     if layout != "grid" {
         bail!("layout must be 'grid'");
     }
 
     let leader_default = match current.leader {
-        Leader::AltJ => "alt-j",
-        Leader::Tab => "tab",
-        Leader::CtrlB => "ctrl-b",
-        Leader::CtrlQ => "ctrl-q",
-        Leader::CtrlBackslash => "ctrl-\\",
+        Leader::AltJ => 0,
+        Leader::Tab => 1,
+        Leader::CtrlB => 2,
+        Leader::CtrlQ => 3,
+        Leader::CtrlBackslash => 4,
     };
-    let leader = match prompt(input, output, "Leader key", leader_default)?.as_str() {
+    let leader_choice = prompt_choice(
+        input,
+        output,
+        "Leader key",
+        &[
+            ("alt-j", "Alt-J"),
+            ("tab", "Tab"),
+            ("ctrl-b", "Ctrl-B"),
+            ("ctrl-q", "Ctrl-Q"),
+            ("ctrl-\\", "Ctrl-\\"),
+        ],
+        leader_default,
+    )?;
+    let leader = match leader_choice.as_str() {
         "alt-j" => Leader::AltJ,
         "tab" => Leader::Tab,
         "ctrl-b" => Leader::CtrlB,
@@ -162,7 +224,7 @@ fn prompt_settings(
 }
 
 fn prompt_task(
-    input: &mut impl BufRead,
+    input: &mut impl PromptSource,
     output: &mut impl Write,
     current: Option<&Task>,
     number: usize,
@@ -215,32 +277,16 @@ fn prompt_task(
 }
 
 fn prompt(
-    input: &mut impl BufRead,
+    input: &mut impl PromptSource,
     output: &mut impl Write,
     label: &str,
     default: &str,
 ) -> Result<String> {
-    if default.is_empty() {
-        write!(output, "{label}: ")?;
-    } else {
-        write!(output, "{label} [{default}]: ")?;
-    }
-    output.flush()?;
-
-    let mut line = String::new();
-    if input.read_line(&mut line)? == 0 {
-        bail!("input closed");
-    }
-    let value = line.trim().to_owned();
-    Ok(if value.is_empty() {
-        default.to_owned()
-    } else {
-        value
-    })
+    input.prompt(output, label, default)
 }
 
 fn required_prompt(
-    input: &mut impl BufRead,
+    input: &mut impl PromptSource,
     output: &mut impl Write,
     label: &str,
     default: &str,
@@ -254,8 +300,74 @@ fn required_prompt(
     }
 }
 
+fn prompt_choice(
+    input: &mut impl PromptSource,
+    output: &mut impl Write,
+    label: &str,
+    choices: &[(&str, &str)],
+    default_index: usize,
+) -> Result<String> {
+    if choices.is_empty() {
+        bail!("choice prompt requires at least one option");
+    }
+    writeln!(output, "{label}")?;
+    for (index, (_, description)) in choices.iter().enumerate() {
+        writeln!(output, "  {}. {}", index + 1, description)?;
+    }
+
+    loop {
+        let default = (default_index + 1).min(choices.len()).to_string();
+        let answer = prompt(input, output, "Choose", &default)?;
+        let normalized = answer.trim().to_ascii_lowercase();
+        if let Ok(number) = normalized.parse::<usize>() {
+            if (1..=choices.len()).contains(&number) {
+                return Ok(choices[number - 1].0.to_owned());
+            }
+        }
+        if let Some((value, _)) = choices.iter().find(|(value, description)| {
+            normalized == *value || normalized == description.to_ascii_lowercase()
+        }) {
+            return Ok((*value).to_owned());
+        }
+        writeln!(output, "Please choose one of the listed options.")?;
+    }
+}
+
+fn parse_task_removals(value: &str, tasks: &[Task]) -> Result<Vec<String>> {
+    let mut removals = Vec::new();
+    for token in value
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        if let Ok(number) = token.parse::<usize>() {
+            let Some(task) = number.checked_sub(1).and_then(|index| tasks.get(index)) else {
+                bail!("no task numbered {number}");
+            };
+            removals.push(task.name.clone());
+        } else if tasks.iter().any(|task| task.name == token) {
+            removals.push(token.to_owned());
+        } else {
+            bail!("no task named {token:?}");
+        }
+    }
+    removals.sort();
+    removals.dedup();
+    Ok(removals)
+}
+
 pub fn prompt_yes_no(
     input: &mut impl BufRead,
+    output: &mut impl Write,
+    label: &str,
+    default_yes: bool,
+) -> Result<bool> {
+    let mut input = LinePrompt { input };
+    prompt_yes_no_with(&mut input, output, label, default_yes)
+}
+
+fn prompt_yes_no_with(
+    input: &mut impl PromptSource,
     output: &mut impl Write,
     label: &str,
     default_yes: bool,
@@ -268,6 +380,133 @@ pub fn prompt_yes_no(
             "y" | "yes" => return Ok(true),
             "n" | "no" => return Ok(false),
             _ => writeln!(output, "Please answer yes or no.")?,
+        }
+    }
+}
+
+fn prompt_prefix(label: &str, default: &str) -> String {
+    if default.is_empty() {
+        format!("{label}: ")
+    } else {
+        format!("{label} [{default}]: ")
+    }
+}
+
+fn read_edited_line(output: &mut impl Write, prefix: &str) -> Result<String> {
+    let _guard = RawModeGuard::enter()?;
+    let mut buffer = String::new();
+    let mut cursor = 0_usize;
+
+    loop {
+        let event = event::read().context("failed to read terminal input")?;
+        let Event::Key(key) = event else {
+            continue;
+        };
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            continue;
+        }
+
+        match key.code {
+            KeyCode::Enter => {
+                writeln!(output, "\r")?;
+                output.flush()?;
+                return Ok(buffer);
+            }
+            KeyCode::Char('c' | 'C') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                bail!("input cancelled");
+            }
+            KeyCode::Char('d' | 'D')
+                if key.modifiers.contains(KeyModifiers::CONTROL) && buffer.is_empty() =>
+            {
+                bail!("input closed");
+            }
+            KeyCode::Char('a' | 'A') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                cursor = 0;
+            }
+            KeyCode::Char('e' | 'E') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                cursor = char_len(&buffer);
+            }
+            KeyCode::Char('u' | 'U') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                buffer.clear();
+                cursor = 0;
+            }
+            KeyCode::Char('k' | 'K') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let index = byte_index(&buffer, cursor);
+                buffer.truncate(index);
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                let index = byte_index(&buffer, cursor);
+                buffer.insert(index, character);
+                cursor += 1;
+            }
+            KeyCode::Backspace if cursor > 0 => {
+                let start = byte_index(&buffer, cursor - 1);
+                let end = byte_index(&buffer, cursor);
+                buffer.replace_range(start..end, "");
+                cursor -= 1;
+            }
+            KeyCode::Delete if cursor < char_len(&buffer) => {
+                let start = byte_index(&buffer, cursor);
+                let end = byte_index(&buffer, cursor + 1);
+                buffer.replace_range(start..end, "");
+            }
+            KeyCode::Left => cursor = cursor.saturating_sub(1),
+            KeyCode::Right => cursor = (cursor + 1).min(char_len(&buffer)),
+            KeyCode::Home => cursor = 0,
+            KeyCode::End => cursor = char_len(&buffer),
+            _ => {}
+        }
+
+        redraw_line(output, prefix, &buffer, cursor)?;
+    }
+}
+
+fn redraw_line(
+    output: &mut impl Write,
+    prefix: &str,
+    buffer: &str,
+    cursor: usize,
+) -> io::Result<()> {
+    write!(output, "\r\x1b[2K{prefix}{buffer}")?;
+    let distance_from_end = char_len(buffer).saturating_sub(cursor);
+    if distance_from_end > 0 {
+        write!(output, "\x1b[{distance_from_end}D")?;
+    }
+    output.flush()
+}
+
+fn char_len(value: &str) -> usize {
+    value.chars().count()
+}
+
+fn byte_index(value: &str, char_index: usize) -> usize {
+    value
+        .char_indices()
+        .nth(char_index)
+        .map(|(index, _)| index)
+        .unwrap_or(value.len())
+}
+
+struct RawModeGuard {
+    active: bool,
+}
+
+impl RawModeGuard {
+    fn enter() -> Result<Self> {
+        enable_raw_mode().context("failed to enable raw terminal mode")?;
+        Ok(Self { active: true })
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        if self.active {
+            disable_raw_mode().ok();
+            self.active = false;
         }
     }
 }
@@ -334,6 +573,36 @@ mod tests {
     }
 
     #[test]
+    fn parses_task_removals_by_number_and_name() {
+        let tasks = vec![
+            Task {
+                name: "api".to_owned(),
+                command: TaskCommand::Shell("echo api".to_owned()),
+                cwd: PathBuf::from("."),
+                env: BTreeMap::new(),
+                watch: None,
+                run_on_change: None,
+                repeat: None,
+            },
+            Task {
+                name: "web".to_owned(),
+                command: TaskCommand::Shell("echo web".to_owned()),
+                cwd: PathBuf::from("."),
+                env: BTreeMap::new(),
+                watch: None,
+                run_on_change: None,
+                repeat: None,
+            },
+        ];
+
+        assert_eq!(
+            parse_task_removals("1, web", &tasks).unwrap(),
+            ["api", "web"]
+        );
+        assert!(parse_task_removals("3", &tasks).is_err());
+    }
+
+    #[test]
     fn creates_a_config_from_line_input() {
         let temp = tempdir().unwrap();
         let path = temp.path().join(crate::config::CONFIG_FILE);
@@ -351,5 +620,19 @@ mod tests {
             config.tasks[0].command,
             TaskCommand::Shell(ref command) if command == "echo ready"
         ));
+    }
+
+    #[test]
+    fn creates_a_config_with_numbered_setting_choices() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join(crate::config::CONFIG_FILE);
+        let answers = b"\n3\nserver\necho ready\n\n\nn\n\nn\n";
+        let mut input = Cursor::new(answers);
+        let mut output = Vec::new();
+
+        run_with_io(path.clone(), &mut input, &mut output).unwrap();
+
+        let config = parse_file(&path).unwrap();
+        assert_eq!(config.settings.leader, Leader::CtrlB);
     }
 }
