@@ -99,6 +99,7 @@ changing modes.
 | `r` | Restart the focused task |
 | `R` | Restart every task |
 | `c` | Clear the focused pane and its scrollback |
+| `?` | Show command help |
 | `q` or `Ctrl+C` | Stop all tasks and quit |
 | Leader or `Esc` | Return to input mode |
 

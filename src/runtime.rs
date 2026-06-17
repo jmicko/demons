@@ -30,7 +30,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Widget},
+    widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap},
 };
 use vt100::{MouseProtocolEncoding, MouseProtocolMode, Parser};
 
@@ -131,6 +131,7 @@ struct App {
     fullscreen: bool,
     search: Option<SearchState>,
     last_search: Option<String>,
+    show_help: bool,
 }
 
 impl App {
@@ -174,6 +175,7 @@ impl App {
             fullscreen: false,
             search: None,
             last_search: None,
+            show_help: false,
         }
     }
 
@@ -377,6 +379,14 @@ impl App {
                 .render(help_area, buffer);
         }
 
+        if self.show_help {
+            render_command_help(
+                frame_area,
+                buffer,
+                self.loaded.config.settings.leader.label(),
+            );
+        }
+
         if self.mode == AppMode::Input {
             let task = &self.tasks[self.focus];
             let area = self.content_rects[self.focus];
@@ -416,6 +426,10 @@ impl App {
         if is_paste_key(key) {
             self.paste_clipboard_to_focus()?;
             return Ok(Action::Continue);
+        }
+
+        if self.show_help {
+            return self.handle_help_key(key);
         }
 
         let leader = self.loaded.config.settings.leader;
@@ -474,6 +488,7 @@ impl App {
             KeyCode::End => {
                 self.tasks[self.focus].scroll_to_bottom();
             }
+            KeyCode::Char('?') => self.show_help = true,
             KeyCode::Char('f') => self.fullscreen = !self.fullscreen,
             KeyCode::Char('/') => self.start_search(),
             KeyCode::Char('n') => self.repeat_search(SearchDirection::Older),
@@ -494,6 +509,18 @@ impl App {
             KeyCode::Char('c') => {
                 self.tasks[self.focus].clear();
                 self.clear_selection_for(self.focus);
+            }
+            _ => {}
+        }
+        Ok(Action::Continue)
+    }
+
+    fn handle_help_key(&mut self, key: KeyEvent) -> Result<Action> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('?') => self.show_help = false,
+            KeyCode::Char('q') => return Ok(Action::Quit),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Ok(Action::Quit);
             }
             _ => {}
         }
@@ -571,6 +598,7 @@ impl App {
         });
         self.selection = None;
         self.notice = None;
+        self.show_help = false;
         self.mode = AppMode::Search;
     }
 
@@ -719,6 +747,11 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<Action> {
+        if self.show_help {
+            self.show_help = false;
+            return Ok(Action::Continue);
+        }
+
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             && self.mode_button_hit(mouse.column, mouse.row)
         {
@@ -814,6 +847,7 @@ impl App {
             AppMode::Input => AppMode::Command,
             AppMode::Command | AppMode::Search => {
                 self.search = None;
+                self.show_help = false;
                 AppMode::Input
             }
         };
@@ -2333,6 +2367,54 @@ fn render_selection(
     }
 }
 
+fn render_command_help(area: Rect, buffer: &mut Buffer, leader: &str) {
+    let popup = centered_rect(area, 74, 16);
+    Clear.render(popup, buffer);
+    let lines = vec![
+        Line::styled(
+            "Command Help",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+        Line::raw("arrows / h j k l       Move focus"),
+        Line::raw("Tab / Shift-Tab        Cycle panes"),
+        Line::raw("f                      Toggle fullscreen pane"),
+        Line::raw("PageUp/PageDown        Scroll focused pane"),
+        Line::raw("Home/End               Jump to top/bottom of history"),
+        Line::raw("drag / right-click     Select and copy pane text"),
+        Line::raw("y / Y                  Copy visible text / full scrollback"),
+        Line::raw("S                      Save full scrollback to a temp log"),
+        Line::raw("/, n, N                Search, repeat older, repeat newer"),
+        Line::raw("r / R                  Restart focused task / all tasks"),
+        Line::raw("c                      Clear focused pane"),
+        Line::raw("q or Ctrl-C            Quit"),
+        Line::raw(format!("{leader} or Esc          Return to input mode")),
+        Line::raw("? or Esc               Close this help"),
+    ];
+    Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .style(Style::default().fg(Color::White).bg(Color::Black)),
+        )
+        .wrap(Wrap { trim: false })
+        .render(popup, buffer);
+}
+
+fn centered_rect(area: Rect, preferred_width: u16, preferred_height: u16) -> Rect {
+    let width = preferred_width.min(area.width.saturating_sub(2)).max(1);
+    let height = preferred_height.min(area.height.saturating_sub(2)).max(1);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
+}
+
 fn cell_style(cell: &vt100::Cell) -> Style {
     let mut style = Style::default();
     if let Some(color) = terminal_color(cell.fgcolor()) {
@@ -2880,6 +2962,35 @@ mod tests {
         .unwrap();
 
         assert_eq!(app.mode, AppMode::Input);
+    }
+
+    #[test]
+    fn command_mode_question_mark_opens_and_closes_help() {
+        let mut app = test_app();
+        app.update_layout(Rect::new(0, 0, 100, 20));
+        app.mode = AppMode::Command;
+
+        app.handle_key(key(KeyCode::Char('?'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.show_help);
+
+        app.handle_key(key(KeyCode::Char('r'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.show_help);
+        assert!(!app.tasks[0].restart_requested);
+
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(!app.show_help);
+        assert_eq!(app.mode, AppMode::Command);
+    }
+
+    #[test]
+    fn centered_rect_clamps_to_small_areas() {
+        assert_eq!(
+            centered_rect(Rect::new(0, 0, 10, 5), 74, 16),
+            Rect::new(1, 1, 8, 3)
+        );
     }
 
     #[test]

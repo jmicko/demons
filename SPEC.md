@@ -221,6 +221,7 @@ The configured leader key (default `Alt+J`) toggles between two modes.
 - `r`: restart focused pane.
 - `R`: restart all panes.
 - `c`: clear the focused pane and its scrollback.
+- `?`: show command help.
 - `q` or `Ctrl+C`: quit (sends SIGTERM, waits 2s, then SIGKILL).
 - Press the leader, click the footer mode button, or press `Esc` → return to
   input mode.
