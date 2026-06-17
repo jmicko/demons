@@ -435,7 +435,10 @@ impl App {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 return Ok(Action::Quit);
             }
-            KeyCode::Char('c') => self.tasks[self.focus].clear(),
+            KeyCode::Char('c') => {
+                self.tasks[self.focus].clear();
+                self.clear_selection_for(self.focus);
+            }
             _ => {}
         }
         Ok(Action::Continue)
@@ -748,6 +751,16 @@ impl App {
             .as_ref()
             .filter(|notice| notice.until > now)
             .map(|notice| notice.text.as_str())
+    }
+
+    fn clear_selection_for(&mut self, index: usize) {
+        if self
+            .selection
+            .as_ref()
+            .is_some_and(|selection| selection.pane == index)
+        {
+            self.selection = None;
+        }
     }
 
     fn cycle_focus(&mut self, delta: isize) {
@@ -2366,6 +2379,27 @@ mod tests {
         app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
             .unwrap();
         assert_eq!(app.tasks[0].scroll_offset, 0);
+    }
+
+    #[test]
+    fn clearing_focused_pane_clears_its_selection() {
+        let mut app = test_app();
+        app.update_layout(Rect::new(0, 0, 100, 20));
+        app.mode = AppMode::Command;
+        app.selection = Some(Selection {
+            pane: 0,
+            anchor: SelectionPoint { line: 0, column: 0 },
+            cursor: SelectionPoint { line: 0, column: 3 },
+            dragging: false,
+            dragged: true,
+            last_mouse: None,
+            last_scroll: Instant::now(),
+        });
+
+        app.handle_key(key(KeyCode::Char('c'), KeyModifiers::NONE))
+            .unwrap();
+
+        assert!(app.selection.is_none());
     }
 
     #[test]
