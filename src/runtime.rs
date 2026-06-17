@@ -492,6 +492,9 @@ impl App {
             self.start_selection(index, mouse);
             return Ok(Action::Continue);
         }
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            self.selection = None;
+        }
 
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
             && self.paste_clipboard_to_task(index)?
@@ -2465,6 +2468,33 @@ mod tests {
 
         app.handle_key(key(KeyCode::Char('c'), KeyModifiers::NONE))
             .unwrap();
+
+        assert!(app.selection.is_none());
+    }
+
+    #[test]
+    fn plain_child_mouse_click_clears_existing_selection() {
+        let mut app = test_app();
+        app.update_layout(Rect::new(0, 0, 100, 20));
+        app.tasks[0].parser.process(b"\x1b[?1000h");
+        app.selection = Some(Selection {
+            pane: 0,
+            anchor: SelectionPoint { line: 0, column: 0 },
+            cursor: SelectionPoint { line: 0, column: 3 },
+            dragging: false,
+            dragged: true,
+            last_mouse: None,
+            last_scroll: Instant::now(),
+        });
+
+        let first = app.content_rects[0];
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: first.x,
+            row: first.y,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
 
         assert!(app.selection.is_none());
     }
