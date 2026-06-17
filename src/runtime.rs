@@ -1,15 +1,15 @@
 use std::{
     collections::{HashSet, VecDeque},
-    env,
+    env, fs,
     io::{self, Read, Stdout, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, SyncSender},
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -357,7 +357,7 @@ impl App {
                         "COMMAND MODE",
                         Color::Yellow,
                         format!(
-                            " arrows/hjkl: move | f: fullscreen | / n/N: find | y/Y: copy | r: restart | R: all | c: clear | q: quit | {}: input ",
+                            " arrows/hjkl: move | f: fullscreen | / n/N: find | y/Y: copy | S: save | r: restart | R: all | c: clear | q: quit | {}: input ",
                             self.loaded.config.settings.leader.label()
                         ),
                     ),
@@ -480,6 +480,7 @@ impl App {
             KeyCode::Char('N') => self.repeat_search(SearchDirection::Newer),
             KeyCode::Char('y') => self.copy_focused_visible(),
             KeyCode::Char('Y') => self.copy_focused_history(),
+            KeyCode::Char('S') => self.save_focused_history()?,
             KeyCode::Char('r') => self.request_restart(self.focus),
             KeyCode::Char('R') => {
                 for index in 0..self.tasks.len() {
@@ -1109,6 +1110,40 @@ impl App {
                 "Copied {chars} history characters from {task_name} internally; too large for OSC 52."
             ));
         }
+    }
+
+    fn save_focused_history(&mut self) -> Result<()> {
+        self.save_focused_history_to_dir(&env::temp_dir().join("demons"))
+    }
+
+    fn save_focused_history_to_dir(&mut self, dir: &Path) -> Result<()> {
+        let Some((task_name, text)) = self
+            .tasks
+            .get(self.focus)
+            .map(|task| (task.task.name.clone(), task.history.all_text()))
+        else {
+            self.set_notice("Focused pane has no scrollback.".to_owned());
+            return Ok(());
+        };
+        if text.is_empty() {
+            self.set_notice(format!("{task_name} has no scrollback."));
+            return Ok(());
+        }
+
+        let path = write_history_log(dir, &task_name, &text)?;
+        let path_text = path.display().to_string();
+        self.clipboard = path_text.clone();
+        let copied_to_terminal = write_osc52_clipboard(&path_text).is_ok();
+        if copied_to_terminal {
+            self.set_notice(format!(
+                "Saved {task_name} scrollback to {path_text}; path copied."
+            ));
+        } else {
+            self.set_notice(format!(
+                "Saved {task_name} scrollback to {path_text}; path copied internally."
+            ));
+        }
+        Ok(())
     }
 
     fn visible_pane_text(&self, index: usize) -> Option<String> {
@@ -2405,6 +2440,64 @@ fn search_footer_text(search: &SearchState) -> String {
     format!(" /{query}  Enter: jump | Esc: cancel ")
 }
 
+fn write_history_log(dir: &Path, task_name: &str, text: &str) -> Result<PathBuf> {
+    fs::create_dir_all(dir)
+        .with_context(|| format!("failed to create log directory {}", dir.display()))?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let name = sanitize_filename(task_name);
+
+    for attempt in 0..1000 {
+        let suffix = if attempt == 0 {
+            String::new()
+        } else {
+            format!("-{attempt}")
+        };
+        let path = dir.join(format!("{name}-{stamp}{suffix}.log"));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                file.write_all(text.as_bytes())
+                    .with_context(|| format!("failed to write {}", path.display()))?;
+                return Ok(path);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to write {}", path.display()));
+            }
+        }
+    }
+
+    anyhow::bail!(
+        "failed to create a unique scrollback log in {}",
+        dir.display()
+    );
+}
+
+fn sanitize_filename(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let trimmed = sanitized.trim_matches('-');
+    if trimmed.is_empty() {
+        "pane".to_owned()
+    } else {
+        trimmed.chars().take(64).collect()
+    }
+}
+
 #[cfg(test)]
 fn write_osc52_clipboard(_text: &str) -> io::Result<()> {
     Ok(())
@@ -2648,6 +2741,7 @@ mod tests {
     use std::{collections::BTreeMap, path::PathBuf};
 
     use crate::config::{Config, Settings};
+    use tempfile::tempdir;
 
     use super::*;
 
@@ -2888,6 +2982,44 @@ mod tests {
         assert_eq!(
             search_footer_text(&search),
             " /er|or  Enter: jump | Esc: cancel "
+        );
+    }
+
+    #[test]
+    fn history_log_sanitizes_name_and_writes_contents() {
+        let temp = tempdir().unwrap();
+
+        let path = write_history_log(temp.path(), "web/dev:1", "alpha\nbeta").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha\nbeta");
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("web-dev-1-")
+        );
+    }
+
+    #[test]
+    fn command_mode_save_history_writes_log_and_copies_path() {
+        let temp = tempdir().unwrap();
+        let mut app = test_app();
+        app.update_layout(Rect::new(0, 0, 100, 8));
+        app.mode = AppMode::Command;
+        app.tasks[0].process_output(b"important output\n");
+
+        app.save_focused_history_to_dir(temp.path()).unwrap();
+
+        let path = PathBuf::from(&app.clipboard);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "important output\n"
+        );
+        assert!(path.starts_with(temp.path()));
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|notice| notice.text.contains("path copied"))
         );
     }
 

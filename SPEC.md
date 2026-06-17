@@ -213,6 +213,8 @@ The configured leader key (default `Alt+J`) toggles between two modes.
 - `Home` / `End`: jump to the top or bottom of focused pane history.
 - `y`: copy the focused pane's visible text.
 - `Y`: copy the focused pane's full scrollback.
+- `S`: save the focused pane's full scrollback to a temp log file and copy the
+  file path.
 - `/`: search the focused pane's scrollback and jump to the newest matching
   line.
 - `n` / `N`: repeat the previous search older / newer in the focused pane.
