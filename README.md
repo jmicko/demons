@@ -87,6 +87,7 @@ changing modes.
 | --- | --- |
 | Arrow keys or `h j k l` | Move focus |
 | `Tab` / `Shift+Tab` | Cycle panes |
+| `f` | Toggle fullscreen for the focused pane |
 | `PageUp` / `PageDown` | Scroll the focused pane by one page |
 | `Home` / `End` | Jump to the top or bottom of focused pane history |
 | `r` | Restart the focused task |

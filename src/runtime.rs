@@ -127,6 +127,7 @@ struct App {
     selection: Option<Selection>,
     clipboard: String,
     notice: Option<Notice>,
+    fullscreen: bool,
 }
 
 impl App {
@@ -167,6 +168,7 @@ impl App {
             selection: None,
             clipboard: String::new(),
             notice: None,
+            fullscreen: false,
         }
     }
 
@@ -213,23 +215,44 @@ impl App {
                 footer.height,
             )
         });
-        self.grid = choose_grid(self.tasks.len(), pane_area);
-        self.pane_rects = pane_rects(pane_area, self.grid, self.tasks.len());
-        self.content_rects = self
-            .pane_rects
-            .iter()
-            .map(|rect| {
-                Rect::new(
-                    rect.x.saturating_add(1),
-                    rect.y.saturating_add(1),
-                    rect.width.saturating_sub(2),
-                    rect.height.saturating_sub(2),
-                )
-            })
-            .collect();
+        if self.fullscreen {
+            self.grid = Grid {
+                columns: 1,
+                rows: 1,
+            };
+            self.pane_rects = vec![Rect::default(); self.tasks.len()];
+            self.content_rects = vec![Rect::default(); self.tasks.len()];
+            if !self.tasks.is_empty() {
+                let focus = self.focus.min(self.tasks.len() - 1);
+                self.pane_rects[focus] = pane_area;
+                self.content_rects[focus] = Rect::new(
+                    pane_area.x.saturating_add(1),
+                    pane_area.y.saturating_add(1),
+                    pane_area.width.saturating_sub(2),
+                    pane_area.height.saturating_sub(2),
+                );
+                let area = self.content_rects[focus];
+                self.tasks[focus].resize(area.width, area.height);
+            }
+        } else {
+            self.grid = choose_grid(self.tasks.len(), pane_area);
+            self.pane_rects = pane_rects(pane_area, self.grid, self.tasks.len());
+            self.content_rects = self
+                .pane_rects
+                .iter()
+                .map(|rect| {
+                    Rect::new(
+                        rect.x.saturating_add(1),
+                        rect.y.saturating_add(1),
+                        rect.width.saturating_sub(2),
+                        rect.height.saturating_sub(2),
+                    )
+                })
+                .collect();
 
-        for (task, area) in self.tasks.iter_mut().zip(&self.content_rects) {
-            task.resize(area.width, area.height);
+            for (task, area) in self.tasks.iter_mut().zip(&self.content_rects) {
+                task.resize(area.width, area.height);
+            }
         }
     }
 
@@ -241,6 +264,9 @@ impl App {
         for index in 0..self.tasks.len() {
             let area = self.pane_rects[index];
             let content = self.content_rects[index];
+            if area.width == 0 || area.height == 0 {
+                continue;
+            }
             let focused = index == self.focus;
             let border_color = match (focused, self.mode) {
                 (true, AppMode::Input) => Color::Cyan,
@@ -319,7 +345,7 @@ impl App {
                         "COMMAND MODE",
                         Color::Yellow,
                         format!(
-                            " arrows/hjkl: move | r: restart | R: all | c: clear | q: quit | {}: input ",
+                            " arrows/hjkl: move | f: fullscreen | r: restart | R: all | c: clear | q: quit | {}: input ",
                             self.loaded.config.settings.leader.label()
                         ),
                     ),
@@ -425,6 +451,7 @@ impl App {
             KeyCode::End => {
                 self.tasks[self.focus].scroll_to_bottom();
             }
+            KeyCode::Char('f') => self.fullscreen = !self.fullscreen,
             KeyCode::Char('r') => self.request_restart(self.focus),
             KeyCode::Char('R') => {
                 for index in 0..self.tasks.len() {
@@ -836,6 +863,14 @@ impl App {
     }
 
     fn move_focus(&mut self, direction: Direction) {
+        if self.fullscreen {
+            match direction {
+                Direction::Left | Direction::Up => self.cycle_focus(-1),
+                Direction::Right | Direction::Down => self.cycle_focus(1),
+            }
+            return;
+        }
+
         let row = self.focus / self.grid.columns;
         let column = self.focus % self.grid.columns;
         let next = match direction {
@@ -2325,6 +2360,43 @@ mod tests {
         .unwrap();
 
         assert_eq!(app.mode, AppMode::Input);
+    }
+
+    #[test]
+    fn fullscreen_layout_only_resizes_focused_pane() {
+        let mut app = test_app();
+        app.update_layout(Rect::new(0, 0, 100, 20));
+        let hidden_size = app.tasks[0].pty_size;
+        app.focus = 1;
+        app.fullscreen = true;
+
+        app.update_layout(Rect::new(0, 0, 100, 20));
+
+        assert_eq!(app.pane_rects[0], Rect::default());
+        assert_eq!(app.pane_rects[1], Rect::new(0, 0, 100, 19));
+        assert_eq!(app.tasks[0].pty_size.rows, hidden_size.rows);
+        assert_eq!(app.tasks[0].pty_size.cols, hidden_size.cols);
+        assert_eq!(app.tasks[1].pty_size.rows, 17);
+        assert_eq!(app.tasks[1].pty_size.cols, 98);
+    }
+
+    #[test]
+    fn command_mode_f_toggles_fullscreen_and_arrows_cycle_inside_it() {
+        let mut app = test_app();
+        app.update_layout(Rect::new(0, 0, 100, 20));
+        app.mode = AppMode::Command;
+
+        app.handle_key(key(KeyCode::Char('f'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.fullscreen);
+
+        app.handle_key(key(KeyCode::Right, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.focus, 1);
+
+        app.handle_key(key(KeyCode::Char('f'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(!app.fullscreen);
     }
 
     #[test]

@@ -159,6 +159,8 @@ Calculated at startup and on terminal resize.
   5. Tile panes left-to-right, top-to-bottom, in declaration order. Empty cells in the last row are unused.
 - `N = 1` → `1×1` (full screen).
 - For `N > 9` in v1 we still grid them; a 10-pane grid is awkward, and that's fine for now. v2 may add a tabbed fallback.
+- Fullscreen mode shows only the focused pane in the full pane area. Other
+  tasks keep running and keep their last PTY size until grid mode is restored.
 
 ### 6.2 Pane
 
@@ -205,6 +207,8 @@ The configured leader key (default `Alt+J`) toggles between two modes.
 - `Tab` / `Shift+Tab`: cycle panes, except that `Tab` toggles modes when it is
   configured as the leader. Arrow keys and `h j k l` remain available.
 - Arrow keys or `h j k l`: move focus.
+- `f`: toggle fullscreen for the focused pane. While fullscreen is active,
+  arrows and `h j k l` cycle the focused pane shown fullscreen.
 - `PageUp` / `PageDown`: scroll the focused pane history by one page.
 - `Home` / `End`: jump to the top or bottom of focused pane history.
 - `r`: restart focused pane.
