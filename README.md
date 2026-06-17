@@ -47,7 +47,8 @@ demons init
 
 The wizard uses numbered choices for fixed options and supports normal line
 editing keys while entering text. It also offers starter tasks when it detects
-common project files such as `Cargo.toml`, `package.json`, or `Makefile`.
+common project files such as `Cargo.toml`, package scripts in `package.json`,
+or `Makefile`.
 
 Or create `demons.toml` yourself:
 

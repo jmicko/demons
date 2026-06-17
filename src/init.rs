@@ -161,11 +161,18 @@ fn new_config(
 ) -> Result<Config> {
     writeln!(output, "Create a demons configuration.\n")?;
     let settings = prompt_settings(input, output, &Settings::default())?;
-    let first_task = prompt_detected_task(input, output, detected_task_templates(root))?;
+    let starters = detected_task_templates(root);
+    let first_task = prompt_detected_task(input, output, starters.clone())?;
     let mut tasks = vec![prompt_task(input, output, first_task.as_ref(), 1)?];
     while prompt_yes_no_with(input, output, "Add another task?", true)? {
         let number = tasks.len() + 1;
-        tasks.push(prompt_task(input, output, None, number)?);
+        let detected = starters
+            .iter()
+            .filter(|candidate| !tasks.iter().any(|task| task.name == candidate.name))
+            .cloned()
+            .collect();
+        let task = prompt_detected_task(input, output, detected)?;
+        tasks.push(prompt_task(input, output, task.as_ref(), number)?);
     }
     Ok(Config { settings, tasks })
 }
@@ -223,28 +230,51 @@ fn detected_task_templates(root: &Path) -> Vec<Task> {
         tasks.push(template_task("server", "cargo run"));
     }
 
-    let package_json = root.join("package.json");
-    if package_json.is_file()
-        && fs::read_to_string(&package_json)
-            .map(|source| source.contains("\"dev\""))
-            .unwrap_or(false)
-    {
-        let command = if root.join("pnpm-lock.yaml").is_file() {
-            "pnpm run dev"
-        } else if root.join("yarn.lock").is_file() {
-            "yarn dev"
-        } else if root.join("bun.lock").is_file() || root.join("bun.lockb").is_file() {
-            "bun dev"
-        } else {
-            "npm run dev"
-        };
-        tasks.push(template_task("web", command));
-    }
+    tasks.extend(detected_package_tasks(root));
 
     if root.join("Makefile").is_file() || root.join("makefile").is_file() {
         tasks.push(template_task("make", "make"));
     }
     tasks
+}
+
+#[derive(serde::Deserialize)]
+struct PackageJson {
+    #[serde(default)]
+    scripts: BTreeMap<String, String>,
+}
+
+fn detected_package_tasks(root: &Path) -> Vec<Task> {
+    let package_json = root.join("package.json");
+    let Ok(source) = fs::read_to_string(package_json) else {
+        return Vec::new();
+    };
+    let Ok(package) = serde_json::from_str::<PackageJson>(&source) else {
+        return Vec::new();
+    };
+
+    [
+        ("dev", "web"),
+        ("start", "start"),
+        ("serve", "serve"),
+        ("watch", "watch"),
+    ]
+    .into_iter()
+    .filter(|(script, _)| package.scripts.contains_key(*script))
+    .map(|(script, name)| template_task(name, &package_script_command(root, script)))
+    .collect()
+}
+
+fn package_script_command(root: &Path, script: &str) -> String {
+    if root.join("pnpm-lock.yaml").is_file() {
+        format!("pnpm run {script}")
+    } else if root.join("yarn.lock").is_file() {
+        format!("yarn {script}")
+    } else if root.join("bun.lock").is_file() || root.join("bun.lockb").is_file() {
+        format!("bun run {script}")
+    } else {
+        format!("npm run {script}")
+    }
 }
 
 fn template_task(name: &str, command: &str) -> Task {
@@ -802,6 +832,40 @@ mod tests {
     }
 
     #[test]
+    fn offers_remaining_detected_tasks_when_adding_to_new_config() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\n",
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("package.json"),
+            r#"{"scripts":{"dev":"vite"}}"#,
+        )
+        .unwrap();
+        let path = temp.path().join(crate::config::CONFIG_FILE);
+        let answers = [
+            "", "", "", "", "", "", "", "", "", "", "", "", "", "n", "", "n",
+        ]
+        .join("\n")
+            + "\n";
+        let mut input = Cursor::new(answers.into_bytes());
+        let mut output = Vec::new();
+
+        run_with_io(path.clone(), &mut input, &mut output).unwrap();
+
+        let config = parse_file(&path).unwrap();
+        assert_eq!(config.tasks.len(), 2);
+        assert_eq!(config.tasks[0].name, "server");
+        assert_eq!(config.tasks[1].name, "web");
+        assert!(matches!(
+            config.tasks[1].command,
+            TaskCommand::Shell(ref command) if command == "npm run dev"
+        ));
+    }
+
+    #[test]
     fn detects_package_manager_dev_script_starter() {
         let temp = tempdir().unwrap();
         fs::write(
@@ -819,5 +883,17 @@ mod tests {
             templates[0].command,
             TaskCommand::Shell(ref command) if command == "pnpm run dev"
         ));
+    }
+
+    #[test]
+    fn package_detection_requires_actual_script_entries() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("package.json"),
+            r#"{"dependencies":{"dev":"latest"}}"#,
+        )
+        .unwrap();
+
+        assert!(detected_task_templates(temp.path()).is_empty());
     }
 }
