@@ -247,7 +247,9 @@ For each task:
 - Spawn the command in a new session / process group (so SIGTERM propagates to the whole tree, not just the immediate child).
 - Inherit parent env, then merge task-level `env` on top.
 - Stream stdout + stderr into the pane's scrollback, interleaved.
-- Manual restart (`r` or click `[↻]`): kill the process group, wait for it to exit, respawn.
+- Manual restart (`r` or click `[↻]`): kill the process group and any dependent
+  task process groups, wait for exits, then respawn them in dependency order.
+  Each dependent's `start_delay` starts after its dependencies have started.
 - v2: file-watch-driven restart, `run_on_change`, and `repeat` — schema reserved.
 - On demons quit: send SIGTERM to every process group, wait 2s, send SIGKILL to any that are still alive. Exit only when all children are reaped.
 - External `SIGINT`, `SIGTERM`, and `SIGHUP` signals trigger the same graceful
