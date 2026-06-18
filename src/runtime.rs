@@ -3612,8 +3612,10 @@ fn render_menu_tasks(area: Rect, buffer: &mut Buffer, menu: &mut MenuState) {
             .add_modifier(Modifier::BOLD),
     );
     let rows = area.height.saturating_sub(1);
+    let count = menu.draft.tasks.len() + 1;
+    let start = scroll_start(menu.cursor, count, usize::from(rows));
     for row in 0..rows {
-        let index = usize::from(row);
+        let index = start + usize::from(row);
         let y = area.y + row + 1;
         let (text, action) = if index < menu.draft.tasks.len() {
             let task = &menu.draft.tasks[index];
@@ -3695,10 +3697,12 @@ fn render_menu_dependencies(area: Rect, buffer: &mut Buffer, menu: &mut MenuStat
         );
         return;
     }
-    for (row, candidate) in candidates.iter().enumerate() {
-        if row + 1 >= usize::from(area.height) {
+    let rows = area.height.saturating_sub(1);
+    let start = scroll_start(menu.dependency_cursor, candidates.len(), usize::from(rows));
+    for row in 0..rows {
+        let Some(candidate) = candidates.get(start + usize::from(row)) else {
             break;
-        }
+        };
         let candidate_task = &menu.draft.tasks[*candidate];
         let checked = menu.draft.tasks[task]
             .depends_on
@@ -3711,9 +3715,9 @@ fn render_menu_dependencies(area: Rect, buffer: &mut Buffer, menu: &mut MenuStat
         );
         render_menu_row(
             buffer,
-            Rect::new(area.x, area.y + row as u16 + 1, area.width, 1),
+            Rect::new(area.x, area.y + row + 1, area.width, 1),
             &text,
-            row == menu.dependency_cursor,
+            start + usize::from(row) == menu.dependency_cursor,
             Some(MenuAction::ToggleDependency(*candidate)),
             &mut menu.hits,
         );
@@ -3926,6 +3930,16 @@ fn dependency_candidates(menu: &MenuState, task: usize) -> Vec<usize> {
     (0..menu.draft.tasks.len())
         .filter(|candidate| *candidate != task)
         .collect()
+}
+
+fn scroll_start(selected: usize, count: usize, visible: usize) -> usize {
+    if visible == 0 || count <= visible {
+        return 0;
+    }
+    selected
+        .saturating_add(1)
+        .saturating_sub(visible)
+        .min(count - visible)
 }
 
 fn exit_actions(configure_only: bool) -> &'static [MenuExitAction] {
@@ -5864,6 +5878,15 @@ mod tests {
         let (dependencies, dependents) = dependency_graph(&[server, web]);
         assert_eq!(dependencies[0], vec![1]);
         assert_eq!(dependents[1], vec![0]);
+    }
+
+    #[test]
+    fn menu_scroll_start_keeps_cursor_visible() {
+        assert_eq!(scroll_start(0, 10, 4), 0);
+        assert_eq!(scroll_start(3, 10, 4), 0);
+        assert_eq!(scroll_start(4, 10, 4), 1);
+        assert_eq!(scroll_start(9, 10, 4), 6);
+        assert_eq!(scroll_start(9, 3, 4), 0);
     }
 
     #[test]
