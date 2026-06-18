@@ -143,7 +143,9 @@ fn run_loop(
             let event = event::read().context("failed to read terminal input")?;
             if app.handle_terminal_event(event)? == Action::Quit {
                 app.mark_stopping();
-                terminal.draw(|frame| app.draw(frame)).ok();
+                if app.tasks_started {
+                    terminal.draw(|frame| app.draw(frame)).ok();
+                }
                 return Ok(());
             }
             dirty = true;
@@ -420,7 +422,7 @@ impl App {
             render_quit_confirm(frame_area, buffer);
         }
 
-        if self.mode == AppMode::Input && !self.tasks.is_empty() {
+        if self.mode == AppMode::Input && self.menu.is_none() && !self.tasks.is_empty() {
             let task = &self.tasks[self.focus];
             let area = self.content_rects[self.focus];
             if task.scroll_offset == 0 && !task.parser.screen().hide_cursor() {
