@@ -3581,7 +3581,7 @@ fn render_menu_help(area: Rect, buffer: &mut Buffer, leader: &str) {
         if row >= usize::from(area.height) {
             break;
         }
-        let style = if row == 0 {
+        let style = if line == "Command mode" || line == "Menu" {
             Style::default()
                 .fg(THEME_GREEN)
                 .bg(THEME_BLACK)
