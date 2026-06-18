@@ -5120,7 +5120,7 @@ mod tests {
     fn footer_items_keep_buttons_together_when_wrapping() {
         let items = vec![
             footer_button("a one", FooterAction::ClearFocused),
-            footer_button("? help", FooterAction::ShowHelp),
+            footer_button("? menu", FooterAction::ShowHelp),
             footer_button("q quit", FooterAction::Quit),
         ];
         let mut buffer = Buffer::empty(Rect::new(0, 0, 14, 3));
