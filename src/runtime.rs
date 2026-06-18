@@ -3569,6 +3569,12 @@ fn render_menu_help(area: Rect, buffer: &mut Buffer, leader: &str) {
         "c                      Clear focused pane",
         "?                      Open this menu",
         "q or Ctrl-C            Close Demons with confirmation",
+        "",
+        "Menu",
+        "arrows / wheel         Move through visible options",
+        "Enter / click          Activate an option",
+        "Space                  Toggle dependency checkboxes",
+        "Esc                    Back out one level",
     ];
     for (row, line) in lines.iter().enumerate() {
         if row >= usize::from(area.height) {
