@@ -374,10 +374,10 @@ impl App {
                 .title(restart);
             block.render(area, buffer);
 
-            if self.pane_uses_history_view(index) {
-                render_history(&self.tasks[index], content, buffer);
-            } else {
+            if self.tasks[index].scroll_offset == 0 {
                 render_screen(&self.tasks[index].parser, content, buffer);
+            } else {
+                render_history(&self.tasks[index], content, buffer);
             }
             render_waiting_countdown(&self.tasks[index], content, now, buffer);
             render_selection(
@@ -2234,14 +2234,6 @@ impl App {
             self.selection = None;
             self.notice = None;
         }
-    }
-
-    fn pane_uses_history_view(&self, index: usize) -> bool {
-        self.tasks[index].scroll_offset != 0
-            || self
-                .selection
-                .as_ref()
-                .is_some_and(|selection| selection.pane == index && selection.history_backed)
     }
 
     fn focused_page_rows(&self) -> usize {
@@ -6210,7 +6202,7 @@ mod tests {
     }
 
     #[test]
-    fn search_selection_uses_history_text_for_rewritten_screen() {
+    fn search_selection_copies_history_text_without_forcing_scrollback() {
         let mut app = test_app();
         app.update_layout(Rect::new(0, 0, 100, 8));
         app.mode = AppMode::Command;
@@ -6225,7 +6217,7 @@ mod tests {
         app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
 
-        assert!(app.pane_uses_history_view(0));
+        assert_eq!(app.tasks[0].scroll_offset, 0);
         assert_eq!(app.selected_text().unwrap(), "http://localhostXY");
     }
 
