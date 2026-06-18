@@ -415,6 +415,7 @@ impl App {
                 self.loaded.config.settings.leader.label(),
                 self.quit_when_menu_closes,
                 self.tasks_started,
+                self.mouse_position,
             );
         }
 
@@ -3405,6 +3406,7 @@ fn render_menu(
     leader: &str,
     configure_only: bool,
     tasks_started: bool,
+    hover_position: Option<(u16, u16)>,
 ) {
     let popup = centered_rect(area, 92, 26);
     if popup.width == 0 || popup.height == 0 {
@@ -3426,11 +3428,14 @@ fn render_menu(
 
     if popup.width >= 8 {
         let close = Rect::new(popup.right().saturating_sub(5), popup.y, 3, 1);
+        let close_hovered = hover_position.is_some_and(|(x, y)| contains(close, x, y));
         render_text(
             buffer,
             close,
             " x ",
-            Style::default().fg(THEME_BLACK).bg(THEME_SNOW),
+            Style::default()
+                .fg(THEME_BLACK)
+                .bg(if close_hovered { THEME_RED } else { THEME_SNOW }),
         );
         menu.hits.push(MenuHit {
             rect: close,
@@ -3450,14 +3455,17 @@ fn render_menu(
             break;
         }
         let selected = *tab == menu.tab;
+        let rect = Rect::new(tab_x, inner.y, width, 1);
+        let hovered = hover_position.is_some_and(|(x, y)| contains(rect, x, y));
         let style = if selected {
             Style::default().fg(THEME_BLACK).bg(THEME_GREEN)
+        } else if hovered {
+            Style::default().fg(THEME_BLACK).bg(THEME_GOLD)
         } else if index % 2 == 0 {
             Style::default().fg(THEME_BLACK).bg(THEME_SNOW)
         } else {
             Style::default().fg(THEME_BLACK).bg(THEME_RED)
         };
-        let rect = Rect::new(tab_x, inner.y, width, 1);
         render_text(buffer, rect, &label, style);
         menu.hits.push(MenuHit {
             rect,
@@ -3494,15 +3502,22 @@ fn render_menu(
         return;
     }
     if let Some(task) = menu.dependency_task {
-        render_menu_dependencies(body, buffer, menu, task);
+        render_menu_dependencies(body, buffer, menu, task, hover_position);
         return;
     }
 
     match menu.tab {
         MenuTab::Help => render_menu_help(body, buffer, leader),
-        MenuTab::Tasks => render_menu_tasks(body, buffer, menu),
-        MenuTab::Settings => render_menu_settings(body, buffer, menu),
-        MenuTab::Exit => render_menu_exit(body, buffer, menu, configure_only, tasks_started),
+        MenuTab::Tasks => render_menu_tasks(body, buffer, menu, hover_position),
+        MenuTab::Settings => render_menu_settings(body, buffer, menu, hover_position),
+        MenuTab::Exit => render_menu_exit(
+            body,
+            buffer,
+            menu,
+            configure_only,
+            tasks_started,
+            hover_position,
+        ),
     }
 }
 
@@ -3554,9 +3569,14 @@ fn render_menu_help(area: Rect, buffer: &mut Buffer, leader: &str) {
     }
 }
 
-fn render_menu_tasks(area: Rect, buffer: &mut Buffer, menu: &mut MenuState) {
+fn render_menu_tasks(
+    area: Rect,
+    buffer: &mut Buffer,
+    menu: &mut MenuState,
+    hover_position: Option<(u16, u16)>,
+) {
     if let Some(task_index) = menu.task_detail {
-        render_menu_task_detail(area, buffer, menu, task_index);
+        render_menu_task_detail(area, buffer, menu, task_index, hover_position);
         return;
     }
     render_text(
@@ -3592,6 +3612,7 @@ fn render_menu_tasks(area: Rect, buffer: &mut Buffer, menu: &mut MenuState) {
             index == menu.cursor,
             Some(action),
             &mut menu.hits,
+            hover_position,
         );
     }
 }
@@ -3601,6 +3622,7 @@ fn render_menu_task_detail(
     buffer: &mut Buffer,
     menu: &mut MenuState,
     task_index: usize,
+    hover_position: Option<(u16, u16)>,
 ) {
     let Some(task) = menu.draft.tasks.get(task_index) else {
         return;
@@ -3627,11 +3649,18 @@ fn render_menu_task_detail(
             row == menu.cursor,
             Some(MenuAction::TaskField(*field)),
             &mut menu.hits,
+            hover_position,
         );
     }
 }
 
-fn render_menu_dependencies(area: Rect, buffer: &mut Buffer, menu: &mut MenuState, task: usize) {
+fn render_menu_dependencies(
+    area: Rect,
+    buffer: &mut Buffer,
+    menu: &mut MenuState,
+    task: usize,
+    hover_position: Option<(u16, u16)>,
+) {
     let Some(task_name) = menu.draft.tasks.get(task).map(|task| task.name.clone()) else {
         return;
     };
@@ -3677,11 +3706,17 @@ fn render_menu_dependencies(area: Rect, buffer: &mut Buffer, menu: &mut MenuStat
             start + usize::from(row) == menu.dependency_cursor,
             Some(MenuAction::ToggleDependency(*candidate)),
             &mut menu.hits,
+            hover_position,
         );
     }
 }
 
-fn render_menu_settings(area: Rect, buffer: &mut Buffer, menu: &mut MenuState) {
+fn render_menu_settings(
+    area: Rect,
+    buffer: &mut Buffer,
+    menu: &mut MenuState,
+    hover_position: Option<(u16, u16)>,
+) {
     render_text(
         buffer,
         Rect::new(area.x, area.y, area.width, 1),
@@ -3698,6 +3733,7 @@ fn render_menu_settings(area: Rect, buffer: &mut Buffer, menu: &mut MenuState) {
         menu.cursor == 0,
         Some(MenuAction::CycleLeader),
         &mut menu.hits,
+        hover_position,
     );
 }
 
@@ -3707,6 +3743,7 @@ fn render_menu_exit(
     menu: &mut MenuState,
     configure_only: bool,
     tasks_started: bool,
+    hover_position: Option<(u16, u16)>,
 ) {
     render_text(
         buffer,
@@ -3733,6 +3770,7 @@ fn render_menu_exit(
             row == menu.cursor,
             Some(MenuAction::Exit(*action)),
             &mut menu.hits,
+            hover_position,
         );
     }
 }
@@ -3771,9 +3809,13 @@ fn render_menu_row(
     selected: bool,
     action: Option<MenuAction>,
     hits: &mut Vec<MenuHit>,
+    hover_position: Option<(u16, u16)>,
 ) {
+    let hovered = action.is_some() && hover_position.is_some_and(|(x, y)| contains(rect, x, y));
     let style = if selected {
         Style::default().fg(THEME_BLACK).bg(THEME_SNOW)
+    } else if hovered {
+        Style::default().fg(THEME_BLACK).bg(THEME_GOLD)
     } else {
         Style::default().fg(THEME_SNOW).bg(THEME_BLACK)
     };
