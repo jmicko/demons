@@ -6002,6 +6002,24 @@ mod tests {
     }
 
     #[test]
+    fn menu_text_edit_supports_cursor_movement() {
+        let mut app = test_app();
+        app.open_menu(MenuTab::Tasks);
+        app.apply_menu_action(MenuAction::OpenTask(0)).unwrap();
+        app.apply_menu_action(MenuAction::TaskField(TaskField::Name))
+            .unwrap();
+
+        app.handle_key(key(KeyCode::Left, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(app.menu.as_ref().unwrap().draft.tasks[0].name, "onXe");
+    }
+
+    #[test]
     fn ctrl_c_from_menu_text_edit_opens_quit_confirmation() {
         let mut app = test_app();
         app.open_menu(MenuTab::Tasks);
