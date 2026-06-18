@@ -6071,6 +6071,29 @@ mod tests {
         assert!(app.tasks[0].restart_requested);
     }
 
+    #[test]
+    fn menu_save_affected_schedules_dependents() {
+        let temp = tempdir().unwrap();
+        let server = test_task("server");
+        let mut web = test_task("web");
+        web.depends_on = vec!["server".to_owned()];
+        let mut app = test_app_with_tasks(vec![server, web]);
+        app.loaded.path = temp.path().join(CONFIG_FILE);
+        app.loaded.root = temp.path().to_path_buf();
+        app.tasks_started = true;
+        app.open_menu(MenuTab::Tasks);
+        {
+            let menu = app.menu.as_mut().unwrap();
+            menu.draft.tasks[0].command = TaskCommand::Shell("echo changed".to_owned());
+        }
+
+        app.handle_menu_exit_action(MenuExitAction::SaveAffected)
+            .unwrap();
+
+        assert!(app.tasks[0].start_requested || app.tasks[0].pid.is_some());
+        assert!(app.tasks[1].start_requested || app.tasks[1].pid.is_some());
+    }
+
     fn test_task(name: &str) -> Task {
         Task {
             name: name.to_owned(),
