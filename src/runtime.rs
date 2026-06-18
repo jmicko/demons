@@ -5899,6 +5899,35 @@ mod tests {
     }
 
     #[test]
+    fn menu_dependency_picker_toggles_dependencies() {
+        let mut app = test_app_with_tasks(vec![
+            test_task("server"),
+            test_task("web"),
+            test_task("worker"),
+        ]);
+        app.open_menu(MenuTab::Tasks);
+        app.apply_menu_action(MenuAction::OpenTask(1)).unwrap();
+        app.apply_menu_action(MenuAction::TaskField(TaskField::Dependencies))
+            .unwrap();
+
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(
+            app.menu.as_ref().unwrap().draft.tasks[1].depends_on,
+            vec!["server"]
+        );
+
+        app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char(' '), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(
+            app.menu.as_ref().unwrap().draft.tasks[1].depends_on,
+            vec!["server", "worker"]
+        );
+    }
+
+    #[test]
     fn menu_add_task_and_save_writes_config_in_configure_mode() {
         let temp = tempdir().unwrap();
         let path = temp.path().join(CONFIG_FILE);
