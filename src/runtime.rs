@@ -1565,8 +1565,33 @@ impl App {
     }
 
     fn handle_menu_mouse(&mut self, mouse: MouseEvent) -> Result<Action> {
-        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return Ok(Action::Continue);
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                if self
+                    .menu
+                    .as_ref()
+                    .is_some_and(|menu| menu.dependency_task.is_some())
+                {
+                    self.move_menu_dependency_cursor(-1);
+                } else {
+                    self.move_menu_cursor(-1);
+                }
+                return Ok(Action::Continue);
+            }
+            MouseEventKind::ScrollDown => {
+                if self
+                    .menu
+                    .as_ref()
+                    .is_some_and(|menu| menu.dependency_task.is_some())
+                {
+                    self.move_menu_dependency_cursor(1);
+                } else {
+                    self.move_menu_cursor(1);
+                }
+                return Ok(Action::Continue);
+            }
+            MouseEventKind::Down(MouseButton::Left) => {}
+            _ => return Ok(Action::Continue),
         }
         let action = self.menu.as_ref().and_then(|menu| {
             menu.hits
@@ -5875,6 +5900,22 @@ mod tests {
         assert_eq!(menu.tab, MenuTab::Settings);
         assert!(menu.edit.is_none());
         assert!(menu.task_detail.is_none());
+    }
+
+    #[test]
+    fn mouse_wheel_moves_menu_cursor() {
+        let mut app = test_app();
+        app.open_menu(MenuTab::Tasks);
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+
+        assert_eq!(app.menu.as_ref().unwrap().cursor, 1);
     }
 
     #[test]
