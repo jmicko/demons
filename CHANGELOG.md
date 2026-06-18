@@ -9,6 +9,7 @@ All notable user-facing changes should be recorded here before a release.
 - Added a tabbed runtime menu with Help, Tasks, Settings, and Exit sections.
 - Changed `demons init` to open the configurator without starting tasks.
 - Added task dependencies and `start_delay`, including dependent restarts.
+- Added pane-header countdowns for delayed starts.
 - Added clickable, wrapping footer command buttons and the Christmas color
   theme.
 - Added close confirmation that works consistently from command mode and from

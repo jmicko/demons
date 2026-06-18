@@ -181,6 +181,7 @@ struct App {
     confirm_quit: bool,
     quit_when_menu_closes: bool,
     tasks_started: bool,
+    countdown_snapshot: Vec<Option<u64>>,
 }
 
 impl App {
@@ -233,6 +234,7 @@ impl App {
             confirm_quit: false,
             quit_when_menu_closes,
             tasks_started: false,
+            countdown_snapshot: Vec::new(),
         }
     }
 
@@ -329,6 +331,7 @@ impl App {
     }
 
     fn draw(&mut self, frame: &mut Frame<'_>) {
+        let now = Instant::now();
         let frame_area = frame.area();
         self.update_layout(frame_area);
         let buffer = frame.buffer_mut();
@@ -347,7 +350,7 @@ impl App {
                 (true, AppMode::Search) => THEME_GOLD,
                 _ => THEME_HOLLY,
             };
-            let (status, status_color) = self.tasks[index].status_label();
+            let (status, status_color) = self.tasks[index].status_label(now);
             let title = Line::from(vec![
                 Span::raw(" "),
                 Span::styled(status, Style::default().fg(status_color)),
@@ -392,7 +395,7 @@ impl App {
                 footer_area.width.saturating_sub(button_area.width),
                 footer_area.height,
             );
-            let (mode_label, mode_color, items) = self.footer_parts(Instant::now());
+            let (mode_label, mode_color, items) = self.footer_parts(now);
             let mode_hovered = self
                 .mouse_position
                 .is_some_and(|(x, y)| contains(button_area, x, y));
@@ -2387,6 +2390,11 @@ impl App {
         if self.tick_dependency_starts(now) {
             changed = true;
         }
+        let countdown_snapshot = self.waiting_countdown_snapshot(now);
+        if countdown_snapshot != self.countdown_snapshot {
+            self.countdown_snapshot = countdown_snapshot;
+            changed = true;
+        }
         if self
             .notice
             .as_ref()
@@ -2405,6 +2413,16 @@ impl App {
             }
         }
         Ok(changed)
+    }
+
+    fn waiting_countdown_snapshot(&self, now: Instant) -> Vec<Option<u64>> {
+        self.tasks
+            .iter()
+            .map(|task| {
+                task.pending_start
+                    .map(|deadline| countdown_seconds(deadline, now))
+            })
+            .collect()
     }
 
     fn apply_escape(&mut self) -> Result<()> {
@@ -2753,10 +2771,19 @@ impl TaskRuntime {
         ));
     }
 
-    fn status_label(&self) -> (String, Color) {
+    fn status_label(&self, now: Instant) -> (String, Color) {
         match &self.status {
             TaskStatus::NotStarted => ("⏸".to_owned(), THEME_HOLLY),
-            TaskStatus::Waiting => ("⏱".to_owned(), THEME_GOLD),
+            TaskStatus::Waiting => {
+                if let Some(deadline) = self.pending_start {
+                    (
+                        format!("⏱ {}s", countdown_seconds(deadline, now)),
+                        THEME_GOLD,
+                    )
+                } else {
+                    ("⏱".to_owned(), THEME_GOLD)
+                }
+            }
             TaskStatus::Starting => ("…".to_owned(), THEME_GOLD),
             TaskStatus::Running => ("●".to_owned(), THEME_GREEN),
             TaskStatus::Restarting => ("↻".to_owned(), THEME_GOLD),
@@ -3469,6 +3496,18 @@ fn dependency_graph(tasks: &[Task]) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
         }
     }
     (dependencies, dependents)
+}
+
+fn countdown_seconds(deadline: Instant, now: Instant) -> u64 {
+    let remaining = deadline.saturating_duration_since(now);
+    if remaining.is_zero() {
+        return 0;
+    }
+    remaining
+        .as_millis()
+        .saturating_add(999)
+        .saturating_div(1000)
+        .min(u128::from(u64::MAX)) as u64
 }
 
 fn render_menu(
@@ -5913,6 +5952,40 @@ mod tests {
             Some(now + Duration::from_secs(3))
         );
         assert!(app.tasks[1].pid.is_none());
+    }
+
+    #[test]
+    fn waiting_status_label_counts_down_to_start() {
+        let now = Instant::now();
+        let mut task = TaskRuntime::new(test_task("web"), PathBuf::from("."));
+        task.status = TaskStatus::Waiting;
+        task.pending_start = Some(now + Duration::from_millis(3200));
+
+        assert_eq!(task.status_label(now).0, "⏱ 4s");
+        assert_eq!(
+            task.status_label(now + Duration::from_millis(1200)).0,
+            "⏱ 2s"
+        );
+        assert_eq!(
+            task.status_label(now + Duration::from_millis(2600)).0,
+            "⏱ 1s"
+        );
+    }
+
+    #[test]
+    fn waiting_countdown_snapshot_tracks_visible_seconds() {
+        let now = Instant::now();
+        let mut app = test_app();
+
+        assert_eq!(app.waiting_countdown_snapshot(now), vec![None, None]);
+
+        app.tasks[1].pending_start = Some(now + Duration::from_millis(2100));
+
+        assert_eq!(app.waiting_countdown_snapshot(now), vec![None, Some(3)]);
+        assert_eq!(
+            app.waiting_countdown_snapshot(now + Duration::from_millis(1200)),
+            vec![None, Some(1)]
+        );
     }
 
     #[test]
