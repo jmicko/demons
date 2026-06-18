@@ -131,7 +131,9 @@ same close confirmation.
 
 Because the leader is intercepted, it cannot be sent to a child while in input
 mode. Set a different leader if an application or window manager needs
-`Alt+J`:
+`Alt+J`. The Settings tab can cycle the leader at runtime, and the Exit tab can
+save or discard that change. `Alt+Backtick` is available for one-hand use, but
+some desktops use it for window switching, so it is not the default.
 
 ```toml
 [settings]
