@@ -51,3 +51,19 @@ fn reports_missing_config_without_prompting_on_piped_input() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("no demons.toml found"));
 }
+
+#[test]
+fn init_requires_an_interactive_terminal() {
+    let temp = tempdir().unwrap();
+    let output = demons()
+        .arg("init")
+        .current_dir(temp.path())
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("demons init requires an interactive terminal")
+    );
+}
