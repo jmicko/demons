@@ -3552,29 +3552,30 @@ fn render_menu(
 }
 
 fn render_menu_help(area: Rect, buffer: &mut Buffer, leader: &str) {
-    let lines = [
-        "Command mode",
-        "arrows / h j k l       Move focus",
-        "Tab / Shift-Tab        Cycle panes",
-        "f                      Toggle fullscreen pane",
-        "PageUp/PageDown        Scroll focused pane",
-        "Home/End               Jump to top/bottom of history",
-        "drag / right-click     Select and copy pane text",
-        "y / Y                  Copy visible text / full scrollback",
-        "S                      Save full scrollback to a temp log",
-        "/                      Search focused pane",
-        "Enter / Shift-Enter    Search older / newer while searching",
-        "r                      Restart focused task and dependents",
-        "R                      Restart every task",
-        "c                      Clear focused pane",
-        "?                      Open this menu",
-        "q or Ctrl-C            Close Demons with confirmation",
-        "",
-        "Menu",
-        "arrows / wheel         Move through visible options",
-        "Enter / click          Activate an option",
-        "Space                  Toggle dependency checkboxes",
-        "Esc                    Back out one level",
+    let lines = vec![
+        "Command mode".to_owned(),
+        "arrows / h j k l       Move focus".to_owned(),
+        "Tab / Shift-Tab        Cycle panes".to_owned(),
+        "f                      Toggle fullscreen pane".to_owned(),
+        "PageUp/PageDown        Scroll focused pane".to_owned(),
+        "Home/End               Jump to top/bottom of history".to_owned(),
+        "drag / right-click     Select and copy pane text".to_owned(),
+        "y / Y                  Copy visible text / full scrollback".to_owned(),
+        "S                      Save full scrollback to a temp log".to_owned(),
+        "/                      Search focused pane".to_owned(),
+        "Enter / Shift-Enter    Search older / newer while searching".to_owned(),
+        "r                      Restart focused task and dependents".to_owned(),
+        "R                      Restart every task".to_owned(),
+        "c                      Clear focused pane".to_owned(),
+        "?                      Open this menu".to_owned(),
+        "q or Ctrl-C            Close Demons with confirmation".to_owned(),
+        format!("{leader} or Esc          Return to input mode outside the menu"),
+        "".to_owned(),
+        "Menu".to_owned(),
+        "arrows / wheel         Move through visible options".to_owned(),
+        "Enter / click          Activate an option".to_owned(),
+        "Space                  Toggle dependency checkboxes".to_owned(),
+        "Esc                    Back out one level".to_owned(),
     ];
     for (row, line) in lines.iter().enumerate() {
         if row >= usize::from(area.height) {
@@ -3593,14 +3594,6 @@ fn render_menu_help(area: Rect, buffer: &mut Buffer, leader: &str) {
             Rect::new(area.x, area.y + row as u16, area.width, 1),
             line,
             style,
-        );
-    }
-    if area.height > 17 {
-        render_text(
-            buffer,
-            Rect::new(area.x, area.y + 17, area.width, 1),
-            &format!("{leader} or Esc          Return to input mode outside the menu"),
-            Style::default().fg(THEME_SNOW).bg(THEME_BLACK),
         );
     }
 }
