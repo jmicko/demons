@@ -374,10 +374,10 @@ impl App {
                 .title(restart);
             block.render(area, buffer);
 
-            if self.tasks[index].scroll_offset == 0 {
-                render_screen(&self.tasks[index].parser, content, buffer);
-            } else {
+            if self.pane_uses_history_view(index) {
                 render_history(&self.tasks[index], content, buffer);
+            } else {
+                render_screen(&self.tasks[index].parser, content, buffer);
             }
             render_waiting_countdown(&self.tasks[index], content, now, buffer);
             render_selection(
@@ -1357,8 +1357,6 @@ impl App {
             KeyCode::Enter | KeyCode::Char('\n' | '\r') => {
                 self.submit_search(SearchDirection::Older)
             }
-            KeyCode::Char('n') => self.submit_search(SearchDirection::Older),
-            KeyCode::Char('N') => self.submit_search(SearchDirection::Newer),
             KeyCode::Char('c' | 'C') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.cancel_search()
             }
@@ -1502,6 +1500,7 @@ impl App {
                 line,
                 column: end_column,
             },
+            history_backed: true,
             dragging: false,
             dragged: true,
             last_mouse: None,
@@ -1583,7 +1582,7 @@ impl App {
         }
 
         if self.mode == AppMode::Search {
-            self.cancel_search();
+            return self.handle_search_mouse(mouse);
         }
 
         if self.handle_selection_drag(mouse) {
@@ -1662,6 +1661,35 @@ impl App {
             let bytes = encode_mouse(mouse, local_x, local_y, encoding);
             self.tasks[index].write_input(&bytes)?;
         }
+        Ok(Action::Continue)
+    }
+
+    fn handle_search_mouse(&mut self, mouse: MouseEvent) -> Result<Action> {
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) && self.copy_selection() {
+            return Ok(Action::Continue);
+        }
+
+        let Some(index) = self.pane_at(mouse.column, mouse.row) else {
+            return Ok(Action::Continue);
+        };
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.focus = index;
+                self.set_search_pane(index);
+            }
+            MouseEventKind::Down(_) => {
+                self.focus = index;
+            }
+            MouseEventKind::ScrollUp => {
+                self.tasks[index].scroll_up(3);
+            }
+            MouseEventKind::ScrollDown => {
+                self.tasks[index].scroll_down(3);
+            }
+            _ => {}
+        }
+
         Ok(Action::Continue)
     }
 
@@ -1788,6 +1816,7 @@ impl App {
             pane: index,
             anchor: point,
             cursor: point,
+            history_backed: false,
             dragging: true,
             dragged: false,
             last_mouse: Some((mouse.column, mouse.row)),
@@ -1936,9 +1965,11 @@ impl App {
         if !selection.dragged {
             return None;
         }
-        if let Some(text) = self.visible_selection_text(selection) {
-            if !text.is_empty() {
-                return Some(text);
+        if !selection.history_backed {
+            if let Some(text) = self.visible_selection_text(selection) {
+                if !text.is_empty() {
+                    return Some(text);
+                }
             }
         }
         Some(
@@ -2190,6 +2221,27 @@ impl App {
         if let Some(next) = next.filter(|index| *index < self.tasks.len()) {
             self.focus = next;
         }
+    }
+
+    fn set_search_pane(&mut self, pane: usize) {
+        let Some(search) = self.search.as_mut() else {
+            return;
+        };
+        if search.pane != pane {
+            search.pane = pane;
+            search.current = None;
+            search.message = None;
+            self.selection = None;
+            self.notice = None;
+        }
+    }
+
+    fn pane_uses_history_view(&self, index: usize) -> bool {
+        self.tasks[index].scroll_offset != 0
+            || self
+                .selection
+                .as_ref()
+                .is_some_and(|selection| selection.pane == index && selection.history_backed)
     }
 
     fn focused_page_rows(&self) -> usize {
@@ -2907,6 +2959,7 @@ struct Selection {
     pane: usize,
     anchor: SelectionPoint,
     cursor: SelectionPoint,
+    history_backed: bool,
     dragging: bool,
     dragged: bool,
     last_mouse: Option<(u16, u16)>,
@@ -5445,6 +5498,26 @@ mod tests {
     }
 
     #[test]
+    fn mouse_movement_does_not_leave_search_mode() {
+        let mut app = test_app();
+        app.mode = AppMode::Command;
+        app.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE))
+            .unwrap();
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 12,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+
+        assert_eq!(app.mode, AppMode::Search);
+        assert!(app.search.is_some());
+        assert_eq!(app.mouse_position, Some((12, 4)));
+    }
+
+    #[test]
     fn footer_height_wraps_long_command_buttons() {
         let mut app = test_app();
         app.mode = AppMode::Command;
@@ -5770,6 +5843,7 @@ mod tests {
             pane: 0,
             anchor: SelectionPoint { line: 0, column: 0 },
             cursor: SelectionPoint { line: 0, column: 4 },
+            history_backed: false,
             dragging: false,
             dragged: true,
             last_mouse: None,
@@ -6083,6 +6157,79 @@ mod tests {
     }
 
     #[test]
+    fn search_accepts_n_in_query_text() {
+        let mut app = test_app();
+        app.mode = AppMode::Command;
+
+        app.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE))
+            .unwrap();
+        for character in "node".chars() {
+            app.handle_key(key(KeyCode::Char(character), KeyModifiers::NONE))
+                .unwrap();
+        }
+
+        let search = app.search.as_ref().unwrap();
+        assert_eq!(search.query, "node");
+        assert_eq!(search.cursor, 4);
+        assert!(search.current.is_none());
+    }
+
+    #[test]
+    fn search_clicking_pane_retargets_active_search() {
+        let mut app = test_app();
+        app.update_layout(Rect::new(0, 0, 100, 8));
+        app.mode = AppMode::Command;
+        app.tasks[0].process_output(b"http://wrong.example\n");
+        app.tasks[1].process_output(b"http://right.example\n");
+
+        app.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE))
+            .unwrap();
+        for character in "http".chars() {
+            app.handle_key(key(KeyCode::Char(character), KeyModifiers::NONE))
+                .unwrap();
+        }
+
+        let second = app.content_rects[1];
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: second.x,
+            row: second.y,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+
+        assert_eq!(app.focus, 1);
+        assert_eq!(app.search.as_ref().unwrap().pane, 1);
+        assert!(app.selection.is_none());
+
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(app.selection.as_ref().unwrap().pane, 1);
+        assert_eq!(app.selected_text().unwrap(), "http://right.example");
+    }
+
+    #[test]
+    fn search_selection_uses_history_text_for_rewritten_screen() {
+        let mut app = test_app();
+        app.update_layout(Rect::new(0, 0, 100, 8));
+        app.mode = AppMode::Command;
+        app.tasks[0].process_output(b"http://localhost\x1b[1GXY");
+
+        app.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE))
+            .unwrap();
+        for character in "http".chars() {
+            app.handle_key(key(KeyCode::Char(character), KeyModifiers::NONE))
+                .unwrap();
+        }
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        assert!(app.pane_uses_history_view(0));
+        assert_eq!(app.selected_text().unwrap(), "http://localhostXY");
+    }
+
+    #[test]
     fn command_mode_search_reports_no_match() {
         let mut app = test_app();
         app.update_layout(Rect::new(0, 0, 100, 8));
@@ -6129,15 +6276,15 @@ mod tests {
             .unwrap();
         assert_eq!(app.selected_text().unwrap(), "error 25");
 
-        app.handle_key(key(KeyCode::Char('n'), KeyModifiers::NONE))
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
         assert_eq!(app.selected_text().unwrap(), "error 15");
 
-        app.handle_key(key(KeyCode::Char('n'), KeyModifiers::NONE))
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
         assert_eq!(app.selected_text().unwrap(), "error 5");
 
-        app.handle_key(key(KeyCode::Char('n'), KeyModifiers::NONE))
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
         assert_eq!(app.selected_text().unwrap(), "error 25");
 
@@ -6155,6 +6302,7 @@ mod tests {
             pane: 0,
             anchor: SelectionPoint { line: 0, column: 0 },
             cursor: SelectionPoint { line: 0, column: 3 },
+            history_backed: false,
             dragging: false,
             dragged: true,
             last_mouse: None,
@@ -6177,6 +6325,7 @@ mod tests {
             pane: 0,
             anchor: SelectionPoint { line: 0, column: 0 },
             cursor: SelectionPoint { line: 0, column: 3 },
+            history_backed: false,
             dragging: false,
             dragged: true,
             last_mouse: None,
