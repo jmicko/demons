@@ -663,6 +663,9 @@ impl App {
                     menu.edit = None;
                 }
             }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Ok(self.request_quit());
+            }
             KeyCode::Enter => self.submit_menu_edit(),
             KeyCode::Backspace => self.delete_menu_edit_char_before_cursor(),
             KeyCode::Delete => self.delete_menu_edit_char_at_cursor(),
@@ -5899,6 +5902,20 @@ mod tests {
         assert_eq!(menu.tab, MenuTab::Settings);
         assert!(menu.edit.is_none());
         assert!(menu.task_detail.is_none());
+    }
+
+    #[test]
+    fn ctrl_c_from_menu_text_edit_opens_quit_confirmation() {
+        let mut app = test_app();
+        app.open_menu(MenuTab::Tasks);
+        app.apply_menu_action(MenuAction::OpenTask(0)).unwrap();
+        app.apply_menu_action(MenuAction::TaskField(TaskField::Name))
+            .unwrap();
+
+        app.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .unwrap();
+
+        assert!(app.confirm_quit);
     }
 
     #[test]
