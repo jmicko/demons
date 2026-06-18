@@ -21,7 +21,8 @@ then runs `cargo check --locked`.
 
 1. Start from a clean working tree on the release branch.
 2. Run `scripts/set-version.sh <version>`.
-3. Update release notes or the GitHub release draft with user-visible changes.
+3. Move the relevant `CHANGELOG.md` entries from `Unreleased` to the target
+   version and date, then use those notes for the GitHub release draft.
 4. Run `make release-check`.
 5. Do a short manual TUI smoke test:
 
