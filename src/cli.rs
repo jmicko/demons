@@ -19,6 +19,6 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Interactively create or edit a demons.toml file.
+    /// Open the configurator without starting tasks.
     Init,
 }

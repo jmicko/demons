@@ -9,7 +9,8 @@ Demons is intentionally minimal: it is **not** a session manager, a process supe
 ## 2. Goals
 
 - One command (`demons`) starts the entire dev stack defined in `demons.toml`.
-- One command (`demons init`) creates the config via an interactive wizard. After that, the user should rarely need to touch the file.
+- One command (`demons init`) opens the configurator without starting tasks.
+  After that, the user should rarely need to touch the file directly.
 - Real PTYs with VT100/xterm-compatible rendering (colors, REPLs, and common
   TUI apps work).
 - Real keyboard and mouse navigation.
@@ -36,7 +37,7 @@ Demons is intentionally minimal: it is **not** a session manager, a process supe
 - Config file: `demons.toml`, at the project root.
 - Discovery: `demons` walks up from CWD to the filesystem root looking for `demons.toml`. The first match wins.
 - If no config is found:
-  - In an interactive terminal: print `No demons.toml found in <path> or its parents. Run 'demons init' here? [Y/n]` and run `init` on `Y` (default).
+  - In an interactive terminal: print `No demons.toml found in <path> or its parents. Run 'demons init' here? [Y/n]` and open the configurator on `Y` (default).
   - In a non-interactive terminal: report that no config was found and exit
     non-zero without prompting.
 - Override: `demons --config <path>` (or `-c`) reads from the specified file, no walk.
@@ -67,6 +68,10 @@ command = "cargo run"
 cwd = "."
 # Optional. Environment variables merged on top of the inherited env.
 env = { RUST_LOG = "debug" }
+# Optional. Task names that must be started before this task starts.
+depends_on = ["server"]
+# Optional. Delay after dependencies have started. Supports ms, s, m, and h.
+start_delay = "3s"
 # Optional. Glob patterns (relative to cwd) to watch. On change, the task
 # is killed and respawned. (Implemented in v2. Schema is reserved.)
 # watch = ["src/**/*.rs", "Cargo.toml"]
@@ -84,52 +89,45 @@ Validation rules (enforced at startup, fail loudly):
 - `command` is required and non-empty.
 - `cwd` must be a directory on disk at startup.
 - No two `[[task]]` blocks may share the same `name`.
-- Unknown keys are an error (no silent ignoring — the wizard owns the schema).
+- `depends_on` entries must name existing tasks, cannot include the task
+  itself, and cannot form dependency cycles.
+- `start_delay` must be a non-negative integer with an optional unit of `ms`,
+  `s`, `m`, or `h`; no unit means seconds.
+- Unknown keys are an error (no silent ignoring — the configurator owns the schema).
 - Reserved v2 fields are parseable so future files have a stable schema, but
   v1 rejects `logging = true` and any task that sets `watch`,
   `run_on_change`, or `repeat`. Reserved behavior is never silently ignored.
 
-### 4.3 `demons init` wizard
+### 4.3 Configurator
 
-`demons init` is an interactive wizard. It uses terminal prompts rather than a
-full TUI, so it works in ordinary terminals while still supporting line editing
-keys for text entry. Every prompt shows the current value (if any) as the
-default, and `Enter` accepts it. Fixed option prompts are presented as numbered
-choices while still accepting their textual values.
+`demons init` opens the configurator and does not start tasks. Without an
+explicit `--config`, it edits the nearest existing `demons.toml` in the current
+directory or its parents; if none exists, it creates `./demons.toml` when the
+user saves. If stdin or stdout is not a TTY, `demons init` errors out:
+`demons init requires an interactive terminal`.
 
-If stdin or stdout is not a TTY, `demons init` errors out: `init requires an interactive terminal`.
-Without an explicit `--config`, `demons init` edits the nearest existing
-`demons.toml` in the current directory or its parents; if none exists, it creates
-`./demons.toml` in the current directory.
+The runtime menu is opened with `?` in command mode or by clicking the footer's
+`? menu` button. The menu has top tabs:
 
-#### 4.3.1 New config (no file present)
+- **Help** — command reference.
+- **Tasks** — task list. Enter or click a task to edit name, command, cwd, env,
+  dependencies, and start delay. Dependencies are selected from a checkbox list
+  of other tasks.
+- **Settings** — app-level settings that can apply immediately, such as the
+  leader key.
+- **Exit** — discard, save without restarting, save and restart affected, or
+  save and restart all. In `demons init`, save/discard closes the configurator
+  without starting tasks.
 
-1. **Project settings** — `layout` and `leader`. Fixed options are selected from numbered choices. Reserved settings are not prompted.
-2. **First task** — if common project files are detected, offer starter task
-   defaults such as `cargo run`, a package-manager `dev` script, or `make`.
-   Then prompt for name, command, cwd, and env. (v1 skips `watch` /
-   `run_on_change` / `repeat`; the wizard will add them in v2.) Each shows a
-   default (cwd default: `.`; env: skip).
-3. **Add another task?** `[Y/n]`. If yes, loop to step 2.
-4. **Review** — print the resulting `demons.toml` and ask `Write to ./demons.toml? [Y/n]`. On yes, write. On no, exit without writing.
-5. **Next step** — print `Run 'demons' to start.` and prompt `Start demons now? [Y/n]`. On yes, start the just-written config.
-
-#### 4.3.2 Existing config (file present)
-
-1. Parse the existing file. On error, print a clear message with line number and exit.
-2. Ask the user to choose from `Edit existing`, `Fresh start`, and `Abort`. `Edit existing` walks through every existing value as a default; `Fresh start` runs the new-config flow (overwriting); `Abort` exits without changes.
-3. In `Edit` mode, after the per-task walkthrough, offer `Add a new task? [y/N]`.
-   New tasks may use the same detected starters as the new-config flow, excluding
-   starter names already present. Then offer a numbered task-removal list.
-   Removals may be entered as comma-separated numbers or names, and blank keeps
-   all tasks.
-4. Review and write, then offer to start (same as new config).
+Keyboard behavior follows common TUI menu conventions: arrows move, Enter
+activates, Space toggles dependency checkboxes, Esc backs out one level, and
+text fields support cursor movement and basic line editing.
 
 ## 5. CLI
 
 ```
 demons                         # Run all tasks from the nearest demons.toml.
-demons init                    # Run the interactive init wizard.
+demons init                    # Open the configurator without starting tasks.
 demons --config <path>         # Use a specific config file.
 demons -c <path>               # Short form.
 demons --help                  # Show usage.
@@ -174,9 +172,10 @@ Each pane has:
 - A pane-local text selection buffer derived from task output, used for deep
   scrollback selection and clipboard copy.
 - A PTY-backed child process.
-- Visible focus state: the selected pane's border is cyan in input mode and
-  yellow in command mode.
-- A one-line footer shows the current mode and available controls.
+- Visible focus state: the selected pane's border is green in input mode, red
+  in command mode, and yellow in search mode.
+- A footer shows the current mode and available controls, wrapping command
+  buttons to additional lines when the terminal is narrow.
 - A fixed-width button at the left of the footer displays and toggles the
   current mode.
 - Footer command buttons are clickable. Paired shortcuts such as `y` / `Y` and
@@ -224,10 +223,10 @@ The configured leader key (default `Alt+J`) toggles between two modes.
   file path.
 - `/`: open focused-pane search mode. In search mode, Enter searches older,
   Shift+Enter searches newer, and Esc leaves search mode.
-- `r`: restart focused pane.
+- `r`: restart focused pane and its dependents.
 - `R`: restart all panes.
 - `c`: clear the focused pane and its scrollback.
-- `?`: show command help.
+- `?`: open the menu.
 - `q` or `Ctrl+C`: show quit confirmation. Press `q` or `Ctrl+C` again to
   quit (sends SIGTERM, waits 2s, then SIGKILL) or `Esc` to cancel.
 - Press the leader, click the footer mode button, or press `Esc` → return to
@@ -313,7 +312,8 @@ cwd = "."
 
 - Should `r` on a running pane prompt for confirmation, or just kill and respawn immediately? Default: immediate.
 - Should the clickable restart button be visible always, or only on mouse hover? Default: always visible.
-- Should the wizard's `Edit` flow offer a "diff against current" view before writing? Default: no, just show the full file.
+- Should the configurator offer a diff against the saved file before writing?
+  Default: no, keep save flow direct.
 - Tabs for `N > 9` panes (v2).
 - The v1 footer is always visible when the terminal is tall enough to spare
   one row; discoverability is more important than reclaiming that row.

@@ -39,18 +39,17 @@ The binary will be at `target/release/demons`.
 
 ## Quick Start
 
-Run the interactive setup from a project root, or from a subdirectory of a
-project that already has a `demons.toml`:
+Run the configurator from a project root, or from a subdirectory of a project
+that already has a `demons.toml`:
 
 ```sh
 demons init
 ```
 
-The wizard uses numbered choices for fixed options and supports normal line
-editing keys while entering text. It also offers starter tasks when it detects
-common project files such as `Cargo.toml`, package scripts in `package.json`,
-or `Makefile`. When an existing config is found in the current directory or a
-parent directory, `demons init` can edit it in place.
+`demons init` opens the same menu UI used at runtime, but it does not start any
+tasks. Use the Tasks tab to add or edit tasks, Settings for app-level options,
+and Exit to save or discard changes. When an existing config is found in the
+current directory or a parent directory, `demons init` edits it in place.
 
 Or create `demons.toml` yourself:
 
@@ -97,10 +96,10 @@ changing modes.
 | `Y` | Copy the focused pane's full scrollback |
 | `S` | Save the focused pane's full scrollback to a temp log file |
 | `/` | Search the focused pane's scrollback |
-| `r` | Restart the focused task |
+| `r` | Restart the focused task and its dependents |
 | `R` | Restart every task |
 | `c` | Clear the focused pane and its scrollback |
-| `?` | Show command help |
+| `?` | Open the menu |
 | `q` or `Ctrl+C` | Ask to close Demons |
 | Leader or `Esc` | Return to input mode |
 
@@ -108,6 +107,8 @@ Click a pane to focus it. Click `[↻]` in a pane header to restart that task.
 The mouse wheel scrolls pane history unless the child application has enabled
 terminal mouse reporting in input mode. Footer command buttons are clickable;
 paired commands like `y` / `Y` and `r` / `R` are shown as separate buttons.
+The `? menu` button opens a tabbed menu with Help, Tasks, Settings, and Exit
+sections.
 
 Drag inside a pane to select text. If the child application has enabled mouse
 reporting, use `Shift`-drag to select instead of sending the drag to the child.
@@ -137,7 +138,7 @@ mode. Set a different leader if an application or window manager needs
 leader = "alt-backtick" # also: "tab", "ctrl-b", "ctrl-q", "ctrl-\\"
 ```
 
-## Testing The Wizard
+## Testing The Configurator
 
 To test the complete no-config flow without writing into a real project:
 
@@ -148,8 +149,8 @@ scratch=$(mktemp -d)
 (cd "$scratch" && "$repo/target/debug/demons")
 ```
 
-Demons will offer to run `init` and will write only inside the temporary
-directory. A simple test command for the wizard is:
+Demons will offer to open the configurator and will write only inside the
+temporary directory. A simple test command for a task is:
 
 ```sh
 while true; do date; sleep 1; done
@@ -173,6 +174,22 @@ name = "api"
 command = ["cargo", "run", "--bin", "api"]
 cwd = "."
 env = { RUST_LOG = "debug" }
+```
+
+Tasks can depend on other tasks. A dependent task starts only after all of its
+dependencies have started, then waits its own optional `start_delay`. Restarting
+a task also restarts its dependents.
+
+```toml
+[[task]]
+name = "server"
+command = "cargo run"
+
+[[task]]
+name = "web"
+command = "npm run dev"
+depends_on = ["server"]
+start_delay = "3s"
 ```
 
 Task names must be unique. Working directories are resolved relative to the

@@ -1,5 +1,6 @@
 mod cli;
 mod config;
+#[allow(dead_code)]
 mod init;
 mod layout;
 mod runtime;
@@ -35,10 +36,10 @@ fn try_main() -> Result<()> {
 
     if matches!(cli.command, Some(Command::Init)) {
         let path = init_path(cli.config, &cwd)?;
-        let result = init::run(path)?;
-        if result.start {
-            runtime::run(LoadedConfig::load(result.path)?)?;
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            bail!("demons init requires an interactive terminal");
         }
+        runtime::configure(LoadedConfig::load_unvalidated_or_default(path)?)?;
         return Ok(());
     }
 
@@ -55,11 +56,10 @@ fn try_main() -> Result<()> {
                 init::prompt_yes_no(&mut input, &mut output, &question, true)?
             };
             if should_init {
-                let result = init::run(cwd.join(CONFIG_FILE))?;
-                if !result.start {
-                    return Ok(());
-                }
-                result.path
+                runtime::configure(LoadedConfig::load_unvalidated_or_default(
+                    cwd.join(CONFIG_FILE),
+                )?)?;
+                return Ok(());
             } else {
                 return Ok(());
             }

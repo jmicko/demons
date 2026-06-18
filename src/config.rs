@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -9,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 pub const CONFIG_FILE: &str = "demons.toml";
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default, skip_serializing_if = "Settings::is_default")]
@@ -82,7 +83,7 @@ impl Leader {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Task {
     pub name: String,
@@ -91,6 +92,10 @@ pub struct Task {
     pub cwd: PathBuf,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_delay: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watch: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -99,7 +104,7 @@ pub struct Task {
     pub repeat: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum TaskCommand {
     Shell(String),
@@ -149,8 +154,35 @@ impl LoadedConfig {
         Ok(loaded)
     }
 
+    pub fn load_unvalidated_or_default(path: PathBuf) -> Result<Self> {
+        let path = absolute_path(path)?;
+        let config = if path.is_file() {
+            parse_file(&path)?
+        } else {
+            Config::default()
+        };
+        let root = path
+            .parent()
+            .context("config path has no parent directory")?
+            .to_path_buf();
+        Ok(Self { path, root, config })
+    }
+
     pub fn validate(&self) -> Result<()> {
         validate_for_path(&self.config, &self.path)
+    }
+
+    pub fn save(&self) -> Result<()> {
+        self.validate()?;
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create config directory {}", parent.display())
+            })?;
+        }
+        let text = toml::to_string_pretty(&self.config)
+            .with_context(|| format!("failed to serialize config {}", self.path.display()))?;
+        fs::write(&self.path, text)
+            .with_context(|| format!("failed to write config {}", self.path.display()))
     }
 
     pub fn task_cwd(&self, task: &Task) -> PathBuf {
@@ -183,6 +215,7 @@ pub fn validate_for_path(config: &Config, path: &Path) -> Result<()> {
         .parent()
         .context("config path has no parent directory")?;
     let mut names = HashSet::new();
+    let mut name_to_index = BTreeMap::new();
     for (index, task) in config.tasks.iter().enumerate() {
         let label = format!("task #{}", index + 1);
         if task.name.trim().is_empty() {
@@ -198,6 +231,7 @@ pub fn validate_for_path(config: &Config, path: &Path) -> Result<()> {
         if !names.insert(task.name.as_str()) {
             bail!("{}: duplicate task name {:?}", path.display(), task.name);
         }
+        name_to_index.insert(task.name.as_str(), index);
         if task.command.is_empty() {
             bail!(
                 "{}: task {:?} has an empty command",
@@ -227,6 +261,46 @@ pub fn validate_for_path(config: &Config, path: &Path) -> Result<()> {
             }
         }
 
+        let mut dependencies = HashSet::new();
+        for dependency in &task.depends_on {
+            if dependency.trim().is_empty()
+                || dependency.trim() != dependency
+                || dependency.chars().any(char::is_control)
+            {
+                bail!(
+                    "{}: task {:?} has an invalid dependency name {:?}",
+                    path.display(),
+                    task.name,
+                    dependency
+                );
+            }
+            if dependency == &task.name {
+                bail!(
+                    "{}: task {:?} cannot depend on itself",
+                    path.display(),
+                    task.name
+                );
+            }
+            if !dependencies.insert(dependency.as_str()) {
+                bail!(
+                    "{}: task {:?} repeats dependency {:?}",
+                    path.display(),
+                    task.name,
+                    dependency
+                );
+            }
+        }
+        if let Some(delay) = task.start_delay.as_deref() {
+            parse_start_delay(delay).with_context(|| {
+                format!(
+                    "{}: task {:?} has invalid start_delay {:?}",
+                    path.display(),
+                    task.name,
+                    delay
+                )
+            })?;
+        }
+
         let cwd = if task.cwd.is_absolute() {
             task.cwd.clone()
         } else {
@@ -250,7 +324,133 @@ pub fn validate_for_path(config: &Config, path: &Path) -> Result<()> {
             );
         }
     }
+    for task in &config.tasks {
+        for dependency in &task.depends_on {
+            if !name_to_index.contains_key(dependency.as_str()) {
+                bail!(
+                    "{}: task {:?} depends on unknown task {:?}",
+                    path.display(),
+                    task.name,
+                    dependency
+                );
+            }
+        }
+    }
+    reject_dependency_cycles(config, &name_to_index, path)?;
     Ok(())
+}
+
+pub fn parse_start_delay(value: &str) -> Result<Duration> {
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("delay cannot be empty");
+    }
+    let (number, unit) = split_duration(value)?;
+    let amount: u64 = number
+        .parse()
+        .with_context(|| format!("invalid delay amount {number:?}"))?;
+    if amount == 0 {
+        return Ok(Duration::ZERO);
+    }
+    let millis = match unit {
+        "" | "s" => amount.checked_mul(1000).context("delay is too large")?,
+        "ms" => amount,
+        "m" => amount.checked_mul(60_000).context("delay is too large")?,
+        "h" => amount
+            .checked_mul(3_600_000)
+            .context("delay is too large")?,
+        _ => bail!("delay unit must be one of ms, s, m, h"),
+    };
+    Ok(Duration::from_millis(millis))
+}
+
+fn split_duration(value: &str) -> Result<(&str, &str)> {
+    let unit_start = value
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(value.len());
+    let number = &value[..unit_start];
+    let unit = &value[unit_start..];
+    if number.is_empty() || !number.chars().all(|character| character.is_ascii_digit()) {
+        bail!("delay must start with a number");
+    }
+    if unit.is_empty()
+        || unit
+            .chars()
+            .all(|character| character.is_ascii_alphabetic())
+    {
+        Ok((number, unit))
+    } else {
+        bail!("delay unit must use letters only");
+    }
+}
+
+fn reject_dependency_cycles(
+    config: &Config,
+    name_to_index: &BTreeMap<&str, usize>,
+    path: &Path,
+) -> Result<()> {
+    let mut states = vec![VisitState::Unvisited; config.tasks.len()];
+    let mut stack = Vec::new();
+    for index in 0..config.tasks.len() {
+        visit_dependency(index, config, name_to_index, &mut states, &mut stack, path)?;
+    }
+    Ok(())
+}
+
+fn visit_dependency(
+    index: usize,
+    config: &Config,
+    name_to_index: &BTreeMap<&str, usize>,
+    states: &mut [VisitState],
+    stack: &mut Vec<usize>,
+    path: &Path,
+) -> Result<()> {
+    match states[index] {
+        VisitState::Visited => return Ok(()),
+        VisitState::Visiting => {
+            let task = &config.tasks[index];
+            bail!(
+                "{}: task dependency cycle includes {:?}",
+                path.display(),
+                task.name
+            );
+        }
+        VisitState::Unvisited => {}
+    }
+    states[index] = VisitState::Visiting;
+    stack.push(index);
+    for dependency in &config.tasks[index].depends_on {
+        let Some(&dependency_index) = name_to_index.get(dependency.as_str()) else {
+            continue;
+        };
+        if states[dependency_index] == VisitState::Visiting {
+            let start = stack
+                .iter()
+                .position(|candidate| *candidate == dependency_index)
+                .unwrap_or(0);
+            let mut cycle = stack[start..]
+                .iter()
+                .map(|candidate| config.tasks[*candidate].name.as_str())
+                .collect::<Vec<_>>();
+            cycle.push(config.tasks[dependency_index].name.as_str());
+            bail!(
+                "{}: task dependency cycle: {}",
+                path.display(),
+                cycle.join(" -> ")
+            );
+        }
+        visit_dependency(dependency_index, config, name_to_index, states, stack, path)?;
+    }
+    stack.pop();
+    states[index] = VisitState::Visited;
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VisitState {
+    Unvisited,
+    Visiting,
+    Visited,
 }
 
 pub fn discover(start: &Path) -> Result<Option<PathBuf>> {
@@ -301,7 +501,7 @@ fn is_false(value: &bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, time::Duration};
 
     use tempfile::tempdir;
 
@@ -409,6 +609,66 @@ mod tests {
         )
         .unwrap();
         assert!(validate_for_path(&duplicate, &path).is_err());
+    }
+
+    #[test]
+    fn validates_dependencies_and_start_delay() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join(CONFIG_FILE);
+        let valid: Config = toml::from_str(
+            r#"
+                [[task]]
+                name = "server"
+                command = "echo server"
+
+                [[task]]
+                name = "web"
+                command = "echo web"
+                depends_on = ["server"]
+                start_delay = "3s"
+            "#,
+        )
+        .unwrap();
+
+        validate_for_path(&valid, &path).unwrap();
+        assert_eq!(
+            parse_start_delay("500ms").unwrap(),
+            Duration::from_millis(500)
+        );
+        assert_eq!(parse_start_delay("2").unwrap(), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn rejects_unknown_dependency_and_cycles() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join(CONFIG_FILE);
+        let unknown: Config = toml::from_str(
+            r#"
+                [[task]]
+                name = "web"
+                command = "echo web"
+                depends_on = ["server"]
+            "#,
+        )
+        .unwrap();
+        assert!(validate_for_path(&unknown, &path).is_err());
+
+        let cycle: Config = toml::from_str(
+            r#"
+                [[task]]
+                name = "api"
+                command = "echo api"
+                depends_on = ["web"]
+
+                [[task]]
+                name = "web"
+                command = "echo web"
+                depends_on = ["api"]
+            "#,
+        )
+        .unwrap();
+        let error = validate_for_path(&cycle, &path).unwrap_err().to_string();
+        assert!(error.contains("dependency cycle"));
     }
 
     #[test]

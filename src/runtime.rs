@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{BTreeMap, HashSet, VecDeque},
     env, fs,
     io::{self, Read, Stdout, Write},
     path::{Path, PathBuf},
@@ -35,7 +35,7 @@ use ratatui::{
 use vt100::{MouseProtocolEncoding, MouseProtocolMode, Parser};
 
 use crate::{
-    config::{Leader, LoadedConfig, Task, TaskCommand},
+    config::{Leader, LoadedConfig, Task, TaskCommand, parse_start_delay},
     layout::{Grid, choose_grid, pane_rects},
 };
 
@@ -59,6 +59,28 @@ const THEME_WHITE: Color = Color::White;
 type ProcessRegistry = Arc<Mutex<HashSet<u32>>>;
 
 pub fn run(loaded: LoadedConfig) -> Result<()> {
+    run_with_options(
+        loaded,
+        RunOptions {
+            start_tasks: true,
+            open_menu: false,
+            quit_when_menu_closes: false,
+        },
+    )
+}
+
+pub fn configure(loaded: LoadedConfig) -> Result<()> {
+    run_with_options(
+        loaded,
+        RunOptions {
+            start_tasks: false,
+            open_menu: true,
+            quit_when_menu_closes: true,
+        },
+    )
+}
+
+fn run_with_options(loaded: LoadedConfig, options: RunOptions) -> Result<()> {
     let registry = Arc::new(Mutex::new(HashSet::new()));
     install_panic_hook(Arc::clone(&registry));
     let shutdown_requested = register_shutdown_signals()?;
@@ -69,11 +91,16 @@ pub fn run(loaded: LoadedConfig) -> Result<()> {
     terminal.clear().context("failed to clear terminal")?;
 
     let (tx, rx) = mpsc::sync_channel(1024);
-    let mut app = App::new(loaded, tx, rx, registry);
+    let mut app = App::new(loaded, tx, rx, registry, options.quit_when_menu_closes);
+    if options.open_menu {
+        app.open_menu(MenuTab::Tasks);
+    }
     let initial_size = terminal.size().context("failed to read terminal size")?;
     let initial_area = Rect::new(0, 0, initial_size.width, initial_size.height);
     app.update_layout(initial_area);
-    app.spawn_all();
+    if options.start_tasks {
+        app.spawn_all();
+    }
 
     let loop_result = run_loop(&mut terminal, &mut app, &shutdown_requested);
     let shutdown_result = app.shutdown();
@@ -81,6 +108,13 @@ pub fn run(loaded: LoadedConfig) -> Result<()> {
     terminal_guard.restore();
 
     loop_result.and(shutdown_result)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RunOptions {
+    start_tasks: bool,
+    open_menu: bool,
+    quit_when_menu_closes: bool,
 }
 
 fn run_loop(
@@ -132,6 +166,8 @@ struct App {
     tx: SyncSender<ProcessEvent>,
     rx: Receiver<ProcessEvent>,
     registry: ProcessRegistry,
+    dependency_indexes: Vec<Vec<usize>>,
+    dependent_indexes: Vec<Vec<usize>>,
     stopping: bool,
     pending_escape: Option<Instant>,
     selection: Option<Selection>,
@@ -139,9 +175,12 @@ struct App {
     notice: Option<Notice>,
     fullscreen: bool,
     search: Option<SearchState>,
+    menu: Option<MenuState>,
     show_help: bool,
     help_close_rect: Option<Rect>,
     confirm_quit: bool,
+    quit_when_menu_closes: bool,
+    tasks_started: bool,
 }
 
 impl App {
@@ -150,6 +189,7 @@ impl App {
         tx: SyncSender<ProcessEvent>,
         rx: Receiver<ProcessEvent>,
         registry: ProcessRegistry,
+        quit_when_menu_closes: bool,
     ) -> Self {
         let tasks = loaded
             .config
@@ -161,6 +201,7 @@ impl App {
                 TaskRuntime::new(task, cwd)
             })
             .collect();
+        let (dependency_indexes, dependent_indexes) = dependency_graph(&loaded.config.tasks);
         Self {
             loaded,
             tasks,
@@ -179,6 +220,8 @@ impl App {
             tx,
             rx,
             registry,
+            dependency_indexes,
+            dependent_indexes,
             stopping: false,
             pending_escape: None,
             selection: None,
@@ -186,19 +229,29 @@ impl App {
             notice: None,
             fullscreen: false,
             search: None,
+            menu: None,
             show_help: false,
             help_close_rect: None,
             confirm_quit: false,
+            quit_when_menu_closes,
+            tasks_started: false,
         }
     }
 
     fn spawn_all(&mut self) {
+        self.tasks_started = true;
         for index in 0..self.tasks.len() {
-            self.spawn(index);
+            self.tasks[index].start_requested = true;
         }
+        self.tick_dependency_starts(Instant::now());
     }
 
     fn spawn(&mut self, index: usize) {
+        if index >= self.tasks.len() {
+            return;
+        }
+        self.tasks[index].pending_start = None;
+        self.tasks[index].start_requested = false;
         let size = self.tasks[index].pty_size;
         if let Err(error) =
             self.tasks[index].spawn(index, size, self.tx.clone(), Arc::clone(&self.registry))
@@ -366,11 +419,22 @@ impl App {
             );
         }
 
+        if let Some(menu) = self.menu.as_mut() {
+            render_menu(
+                frame_area,
+                buffer,
+                menu,
+                self.loaded.config.settings.leader.label(),
+                self.quit_when_menu_closes,
+                self.tasks_started,
+            );
+        }
+
         if self.confirm_quit {
             render_quit_confirm(frame_area, buffer);
         }
 
-        if self.mode == AppMode::Input {
+        if self.mode == AppMode::Input && !self.tasks.is_empty() {
             let task = &self.tasks[self.focus];
             let area = self.content_rects[self.focus];
             if task.scroll_offset == 0 && !task.parser.screen().hide_cursor() {
@@ -389,6 +453,10 @@ impl App {
             }
             Event::Mouse(mouse) => self.handle_mouse(mouse),
             Event::Paste(text) => {
+                if self.menu.is_some() {
+                    self.insert_menu_edit_text(&text);
+                    return Ok(Action::Continue);
+                }
                 match self.mode {
                     AppMode::Input => self.paste_text_to_task(self.focus, &text)?,
                     AppMode::Search => self.insert_search_text(&text),
@@ -402,6 +470,14 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<Action> {
+        if self.confirm_quit {
+            return self.handle_quit_confirm_key(key);
+        }
+
+        if self.menu.is_some() {
+            return self.handle_menu_key(key);
+        }
+
         if is_copy_key(key) {
             self.copy_selection();
             return Ok(Action::Continue);
@@ -409,10 +485,6 @@ impl App {
         if is_paste_key(key) {
             self.paste_clipboard_to_focus()?;
             return Ok(Action::Continue);
-        }
-
-        if self.confirm_quit {
-            return self.handle_quit_confirm_key(key);
         }
 
         if self.show_help {
@@ -447,6 +519,9 @@ impl App {
             if is_quit_key(key) && !self.focused_task_accepts_input() {
                 return Ok(self.request_quit());
             }
+            if self.tasks.is_empty() {
+                return Ok(Action::Continue);
+            }
             let application_cursor = self.tasks[self.focus].parser.screen().application_cursor();
             let bytes = encode_key(key, application_cursor);
             if !bytes.is_empty() {
@@ -465,38 +540,46 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => self.move_focus(Direction::Up),
             KeyCode::Down | KeyCode::Char('j') => self.move_focus(Direction::Down),
             KeyCode::PageUp => {
+                if self.tasks.is_empty() {
+                    return Ok(Action::Continue);
+                }
                 let rows = self.focused_page_rows();
                 self.tasks[self.focus].scroll_up(rows);
             }
             KeyCode::PageDown => {
+                if self.tasks.is_empty() {
+                    return Ok(Action::Continue);
+                }
                 let rows = self.focused_page_rows();
                 self.tasks[self.focus].scroll_down(rows);
             }
             KeyCode::Home => {
-                self.tasks[self.focus].scroll_to_top();
+                if let Some(task) = self.tasks.get_mut(self.focus) {
+                    task.scroll_to_top();
+                }
             }
             KeyCode::End => {
-                self.tasks[self.focus].scroll_to_bottom();
+                if let Some(task) = self.tasks.get_mut(self.focus) {
+                    task.scroll_to_bottom();
+                }
             }
-            KeyCode::Char('?') => self.show_help = true,
+            KeyCode::Char('?') => self.open_menu(MenuTab::Help),
             KeyCode::Char('f') => self.fullscreen = !self.fullscreen,
             KeyCode::Char('/') => self.start_search(),
             KeyCode::Char('y') => self.copy_focused_visible(),
             KeyCode::Char('Y') => self.copy_focused_history(),
             KeyCode::Char('S') => self.save_focused_history()?,
             KeyCode::Char('r') => self.request_restart(self.focus),
-            KeyCode::Char('R') => {
-                for index in 0..self.tasks.len() {
-                    self.request_restart(index);
-                }
-            }
+            KeyCode::Char('R') => self.request_restart_all(),
             KeyCode::Char('q') => return Ok(self.request_quit()),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 return Ok(self.request_quit());
             }
             KeyCode::Char('c') => {
-                self.tasks[self.focus].clear();
-                self.clear_selection_for(self.focus);
+                if let Some(task) = self.tasks.get_mut(self.focus) {
+                    task.clear();
+                    self.clear_selection_for(self.focus);
+                }
             }
             _ => {}
         }
@@ -536,6 +619,654 @@ impl App {
             _ => {}
         }
         Ok(Action::Continue)
+    }
+
+    fn open_menu(&mut self, tab: MenuTab) {
+        self.menu = Some(MenuState::new(self.loaded.config.clone(), tab));
+        self.show_help = false;
+        self.search = None;
+        self.notice = None;
+        self.confirm_quit = false;
+    }
+
+    fn handle_menu_key(&mut self, key: KeyEvent) -> Result<Action> {
+        if self
+            .menu
+            .as_ref()
+            .and_then(|menu| menu.edit.as_ref())
+            .is_some()
+        {
+            return self.handle_menu_edit_key(key);
+        }
+        if self
+            .menu
+            .as_ref()
+            .and_then(|menu| menu.dependency_task)
+            .is_some()
+        {
+            return self.handle_menu_dependency_key(key);
+        }
+
+        match key.code {
+            KeyCode::Esc => return Ok(self.menu_back_or_close()),
+            KeyCode::Left => self.cycle_menu_tab(-1),
+            KeyCode::Right | KeyCode::Tab => self.cycle_menu_tab(1),
+            KeyCode::BackTab => self.cycle_menu_tab(-1),
+            KeyCode::Up | KeyCode::Char('k') => self.move_menu_cursor(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_menu_cursor(1),
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                return self.activate_selected_menu_item();
+            }
+            KeyCode::Char('?') => return Ok(self.menu_back_or_close()),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Ok(self.request_quit());
+            }
+            _ => {}
+        }
+        Ok(Action::Continue)
+    }
+
+    fn handle_menu_dependency_key(&mut self, key: KeyEvent) -> Result<Action> {
+        match key.code {
+            KeyCode::Esc => {
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.dependency_task = None;
+                    menu.dependency_cursor = 0;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.move_menu_dependency_cursor(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_menu_dependency_cursor(1),
+            KeyCode::Enter | KeyCode::Char(' ') => self.toggle_selected_dependency(),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Ok(self.request_quit());
+            }
+            _ => {}
+        }
+        Ok(Action::Continue)
+    }
+
+    fn handle_menu_edit_key(&mut self, key: KeyEvent) -> Result<Action> {
+        match key.code {
+            KeyCode::Esc => {
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.edit = None;
+                }
+            }
+            KeyCode::Enter => self.submit_menu_edit(),
+            KeyCode::Backspace => self.delete_menu_edit_char_before_cursor(),
+            KeyCode::Delete => self.delete_menu_edit_char_at_cursor(),
+            KeyCode::Left => {
+                if let Some(edit) = self.menu.as_mut().and_then(|menu| menu.edit.as_mut()) {
+                    edit.cursor = edit.cursor.saturating_sub(1);
+                }
+            }
+            KeyCode::Right => {
+                if let Some(edit) = self.menu.as_mut().and_then(|menu| menu.edit.as_mut()) {
+                    edit.cursor = (edit.cursor + 1).min(char_count(&edit.value));
+                }
+            }
+            KeyCode::Home => {
+                if let Some(edit) = self.menu.as_mut().and_then(|menu| menu.edit.as_mut()) {
+                    edit.cursor = 0;
+                }
+            }
+            KeyCode::End => {
+                if let Some(edit) = self.menu.as_mut().and_then(|menu| menu.edit.as_mut()) {
+                    edit.cursor = char_count(&edit.value);
+                }
+            }
+            KeyCode::Char('a' | 'A') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(edit) = self.menu.as_mut().and_then(|menu| menu.edit.as_mut()) {
+                    edit.cursor = 0;
+                }
+            }
+            KeyCode::Char('e' | 'E') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(edit) = self.menu.as_mut().and_then(|menu| menu.edit.as_mut()) {
+                    edit.cursor = char_count(&edit.value);
+                }
+            }
+            KeyCode::Char('u' | 'U') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(edit) = self.menu.as_mut().and_then(|menu| menu.edit.as_mut()) {
+                    edit.value.clear();
+                    edit.cursor = 0;
+                }
+            }
+            KeyCode::Char('k' | 'K') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(edit) = self.menu.as_mut().and_then(|menu| menu.edit.as_mut()) {
+                    let index = byte_index_for_char(&edit.value, edit.cursor);
+                    edit.value.truncate(index);
+                }
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.insert_menu_edit_char(character);
+            }
+            _ => {}
+        }
+        Ok(Action::Continue)
+    }
+
+    fn cycle_menu_tab(&mut self, delta: isize) {
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        let index = menu.tab.index() as isize;
+        let next = (index + delta).rem_euclid(MenuTab::ALL.len() as isize) as usize;
+        menu.tab = MenuTab::ALL[next];
+        menu.cursor = 0;
+        menu.task_detail = None;
+        menu.dependency_task = None;
+    }
+
+    fn move_menu_cursor(&mut self, delta: isize) {
+        let configure_only = self.quit_when_menu_closes || !self.tasks_started;
+        let count = self
+            .menu
+            .as_ref()
+            .map(|menu| menu_item_count(menu, configure_only))
+            .unwrap_or(0);
+        if count == 0 {
+            return;
+        }
+        if let Some(menu) = self.menu.as_mut() {
+            menu.cursor = (menu.cursor as isize + delta).rem_euclid(count as isize) as usize;
+        }
+    }
+
+    fn move_menu_dependency_cursor(&mut self, delta: isize) {
+        let Some(menu) = self.menu.as_ref() else {
+            return;
+        };
+        let Some(task) = menu.dependency_task else {
+            return;
+        };
+        let count = dependency_candidates(menu, task).len();
+        if count == 0 {
+            return;
+        }
+        if let Some(menu) = self.menu.as_mut() {
+            menu.dependency_cursor =
+                (menu.dependency_cursor as isize + delta).rem_euclid(count as isize) as usize;
+        }
+    }
+
+    fn activate_selected_menu_item(&mut self) -> Result<Action> {
+        let Some(action) = self.selected_menu_action() else {
+            return Ok(Action::Continue);
+        };
+        self.apply_menu_action(action)
+    }
+
+    fn selected_menu_action(&self) -> Option<MenuAction> {
+        let menu = self.menu.as_ref()?;
+        match menu.tab {
+            MenuTab::Help => None,
+            MenuTab::Tasks => {
+                if menu.task_detail.is_some() {
+                    return task_detail_fields()
+                        .get(menu.cursor)
+                        .copied()
+                        .map(MenuAction::TaskField);
+                }
+                if menu.cursor < menu.draft.tasks.len() {
+                    Some(MenuAction::OpenTask(menu.cursor))
+                } else {
+                    Some(MenuAction::AddTask)
+                }
+            }
+            MenuTab::Settings => Some(MenuAction::CycleLeader),
+            MenuTab::Exit => exit_actions(self.quit_when_menu_closes || !self.tasks_started)
+                .get(menu.cursor)
+                .copied()
+                .map(MenuAction::Exit),
+        }
+    }
+
+    fn apply_menu_action(&mut self, action: MenuAction) -> Result<Action> {
+        match action {
+            MenuAction::Tab(tab) => {
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.tab = tab;
+                    menu.cursor = 0;
+                    menu.task_detail = None;
+                    menu.dependency_task = None;
+                }
+            }
+            MenuAction::Close => return Ok(self.menu_back_or_close()),
+            MenuAction::OpenTask(index) => {
+                if let Some(menu) = self.menu.as_mut() {
+                    if index < menu.draft.tasks.len() {
+                        menu.task_detail = Some(index);
+                        menu.cursor = 0;
+                    }
+                }
+            }
+            MenuAction::AddTask => self.add_menu_task(),
+            MenuAction::TaskField(field) => self.activate_task_field(field),
+            MenuAction::ToggleDependency(candidate) => self.toggle_dependency(candidate),
+            MenuAction::CycleLeader => self.cycle_menu_leader(),
+            MenuAction::Exit(action) => return self.handle_menu_exit_action(action),
+        }
+        Ok(Action::Continue)
+    }
+
+    fn menu_back_or_close(&mut self) -> Action {
+        let Some(menu) = self.menu.as_mut() else {
+            return Action::Continue;
+        };
+        if menu.dependency_task.is_some() {
+            menu.dependency_task = None;
+            menu.dependency_cursor = 0;
+            return Action::Continue;
+        }
+        if menu.task_detail.is_some() {
+            menu.task_detail = None;
+            menu.cursor = 0;
+            return Action::Continue;
+        }
+        if menu.dirty() {
+            menu.tab = MenuTab::Exit;
+            menu.cursor = 0;
+            self.set_notice("Use the Exit tab to save or discard menu changes.".to_owned());
+            return Action::Continue;
+        }
+        self.menu = None;
+        if self.quit_when_menu_closes {
+            Action::Quit
+        } else {
+            Action::Continue
+        }
+    }
+
+    fn add_menu_task(&mut self) {
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        let name = unique_task_name(&menu.draft, "task");
+        menu.draft.tasks.push(Task {
+            name,
+            command: TaskCommand::Shell("echo ready".to_owned()),
+            cwd: PathBuf::from("."),
+            env: BTreeMap::new(),
+            depends_on: Vec::new(),
+            start_delay: None,
+            watch: None,
+            run_on_change: None,
+            repeat: None,
+        });
+        menu.task_detail = Some(menu.draft.tasks.len() - 1);
+        menu.cursor = 0;
+    }
+
+    fn activate_task_field(&mut self, field: TaskField) {
+        let Some(menu) = self.menu.as_ref() else {
+            return;
+        };
+        let Some(task) = menu.task_detail else {
+            return;
+        };
+        match field {
+            TaskField::Name
+            | TaskField::Command
+            | TaskField::Cwd
+            | TaskField::Env
+            | TaskField::StartDelay => {
+                self.start_menu_edit(task, field);
+            }
+            TaskField::Dependencies => {
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.dependency_task = Some(task);
+                    menu.dependency_cursor = 0;
+                }
+            }
+            TaskField::Delete => self.delete_menu_task(task),
+            TaskField::Back => {
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.task_detail = None;
+                    menu.cursor = 0;
+                }
+            }
+        }
+    }
+
+    fn start_menu_edit(&mut self, task_index: usize, field: TaskField) {
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        let Some(task) = menu.draft.tasks.get(task_index) else {
+            return;
+        };
+        let value = match field {
+            TaskField::Name => task.name.clone(),
+            TaskField::Command => task.command.display(),
+            TaskField::Cwd => task.cwd.to_string_lossy().into_owned(),
+            TaskField::Env => format_env_inline(&task.env),
+            TaskField::StartDelay => task.start_delay.clone().unwrap_or_default(),
+            _ => return,
+        };
+        menu.edit = Some(MenuEdit {
+            task: task_index,
+            field,
+            cursor: char_count(&value),
+            value,
+        });
+    }
+
+    fn submit_menu_edit(&mut self) {
+        let Some(edit) = self.menu.as_mut().and_then(|menu| menu.edit.take()) else {
+            return;
+        };
+        let value = edit.value.trim().to_owned();
+        let result = self.apply_menu_edit(&edit, value);
+        if let Err(error) = result {
+            self.set_notice(format!("Edit not applied: {error:#}"));
+            if let Some(menu) = self.menu.as_mut() {
+                menu.edit = Some(edit);
+            }
+        }
+    }
+
+    fn apply_menu_edit(&mut self, edit: &MenuEdit, value: String) -> Result<()> {
+        let Some(menu) = self.menu.as_mut() else {
+            return Ok(());
+        };
+        let Some(task) = menu.draft.tasks.get_mut(edit.task) else {
+            return Ok(());
+        };
+        match edit.field {
+            TaskField::Name => {
+                if value.is_empty() {
+                    anyhow::bail!("task name cannot be empty");
+                }
+                task.name = value;
+                scrub_missing_dependencies(&mut menu.draft);
+            }
+            TaskField::Command => {
+                if value.is_empty() {
+                    anyhow::bail!("command cannot be empty");
+                }
+                task.command = TaskCommand::Shell(value);
+            }
+            TaskField::Cwd => task.cwd = PathBuf::from(if value.is_empty() { "." } else { &value }),
+            TaskField::Env => task.env = parse_env_inline(&value)?,
+            TaskField::StartDelay => {
+                if value.is_empty() {
+                    task.start_delay = None;
+                } else {
+                    parse_start_delay(&value)?;
+                    task.start_delay = Some(value);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn delete_menu_task(&mut self, task_index: usize) {
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        if task_index >= menu.draft.tasks.len() {
+            return;
+        }
+        let name = menu.draft.tasks[task_index].name.clone();
+        menu.draft.tasks.remove(task_index);
+        for task in &mut menu.draft.tasks {
+            task.depends_on.retain(|dependency| dependency != &name);
+        }
+        menu.task_detail = None;
+        menu.cursor = menu.cursor.min(menu.draft.tasks.len());
+    }
+
+    fn toggle_selected_dependency(&mut self) {
+        let Some(menu) = self.menu.as_ref() else {
+            return;
+        };
+        let Some(task) = menu.dependency_task else {
+            return;
+        };
+        let candidates = dependency_candidates(menu, task);
+        let Some(&candidate) = candidates.get(menu.dependency_cursor) else {
+            return;
+        };
+        self.toggle_dependency(candidate);
+    }
+
+    fn toggle_dependency(&mut self, candidate: usize) {
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        let Some(task_index) = menu.dependency_task.or(menu.task_detail) else {
+            return;
+        };
+        if task_index == candidate
+            || task_index >= menu.draft.tasks.len()
+            || candidate >= menu.draft.tasks.len()
+        {
+            return;
+        }
+        let name = menu.draft.tasks[candidate].name.clone();
+        let dependencies = &mut menu.draft.tasks[task_index].depends_on;
+        if let Some(position) = dependencies
+            .iter()
+            .position(|dependency| dependency == &name)
+        {
+            dependencies.remove(position);
+        } else {
+            dependencies.push(name);
+            dependencies.sort();
+        }
+    }
+
+    fn cycle_menu_leader(&mut self) {
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        let leaders = all_leaders();
+        let current = menu.draft.settings.leader;
+        let index = leaders
+            .iter()
+            .position(|leader| *leader == current)
+            .unwrap_or(0);
+        let next = leaders[(index + 1) % leaders.len()];
+        menu.draft.settings.leader = next;
+        self.loaded.config.settings.leader = next;
+    }
+
+    fn handle_menu_exit_action(&mut self, action: MenuExitAction) -> Result<Action> {
+        match action {
+            MenuExitAction::SaveAffected => self.save_menu_config(RestartMode::Affected),
+            MenuExitAction::SaveAll => self.save_menu_config(RestartMode::All),
+            MenuExitAction::SaveOnly => self.save_menu_config(RestartMode::None),
+            MenuExitAction::Discard => {
+                if let Some(menu) = self.menu.take() {
+                    self.loaded.config = menu.original;
+                    if !self.tasks_started {
+                        self.rebuild_unstarted_tasks();
+                    }
+                }
+                if self.quit_when_menu_closes {
+                    Ok(Action::Quit)
+                } else {
+                    Ok(Action::Continue)
+                }
+            }
+            MenuExitAction::Close => {
+                if self.menu.as_ref().is_some_and(MenuState::dirty) {
+                    self.set_notice("Save or discard changes before closing the menu.".to_owned());
+                    Ok(Action::Continue)
+                } else {
+                    self.menu = None;
+                    if self.quit_when_menu_closes {
+                        Ok(Action::Quit)
+                    } else {
+                        Ok(Action::Continue)
+                    }
+                }
+            }
+        }
+    }
+
+    fn save_menu_config(&mut self, restart: RestartMode) -> Result<Action> {
+        let Some(menu) = self.menu.as_ref() else {
+            return Ok(Action::Continue);
+        };
+        let draft = menu.draft.clone();
+        let loaded = LoadedConfig {
+            path: self.loaded.path.clone(),
+            root: self.loaded.root.clone(),
+            config: draft.clone(),
+        };
+        if let Err(error) = loaded.save() {
+            self.set_notice(format!("Config not saved: {error:#}"));
+            return Ok(Action::Continue);
+        }
+
+        let old = self.loaded.config.clone();
+        self.menu = None;
+        self.apply_saved_config(old, draft, restart);
+        if self.quit_when_menu_closes {
+            Ok(Action::Quit)
+        } else {
+            Ok(Action::Continue)
+        }
+    }
+
+    fn apply_saved_config(
+        &mut self,
+        old: crate::config::Config,
+        new: crate::config::Config,
+        restart: RestartMode,
+    ) {
+        if !self.tasks_started {
+            self.loaded.config = new;
+            self.rebuild_unstarted_tasks();
+            self.set_notice(format!("Saved {}.", self.loaded.path.display()));
+            return;
+        }
+
+        let same_runtime_shape = old.tasks.len() == new.tasks.len()
+            && old
+                .tasks
+                .iter()
+                .zip(&new.tasks)
+                .all(|(old, new)| old.name == new.name);
+
+        if same_runtime_shape {
+            let changed = old
+                .tasks
+                .iter()
+                .zip(&new.tasks)
+                .enumerate()
+                .filter_map(|(index, (old, new))| (old != new).then_some(index))
+                .collect::<Vec<_>>();
+            self.loaded.config = new;
+            for index in 0..self.tasks.len() {
+                let task = self.loaded.config.tasks[index].clone();
+                self.tasks[index].cwd = self.loaded.task_cwd(&task);
+                self.tasks[index].start_delay = task
+                    .start_delay
+                    .as_deref()
+                    .and_then(|delay| parse_start_delay(delay).ok())
+                    .unwrap_or_default();
+                self.tasks[index].task = task;
+            }
+            self.rebuild_dependency_graph_from_runtime();
+            match restart {
+                RestartMode::All => self.request_restart_all(),
+                RestartMode::Affected => {
+                    let mut indexes = Vec::new();
+                    for index in changed {
+                        indexes.extend(self.restart_closure(index));
+                    }
+                    indexes.sort_unstable();
+                    indexes.dedup();
+                    self.request_restart_set(&indexes);
+                }
+                RestartMode::None => {}
+            }
+            self.set_notice(format!("Saved {}.", self.loaded.path.display()));
+        } else {
+            self.loaded.config = new;
+            self.rebuild_dependency_graph_from_runtime();
+            self.set_notice(format!(
+                "Saved {}; restart Demons to use added, removed, or renamed tasks.",
+                self.loaded.path.display()
+            ));
+        }
+    }
+
+    fn rebuild_unstarted_tasks(&mut self) {
+        self.tasks = self
+            .loaded
+            .config
+            .tasks
+            .iter()
+            .cloned()
+            .map(|task| {
+                let cwd = self.loaded.task_cwd(&task);
+                TaskRuntime::new(task, cwd)
+            })
+            .collect();
+        self.focus = self.focus.min(self.tasks.len().saturating_sub(1));
+        self.rebuild_dependency_graph_from_runtime();
+    }
+
+    fn rebuild_dependency_graph_from_runtime(&mut self) {
+        let tasks = self
+            .tasks
+            .iter()
+            .map(|runtime| runtime.task.clone())
+            .collect::<Vec<_>>();
+        let (dependency_indexes, dependent_indexes) = dependency_graph(&tasks);
+        self.dependency_indexes = dependency_indexes;
+        self.dependent_indexes = dependent_indexes;
+    }
+
+    fn insert_menu_edit_char(&mut self, character: char) {
+        let Some(edit) = self.menu.as_mut().and_then(|menu| menu.edit.as_mut()) else {
+            return;
+        };
+        if character.is_control() {
+            return;
+        }
+        let index = byte_index_for_char(&edit.value, edit.cursor);
+        edit.value.insert(index, character);
+        edit.cursor += 1;
+    }
+
+    fn insert_menu_edit_text(&mut self, text: &str) {
+        for character in text.chars().filter(|character| !character.is_control()) {
+            self.insert_menu_edit_char(character);
+        }
+    }
+
+    fn delete_menu_edit_char_before_cursor(&mut self) {
+        let Some(edit) = self.menu.as_mut().and_then(|menu| menu.edit.as_mut()) else {
+            return;
+        };
+        if edit.cursor == 0 {
+            return;
+        }
+        let start = byte_index_for_char(&edit.value, edit.cursor - 1);
+        let end = byte_index_for_char(&edit.value, edit.cursor);
+        edit.value.replace_range(start..end, "");
+        edit.cursor -= 1;
+    }
+
+    fn delete_menu_edit_char_at_cursor(&mut self) {
+        let Some(edit) = self.menu.as_mut().and_then(|menu| menu.edit.as_mut()) else {
+            return;
+        };
+        if edit.cursor >= char_count(&edit.value) {
+            return;
+        }
+        let start = byte_index_for_char(&edit.value, edit.cursor);
+        let end = byte_index_for_char(&edit.value, edit.cursor + 1);
+        edit.value.replace_range(start..end, "");
     }
 
     fn handle_search_key(&mut self, key: KeyEvent) -> Result<Action> {
@@ -611,6 +1342,10 @@ impl App {
     }
 
     fn start_search(&mut self) {
+        if self.tasks.is_empty() {
+            self.set_notice("No task panes are configured.".to_owned());
+            return;
+        }
         self.search = Some(SearchState {
             pane: self.focus,
             query: String::new(),
@@ -749,6 +1484,10 @@ impl App {
             return Ok(Action::Continue);
         }
 
+        if self.menu.is_some() {
+            return self.handle_menu_mouse(mouse);
+        }
+
         if self.show_help {
             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
                 && self
@@ -861,6 +1600,22 @@ impl App {
         Ok(Action::Continue)
     }
 
+    fn handle_menu_mouse(&mut self, mouse: MouseEvent) -> Result<Action> {
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return Ok(Action::Continue);
+        }
+        let action = self.menu.as_ref().and_then(|menu| {
+            menu.hits
+                .iter()
+                .find(|hit| contains(hit.rect, mouse.column, mouse.row))
+                .map(|hit| hit.action)
+        });
+        let Some(action) = action else {
+            return Ok(Action::Continue);
+        };
+        self.apply_menu_action(action)
+    }
+
     fn footer_action_at(&self, mouse: MouseEvent) -> Option<FooterAction> {
         if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             return None;
@@ -881,16 +1636,14 @@ impl App {
             FooterAction::CopyVisible => self.copy_focused_visible(),
             FooterAction::CopyHistory => self.copy_focused_history(),
             FooterAction::SaveHistory => self.save_focused_history()?,
-            FooterAction::ShowHelp => self.show_help = true,
+            FooterAction::ShowHelp => self.open_menu(MenuTab::Help),
             FooterAction::RestartFocused => self.request_restart(self.focus),
-            FooterAction::RestartAll => {
-                for index in 0..self.tasks.len() {
-                    self.request_restart(index);
-                }
-            }
+            FooterAction::RestartAll => self.request_restart_all(),
             FooterAction::ClearFocused => {
-                self.tasks[self.focus].clear();
-                self.clear_selection_for(self.focus);
+                if let Some(task) = self.tasks.get_mut(self.focus) {
+                    task.clear();
+                    self.clear_selection_for(self.focus);
+                }
             }
             FooterAction::Quit => return Ok(self.request_quit()),
         }
@@ -1263,7 +2016,7 @@ impl App {
     }
 
     fn paste_clipboard_to_task(&mut self, index: usize) -> Result<bool> {
-        if self.clipboard.is_empty() || self.mode != AppMode::Input {
+        if self.clipboard.is_empty() || self.mode != AppMode::Input || index >= self.tasks.len() {
             return Ok(false);
         }
         let text = self.clipboard.clone();
@@ -1273,6 +2026,9 @@ impl App {
     }
 
     fn paste_text_to_task(&mut self, index: usize, text: &str) -> Result<()> {
+        if index >= self.tasks.len() {
+            return Ok(());
+        }
         let bracketed = self.tasks[index].parser.screen().bracketed_paste();
         if bracketed {
             self.tasks[index].write_input(b"\x1b[200~")?;
@@ -1309,11 +2065,18 @@ impl App {
     }
 
     fn cycle_focus(&mut self, delta: isize) {
+        if self.tasks.is_empty() {
+            self.focus = 0;
+            return;
+        }
         let count = self.tasks.len() as isize;
         self.focus = (self.focus as isize + delta).rem_euclid(count) as usize;
     }
 
     fn move_focus(&mut self, direction: Direction) {
+        if self.tasks.is_empty() {
+            return;
+        }
         if self.fullscreen {
             match direction {
                 Direction::Left | Direction::Up => self.cycle_focus(-1),
@@ -1376,7 +2139,12 @@ impl App {
                 "INPUT MODE",
                 THEME_GREEN,
                 vec![
-                    footer_status(self.tasks[self.focus].task.name.clone()),
+                    footer_status(
+                        self.tasks
+                            .get(self.focus)
+                            .map(|task| task.task.name.clone())
+                            .unwrap_or_else(|| "no tasks configured".to_owned()),
+                    ),
                     footer_status("drag select"),
                     footer_status("right-click copy"),
                 ],
@@ -1401,20 +2169,117 @@ impl App {
     }
 
     fn request_restart(&mut self, index: usize) {
+        if index >= self.tasks.len() {
+            return;
+        }
+        let indexes = self.restart_closure(index);
+        self.request_restart_set(&indexes);
+    }
+
+    fn request_restart_all(&mut self) {
+        let indexes = (0..self.tasks.len()).collect::<Vec<_>>();
+        self.request_restart_set(&indexes);
+    }
+
+    fn request_restart_set(&mut self, indexes: &[usize]) {
         if self.stopping {
             return;
         }
-        if let Some(pid) = self.tasks[index].pid {
-            self.tasks[index].restart_requested = true;
-            self.tasks[index].kill_deadline = Some(Instant::now() + RESTART_GRACE);
-            self.tasks[index].status = TaskStatus::Restarting;
-            self.tasks[index].message("\r\n\x1b[33m[demons] restarting...\x1b[0m\r\n");
-            if signal_process_group(pid, libc::SIGTERM).is_err() {
-                self.tasks[index].kill_deadline = Some(Instant::now());
+        let now = Instant::now();
+        for &index in indexes {
+            if index >= self.tasks.len() {
+                continue;
             }
-        } else {
-            self.spawn(index);
+            self.tasks[index].start_requested = true;
+            self.tasks[index].pending_start = None;
+            if self.tasks[index].pid.is_none() {
+                self.tasks[index].restart_requested = false;
+            }
         }
+        for &index in indexes.iter().rev() {
+            if index >= self.tasks.len() {
+                continue;
+            }
+            if let Some(pid) = self.tasks[index].pid {
+                self.tasks[index].restart_requested = true;
+                self.tasks[index].kill_deadline = Some(now + RESTART_GRACE);
+                self.tasks[index].status = TaskStatus::Restarting;
+                self.tasks[index].message("\r\n\x1b[33m[demons] restarting...\x1b[0m\r\n");
+                if signal_process_group(pid, libc::SIGTERM).is_err() {
+                    self.tasks[index].kill_deadline = Some(now);
+                }
+            }
+        }
+        self.tick_dependency_starts(now);
+    }
+
+    fn restart_closure(&self, index: usize) -> Vec<usize> {
+        let mut seen = vec![false; self.tasks.len()];
+        let mut ordered = Vec::new();
+        self.collect_dependents(index, &mut seen, &mut ordered);
+        ordered
+    }
+
+    fn collect_dependents(&self, index: usize, seen: &mut [bool], ordered: &mut Vec<usize>) {
+        if index >= seen.len() || seen[index] {
+            return;
+        }
+        seen[index] = true;
+        ordered.push(index);
+        for &dependent in self.dependent_indexes.get(index).into_iter().flatten() {
+            self.collect_dependents(dependent, seen, ordered);
+        }
+    }
+
+    fn dependencies_ready(&self, index: usize) -> bool {
+        self.dependency_indexes
+            .get(index)
+            .into_iter()
+            .flatten()
+            .all(|&dependency| {
+                self.tasks.get(dependency).is_some_and(|task| {
+                    task.pid.is_some()
+                        && !task.restart_requested
+                        && matches!(task.status, TaskStatus::Starting | TaskStatus::Running)
+                })
+            })
+    }
+
+    fn tick_dependency_starts(&mut self, now: Instant) -> bool {
+        let mut changed = false;
+        for index in 0..self.tasks.len() {
+            if !self.tasks[index].start_requested
+                || self.tasks[index].pid.is_some()
+                || self.tasks[index].restart_requested
+            {
+                continue;
+            }
+            if !self.dependencies_ready(index) {
+                if self.tasks[index].status != TaskStatus::Waiting {
+                    self.tasks[index].status = TaskStatus::Waiting;
+                    changed = true;
+                }
+                self.tasks[index].pending_start = None;
+                continue;
+            }
+            let deadline = match self.tasks[index].pending_start {
+                Some(deadline) => deadline,
+                None => {
+                    let deadline = now + self.tasks[index].start_delay;
+                    self.tasks[index].pending_start = Some(deadline);
+                    if self.tasks[index].start_delay > Duration::ZERO {
+                        self.tasks[index].status = TaskStatus::Waiting;
+                        changed = true;
+                    }
+                    deadline
+                }
+            };
+            if deadline <= now {
+                self.spawn(index);
+                changed = true;
+            }
+        }
+        changed
     }
 
     fn drain_process_events(&mut self) -> bool {
@@ -1466,8 +2331,10 @@ impl App {
 
                 if self.tasks[task].restart_requested && !self.stopping {
                     self.tasks[task].restart_requested = false;
-                    self.spawn(task);
+                    self.tasks[task].start_requested = true;
+                    self.tasks[task].pending_start = None;
                 }
+                self.tick_dependency_starts(Instant::now());
             }
             _ => {}
         }
@@ -1485,6 +2352,9 @@ impl App {
             changed = true;
         }
         if self.autoscroll_selection(now, false) {
+            changed = true;
+        }
+        if self.tick_dependency_starts(now) {
             changed = true;
         }
         if self
@@ -1509,7 +2379,11 @@ impl App {
 
     fn apply_escape(&mut self) -> Result<()> {
         match self.mode {
-            AppMode::Input => self.tasks[self.focus].write_input(b"\x1b")?,
+            AppMode::Input => {
+                if let Some(task) = self.tasks.get_mut(self.focus) {
+                    task.write_input(b"\x1b")?;
+                }
+            }
             AppMode::Command => self.mode = AppMode::Input,
             AppMode::Search => self.cancel_search(),
         }
@@ -1572,6 +2446,9 @@ struct TaskRuntime {
     status: TaskStatus,
     generation: u64,
     restart_requested: bool,
+    start_requested: bool,
+    pending_start: Option<Instant>,
+    start_delay: Duration,
     kill_deadline: Option<Instant>,
     pty_size: PtySize,
     scroll_offset: usize,
@@ -1586,6 +2463,11 @@ impl TaskRuntime {
             pixel_width: 0,
             pixel_height: 0,
         };
+        let start_delay = task
+            .start_delay
+            .as_deref()
+            .and_then(|delay| parse_start_delay(delay).ok())
+            .unwrap_or_default();
         Self {
             task,
             cwd,
@@ -1596,6 +2478,9 @@ impl TaskRuntime {
             status: TaskStatus::NotStarted,
             generation: 0,
             restart_requested: false,
+            start_requested: false,
+            pending_start: None,
+            start_delay,
             kill_deadline: None,
             pty_size,
             scroll_offset: 0,
@@ -1841,6 +2726,7 @@ impl TaskRuntime {
     fn status_label(&self) -> (String, Color) {
         match &self.status {
             TaskStatus::NotStarted => ("⏸".to_owned(), THEME_HOLLY),
+            TaskStatus::Waiting => ("⏱".to_owned(), THEME_GOLD),
             TaskStatus::Starting => ("…".to_owned(), THEME_GOLD),
             TaskStatus::Running => ("●".to_owned(), THEME_GREEN),
             TaskStatus::Restarting => ("↻".to_owned(), THEME_GOLD),
@@ -2224,9 +3110,10 @@ enum ProcessEvent {
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum TaskStatus {
     NotStarted,
+    Waiting,
     Starting,
     Running,
     Restarting,
@@ -2253,6 +3140,118 @@ struct SearchState {
     cursor: usize,
     current: Option<u64>,
     message: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct MenuState {
+    tab: MenuTab,
+    cursor: usize,
+    task_detail: Option<usize>,
+    dependency_task: Option<usize>,
+    dependency_cursor: usize,
+    edit: Option<MenuEdit>,
+    draft: crate::config::Config,
+    original: crate::config::Config,
+    hits: Vec<MenuHit>,
+}
+
+impl MenuState {
+    fn new(config: crate::config::Config, tab: MenuTab) -> Self {
+        Self {
+            tab,
+            cursor: 0,
+            task_detail: None,
+            dependency_task: None,
+            dependency_cursor: 0,
+            edit: None,
+            draft: config.clone(),
+            original: config,
+            hits: Vec::new(),
+        }
+    }
+
+    fn dirty(&self) -> bool {
+        self.draft != self.original
+    }
+}
+
+#[derive(Clone, Debug)]
+struct MenuEdit {
+    task: usize,
+    field: TaskField,
+    value: String,
+    cursor: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MenuTab {
+    Help,
+    Tasks,
+    Settings,
+    Exit,
+}
+
+impl MenuTab {
+    const ALL: [Self; 4] = [Self::Help, Self::Tasks, Self::Settings, Self::Exit];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Help => "Help",
+            Self::Tasks => "Tasks",
+            Self::Settings => "Settings",
+            Self::Exit => "Exit",
+        }
+    }
+
+    fn index(self) -> usize {
+        Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TaskField {
+    Name,
+    Command,
+    Cwd,
+    Env,
+    Dependencies,
+    StartDelay,
+    Delete,
+    Back,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MenuExitAction {
+    SaveAffected,
+    SaveAll,
+    SaveOnly,
+    Discard,
+    Close,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestartMode {
+    None,
+    Affected,
+    All,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MenuAction {
+    Tab(MenuTab),
+    Close,
+    OpenTask(usize),
+    AddTask,
+    TaskField(TaskField),
+    ToggleDependency(usize),
+    CycleLeader,
+    Exit(MenuExitAction),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MenuHit {
+    rect: Rect,
+    action: MenuAction,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2420,6 +3419,610 @@ fn registry_remove(registry: &ProcessRegistry, pid: u32) {
     if let Ok(mut pids) = registry.lock() {
         pids.remove(&pid);
     }
+}
+
+fn dependency_graph(tasks: &[Task]) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
+    let names = tasks
+        .iter()
+        .enumerate()
+        .map(|(index, task)| (task.name.as_str(), index))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut dependencies = vec![Vec::new(); tasks.len()];
+    let mut dependents = vec![Vec::new(); tasks.len()];
+    for (index, task) in tasks.iter().enumerate() {
+        for dependency in &task.depends_on {
+            let Some(&dependency_index) = names.get(dependency.as_str()) else {
+                continue;
+            };
+            dependencies[index].push(dependency_index);
+            dependents[dependency_index].push(index);
+        }
+    }
+    (dependencies, dependents)
+}
+
+fn render_menu(
+    area: Rect,
+    buffer: &mut Buffer,
+    menu: &mut MenuState,
+    leader: &str,
+    configure_only: bool,
+    tasks_started: bool,
+) {
+    let popup = centered_rect(area, 92, 26);
+    if popup.width == 0 || popup.height == 0 {
+        return;
+    }
+    menu.hits.clear();
+    Clear.render(popup, buffer);
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(THEME_RED))
+        .style(Style::default().fg(THEME_SNOW).bg(THEME_BLACK))
+        .title(Line::styled(
+            " Demons Menu ",
+            Style::default()
+                .fg(THEME_GREEN)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .render(popup, buffer);
+
+    if popup.width >= 8 {
+        let close = Rect::new(popup.right().saturating_sub(5), popup.y, 3, 1);
+        render_text(
+            buffer,
+            close,
+            " x ",
+            Style::default().fg(THEME_BLACK).bg(THEME_SNOW),
+        );
+        menu.hits.push(MenuHit {
+            rect: close,
+            action: MenuAction::Close,
+        });
+    }
+
+    let inner = inset_rect(popup, 2, 1);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let mut tab_x = inner.x;
+    for (index, tab) in MenuTab::ALL.iter().enumerate() {
+        let label = format!(" {} ", tab.label());
+        let width = char_count(&label).min(usize::from(u16::MAX)) as u16;
+        if tab_x.saturating_add(width) > inner.right() {
+            break;
+        }
+        let selected = *tab == menu.tab;
+        let style = if selected {
+            Style::default().fg(THEME_BLACK).bg(THEME_GREEN)
+        } else if index % 2 == 0 {
+            Style::default().fg(THEME_BLACK).bg(THEME_SNOW)
+        } else {
+            Style::default().fg(THEME_BLACK).bg(THEME_RED)
+        };
+        let rect = Rect::new(tab_x, inner.y, width, 1);
+        render_text(buffer, rect, &label, style);
+        menu.hits.push(MenuHit {
+            rect,
+            action: MenuAction::Tab(*tab),
+        });
+        tab_x = tab_x.saturating_add(width);
+    }
+    if menu.dirty() && inner.width > 10 {
+        let text = " unsaved ";
+        let width = char_count(text) as u16;
+        let rect = Rect::new(inner.right().saturating_sub(width), inner.y, width, 1);
+        render_text(
+            buffer,
+            rect,
+            text,
+            Style::default().fg(THEME_BLACK).bg(THEME_GOLD),
+        );
+    }
+
+    let body = Rect::new(
+        inner.x,
+        inner.y.saturating_add(2),
+        inner.width,
+        inner.height.saturating_sub(2),
+    );
+    clear_rect(
+        buffer,
+        body,
+        Style::default().fg(THEME_SNOW).bg(THEME_BLACK),
+    );
+
+    if let Some(edit) = menu.edit.as_ref() {
+        render_menu_edit(body, buffer, edit);
+        return;
+    }
+    if let Some(task) = menu.dependency_task {
+        render_menu_dependencies(body, buffer, menu, task);
+        return;
+    }
+
+    match menu.tab {
+        MenuTab::Help => render_menu_help(body, buffer, leader),
+        MenuTab::Tasks => render_menu_tasks(body, buffer, menu),
+        MenuTab::Settings => render_menu_settings(body, buffer, menu),
+        MenuTab::Exit => render_menu_exit(body, buffer, menu, configure_only, tasks_started),
+    }
+}
+
+fn render_menu_help(area: Rect, buffer: &mut Buffer, leader: &str) {
+    let lines = [
+        "Command mode",
+        "arrows / h j k l       Move focus",
+        "Tab / Shift-Tab        Cycle panes",
+        "f                      Toggle fullscreen pane",
+        "PageUp/PageDown        Scroll focused pane",
+        "Home/End               Jump to top/bottom of history",
+        "drag / right-click     Select and copy pane text",
+        "y / Y                  Copy visible text / full scrollback",
+        "S                      Save full scrollback to a temp log",
+        "/                      Search focused pane",
+        "Enter / Shift-Enter    Search older / newer while searching",
+        "r                      Restart focused task and dependents",
+        "R                      Restart every task",
+        "c                      Clear focused pane",
+        "?                      Open this menu",
+        "q or Ctrl-C            Close Demons with confirmation",
+    ];
+    for (row, line) in lines.iter().enumerate() {
+        if row >= usize::from(area.height) {
+            break;
+        }
+        let style = if row == 0 {
+            Style::default()
+                .fg(THEME_GREEN)
+                .bg(THEME_BLACK)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(THEME_SNOW).bg(THEME_BLACK)
+        };
+        render_text(
+            buffer,
+            Rect::new(area.x, area.y + row as u16, area.width, 1),
+            line,
+            style,
+        );
+    }
+    if area.height > 17 {
+        render_text(
+            buffer,
+            Rect::new(area.x, area.y + 17, area.width, 1),
+            &format!("{leader} or Esc          Return to input mode outside the menu"),
+            Style::default().fg(THEME_SNOW).bg(THEME_BLACK),
+        );
+    }
+}
+
+fn render_menu_tasks(area: Rect, buffer: &mut Buffer, menu: &mut MenuState) {
+    if let Some(task_index) = menu.task_detail {
+        render_menu_task_detail(area, buffer, menu, task_index);
+        return;
+    }
+    render_text(
+        buffer,
+        Rect::new(area.x, area.y, area.width, 1),
+        "Tasks",
+        Style::default()
+            .fg(THEME_GREEN)
+            .bg(THEME_BLACK)
+            .add_modifier(Modifier::BOLD),
+    );
+    let rows = area.height.saturating_sub(1);
+    for row in 0..rows {
+        let index = usize::from(row);
+        let y = area.y + row + 1;
+        let (text, action) = if index < menu.draft.tasks.len() {
+            let task = &menu.draft.tasks[index];
+            (
+                format!("{}  {}", task.name, task.command.display()),
+                MenuAction::OpenTask(index),
+            )
+        } else if index == menu.draft.tasks.len() {
+            ("+ Add task".to_owned(), MenuAction::AddTask)
+        } else {
+            break;
+        };
+        render_menu_row(
+            buffer,
+            Rect::new(area.x, y, area.width, 1),
+            &text,
+            index == menu.cursor,
+            Some(action),
+            &mut menu.hits,
+        );
+    }
+}
+
+fn render_menu_task_detail(
+    area: Rect,
+    buffer: &mut Buffer,
+    menu: &mut MenuState,
+    task_index: usize,
+) {
+    let Some(task) = menu.draft.tasks.get(task_index) else {
+        return;
+    };
+    render_text(
+        buffer,
+        Rect::new(area.x, area.y, area.width, 1),
+        &format!("Task: {}", task.name),
+        Style::default()
+            .fg(THEME_GREEN)
+            .bg(THEME_BLACK)
+            .add_modifier(Modifier::BOLD),
+    );
+    let fields = task_detail_fields();
+    for (row, field) in fields.iter().enumerate() {
+        if row + 1 >= usize::from(area.height) {
+            break;
+        }
+        let text = task_field_text(task, *field);
+        render_menu_row(
+            buffer,
+            Rect::new(area.x, area.y + row as u16 + 1, area.width, 1),
+            &text,
+            row == menu.cursor,
+            Some(MenuAction::TaskField(*field)),
+            &mut menu.hits,
+        );
+    }
+}
+
+fn render_menu_dependencies(area: Rect, buffer: &mut Buffer, menu: &mut MenuState, task: usize) {
+    let Some(task_name) = menu.draft.tasks.get(task).map(|task| task.name.clone()) else {
+        return;
+    };
+    render_text(
+        buffer,
+        Rect::new(area.x, area.y, area.width, 1),
+        &format!("Dependencies for {task_name}"),
+        Style::default()
+            .fg(THEME_GREEN)
+            .bg(THEME_BLACK)
+            .add_modifier(Modifier::BOLD),
+    );
+    let candidates = dependency_candidates(menu, task);
+    if candidates.is_empty() {
+        render_text(
+            buffer,
+            Rect::new(area.x, area.y.saturating_add(2), area.width, 1),
+            "No other tasks are configured.",
+            Style::default().fg(THEME_SNOW).bg(THEME_BLACK),
+        );
+        return;
+    }
+    for (row, candidate) in candidates.iter().enumerate() {
+        if row + 1 >= usize::from(area.height) {
+            break;
+        }
+        let candidate_task = &menu.draft.tasks[*candidate];
+        let checked = menu.draft.tasks[task]
+            .depends_on
+            .iter()
+            .any(|dependency| dependency == &candidate_task.name);
+        let text = format!(
+            "[{}] {}",
+            if checked { "x" } else { " " },
+            candidate_task.name
+        );
+        render_menu_row(
+            buffer,
+            Rect::new(area.x, area.y + row as u16 + 1, area.width, 1),
+            &text,
+            row == menu.dependency_cursor,
+            Some(MenuAction::ToggleDependency(*candidate)),
+            &mut menu.hits,
+        );
+    }
+}
+
+fn render_menu_settings(area: Rect, buffer: &mut Buffer, menu: &mut MenuState) {
+    render_text(
+        buffer,
+        Rect::new(area.x, area.y, area.width, 1),
+        "Settings",
+        Style::default()
+            .fg(THEME_GREEN)
+            .bg(THEME_BLACK)
+            .add_modifier(Modifier::BOLD),
+    );
+    render_menu_row(
+        buffer,
+        Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
+        &format!("Leader key: {}", menu.draft.settings.leader.label()),
+        menu.cursor == 0,
+        Some(MenuAction::CycleLeader),
+        &mut menu.hits,
+    );
+}
+
+fn render_menu_exit(
+    area: Rect,
+    buffer: &mut Buffer,
+    menu: &mut MenuState,
+    configure_only: bool,
+    tasks_started: bool,
+) {
+    render_text(
+        buffer,
+        Rect::new(area.x, area.y, area.width, 1),
+        if menu.dirty() {
+            "Exit - unsaved changes"
+        } else {
+            "Exit"
+        },
+        Style::default()
+            .fg(THEME_GREEN)
+            .bg(THEME_BLACK)
+            .add_modifier(Modifier::BOLD),
+    );
+    let actions = exit_actions(configure_only || !tasks_started);
+    for (row, action) in actions.iter().enumerate() {
+        if row + 1 >= usize::from(area.height) {
+            break;
+        }
+        render_menu_row(
+            buffer,
+            Rect::new(area.x, area.y + row as u16 + 1, area.width, 1),
+            exit_action_label(*action, configure_only || !tasks_started),
+            row == menu.cursor,
+            Some(MenuAction::Exit(*action)),
+            &mut menu.hits,
+        );
+    }
+}
+
+fn render_menu_edit(area: Rect, buffer: &mut Buffer, edit: &MenuEdit) {
+    render_text(
+        buffer,
+        Rect::new(area.x, area.y, area.width, 1),
+        &format!("Editing {}", task_field_name(edit.field)),
+        Style::default()
+            .fg(THEME_GREEN)
+            .bg(THEME_BLACK)
+            .add_modifier(Modifier::BOLD),
+    );
+    let mut value = edit.value.clone();
+    let cursor = byte_index_for_char(&value, edit.cursor);
+    value.insert(cursor, '|');
+    render_text(
+        buffer,
+        Rect::new(area.x, area.y.saturating_add(2), area.width, 1),
+        &value,
+        Style::default().fg(THEME_BLACK).bg(THEME_SNOW),
+    );
+    render_text(
+        buffer,
+        Rect::new(area.x, area.y.saturating_add(4), area.width, 1),
+        "Enter saves this field. Esc cancels.",
+        Style::default().fg(THEME_SNOW).bg(THEME_BLACK),
+    );
+}
+
+fn render_menu_row(
+    buffer: &mut Buffer,
+    rect: Rect,
+    text: &str,
+    selected: bool,
+    action: Option<MenuAction>,
+    hits: &mut Vec<MenuHit>,
+) {
+    let style = if selected {
+        Style::default().fg(THEME_BLACK).bg(THEME_SNOW)
+    } else {
+        Style::default().fg(THEME_SNOW).bg(THEME_BLACK)
+    };
+    render_text(buffer, rect, text, style);
+    if let Some(action) = action {
+        hits.push(MenuHit { rect, action });
+    }
+}
+
+fn render_text(buffer: &mut Buffer, rect: Rect, text: &str, style: Style) {
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+    for column in 0..rect.width {
+        buffer[(rect.x + column, rect.y)]
+            .set_symbol(" ")
+            .set_style(style);
+    }
+    for (column, character) in text.chars().take(usize::from(rect.width)).enumerate() {
+        let mut encoded = [0_u8; 4];
+        buffer[(rect.x + column as u16, rect.y)]
+            .set_symbol(character.encode_utf8(&mut encoded))
+            .set_style(style);
+    }
+}
+
+fn clear_rect(buffer: &mut Buffer, rect: Rect, style: Style) {
+    for row in 0..rect.height {
+        for column in 0..rect.width {
+            buffer[(rect.x + column, rect.y + row)]
+                .set_symbol(" ")
+                .set_style(style);
+        }
+    }
+}
+
+fn inset_rect(rect: Rect, horizontal: u16, vertical: u16) -> Rect {
+    Rect::new(
+        rect.x.saturating_add(horizontal),
+        rect.y.saturating_add(vertical),
+        rect.width.saturating_sub(horizontal.saturating_mul(2)),
+        rect.height.saturating_sub(vertical.saturating_mul(2)),
+    )
+}
+
+fn menu_item_count(menu: &MenuState, configure_only: bool) -> usize {
+    match menu.tab {
+        MenuTab::Help => 0,
+        MenuTab::Tasks if menu.task_detail.is_some() => task_detail_fields().len(),
+        MenuTab::Tasks => menu.draft.tasks.len() + 1,
+        MenuTab::Settings => 1,
+        MenuTab::Exit => exit_actions(configure_only).len(),
+    }
+}
+
+fn task_detail_fields() -> &'static [TaskField] {
+    &[
+        TaskField::Name,
+        TaskField::Command,
+        TaskField::Cwd,
+        TaskField::Env,
+        TaskField::Dependencies,
+        TaskField::StartDelay,
+        TaskField::Delete,
+        TaskField::Back,
+    ]
+}
+
+fn task_field_text(task: &Task, field: TaskField) -> String {
+    match field {
+        TaskField::Name => format!("Name: {}", task.name),
+        TaskField::Command => format!("Command: {}", task.command.display()),
+        TaskField::Cwd => format!("Working directory: {}", task.cwd.display()),
+        TaskField::Env => {
+            let value = format_env_inline(&task.env);
+            format!(
+                "Environment: {}",
+                if value.is_empty() { "(none)" } else { &value }
+            )
+        }
+        TaskField::Dependencies => {
+            let value = task.depends_on.join(", ");
+            format!(
+                "Dependencies: {}",
+                if value.is_empty() { "(none)" } else { &value }
+            )
+        }
+        TaskField::StartDelay => format!(
+            "Start delay: {}",
+            task.start_delay.as_deref().unwrap_or("(none)")
+        ),
+        TaskField::Delete => "Delete task".to_owned(),
+        TaskField::Back => "Back to task list".to_owned(),
+    }
+}
+
+fn task_field_name(field: TaskField) -> &'static str {
+    match field {
+        TaskField::Name => "name",
+        TaskField::Command => "command",
+        TaskField::Cwd => "working directory",
+        TaskField::Env => "environment",
+        TaskField::Dependencies => "dependencies",
+        TaskField::StartDelay => "start delay",
+        TaskField::Delete => "delete",
+        TaskField::Back => "back",
+    }
+}
+
+fn dependency_candidates(menu: &MenuState, task: usize) -> Vec<usize> {
+    (0..menu.draft.tasks.len())
+        .filter(|candidate| *candidate != task)
+        .collect()
+}
+
+fn exit_actions(configure_only: bool) -> &'static [MenuExitAction] {
+    if configure_only {
+        &[
+            MenuExitAction::SaveOnly,
+            MenuExitAction::Discard,
+            MenuExitAction::Close,
+        ]
+    } else {
+        &[
+            MenuExitAction::SaveAffected,
+            MenuExitAction::SaveAll,
+            MenuExitAction::SaveOnly,
+            MenuExitAction::Discard,
+            MenuExitAction::Close,
+        ]
+    }
+}
+
+fn exit_action_label(action: MenuExitAction, configure_only: bool) -> &'static str {
+    match (action, configure_only) {
+        (MenuExitAction::SaveOnly, true) => "Save config and close",
+        (MenuExitAction::SaveOnly, false) => "Save without restarting",
+        (MenuExitAction::SaveAffected, _) => "Save and restart affected",
+        (MenuExitAction::SaveAll, _) => "Save and restart all",
+        (MenuExitAction::Discard, true) => "Discard and close",
+        (MenuExitAction::Discard, false) => "Discard changes",
+        (MenuExitAction::Close, _) => "Close menu",
+    }
+}
+
+fn all_leaders() -> &'static [Leader] {
+    &[
+        Leader::AltJ,
+        Leader::AltBacktick,
+        Leader::Tab,
+        Leader::CtrlB,
+        Leader::CtrlQ,
+        Leader::CtrlBackslash,
+    ]
+}
+
+fn unique_task_name(config: &crate::config::Config, base: &str) -> String {
+    if !config.tasks.iter().any(|task| task.name == base) {
+        return base.to_owned();
+    }
+    for number in 2..1000 {
+        let candidate = format!("{base}{number}");
+        if !config.tasks.iter().any(|task| task.name == candidate) {
+            return candidate;
+        }
+    }
+    format!("{base}{}", config.tasks.len() + 1)
+}
+
+fn scrub_missing_dependencies(config: &mut crate::config::Config) {
+    let names = config
+        .tasks
+        .iter()
+        .map(|task| task.name.clone())
+        .collect::<HashSet<_>>();
+    for task in &mut config.tasks {
+        task.depends_on
+            .retain(|dependency| names.contains(dependency) && dependency != &task.name);
+    }
+}
+
+fn format_env_inline(env: &BTreeMap<String, String>) -> String {
+    env.iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn parse_env_inline(text: &str) -> Result<BTreeMap<String, String>> {
+    let mut env = BTreeMap::new();
+    for entry in text
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let Some((key, value)) = entry.split_once('=') else {
+            anyhow::bail!("environment entries must be KEY=value");
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty()
+            || key.contains(['=', '\0'])
+            || key.contains(char::is_whitespace)
+            || value.contains('\0')
+        {
+            anyhow::bail!("invalid environment entry for key {key:?}");
+        }
+        env.insert(key.to_owned(), value.to_owned());
+    }
+    Ok(env)
 }
 
 fn render_history(task: &TaskRuntime, area: Rect, buffer: &mut Buffer) {
@@ -2866,7 +4469,7 @@ fn command_footer_items() -> Vec<FooterItem> {
         ("R restart all", FooterAction::RestartAll),
         ("c clear", FooterAction::ClearFocused),
         ("q quit", FooterAction::Quit),
-        ("? help", FooterAction::ShowHelp),
+        ("? menu", FooterAction::ShowHelp),
     ]
     .into_iter()
     .enumerate()
@@ -3275,7 +4878,7 @@ fn mouse_button_code(button: MouseButton) -> u32 {
 mod tests {
     use std::{collections::BTreeMap, path::PathBuf};
 
-    use crate::config::{Config, Settings};
+    use crate::config::{CONFIG_FILE, Config, Settings};
     use tempfile::tempdir;
 
     use super::*;
@@ -3436,23 +5039,23 @@ mod tests {
     }
 
     #[test]
-    fn command_mode_question_mark_opens_and_closes_help() {
+    fn command_mode_question_mark_opens_menu_help_tab() {
         let mut app = test_app();
         app.update_layout(Rect::new(0, 0, 100, 20));
         app.mode = AppMode::Command;
 
         app.handle_key(key(KeyCode::Char('?'), KeyModifiers::NONE))
             .unwrap();
-        assert!(app.show_help);
+        assert_eq!(app.menu.as_ref().unwrap().tab, MenuTab::Help);
 
         app.handle_key(key(KeyCode::Char('r'), KeyModifiers::NONE))
             .unwrap();
-        assert!(app.show_help);
+        assert!(app.menu.is_some());
         assert!(!app.tasks[0].restart_requested);
 
         app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
             .unwrap();
-        assert!(!app.show_help);
+        assert!(app.menu.is_none());
         assert_eq!(app.mode, AppMode::Command);
     }
 
@@ -4244,12 +5847,119 @@ mod tests {
         assert_eq!(task.scroll_offset, 0);
     }
 
+    #[test]
+    fn dependency_graph_links_tasks_by_name() {
+        let mut server = test_task("server");
+        let mut web = test_task("web");
+        web.depends_on = vec!["server".to_owned()];
+        web.start_delay = Some("3s".to_owned());
+        let app = test_app_with_tasks(vec![server.clone(), web.clone()]);
+
+        assert_eq!(app.dependency_indexes[1], vec![0]);
+        assert_eq!(app.dependent_indexes[0], vec![1]);
+        assert_eq!(app.restart_closure(0), vec![0, 1]);
+        assert_eq!(app.restart_closure(1), vec![1]);
+
+        server.depends_on = vec!["web".to_owned()];
+        let (dependencies, dependents) = dependency_graph(&[server, web]);
+        assert_eq!(dependencies[0], vec![1]);
+        assert_eq!(dependents[1], vec![0]);
+    }
+
+    #[test]
+    fn dependent_start_waits_for_dependencies_and_delay() {
+        let server = test_task("server");
+        let mut web = test_task("web");
+        web.depends_on = vec!["server".to_owned()];
+        web.start_delay = Some("3s".to_owned());
+        let mut app = test_app_with_tasks(vec![server, web]);
+        let now = Instant::now();
+
+        app.tasks[1].start_requested = true;
+        assert!(app.tick_dependency_starts(now));
+        assert_eq!(app.tasks[1].status, TaskStatus::Waiting);
+        assert!(app.tasks[1].pending_start.is_none());
+
+        app.tasks[0].pid = Some(1234);
+        app.tasks[0].status = TaskStatus::Running;
+        assert!(app.tick_dependency_starts(now));
+        assert_eq!(app.tasks[1].status, TaskStatus::Waiting);
+        assert_eq!(
+            app.tasks[1].pending_start,
+            Some(now + Duration::from_secs(3))
+        );
+        assert!(app.tasks[1].pid.is_none());
+    }
+
+    #[test]
+    fn menu_add_task_and_save_writes_config_in_configure_mode() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join(CONFIG_FILE);
+        let loaded = LoadedConfig {
+            path: path.clone(),
+            root: temp.path().to_path_buf(),
+            config: Config::default(),
+        };
+        let (tx, rx) = mpsc::sync_channel(8);
+        let mut app = App::new(loaded, tx, rx, Arc::new(Mutex::new(HashSet::new())), true);
+
+        app.open_menu(MenuTab::Tasks);
+        app.apply_menu_action(MenuAction::AddTask).unwrap();
+        assert_eq!(
+            app.handle_menu_exit_action(MenuExitAction::SaveOnly)
+                .unwrap(),
+            Action::Quit
+        );
+
+        let saved = std::fs::read_to_string(path).unwrap();
+        assert!(saved.contains("[[task]]"));
+        assert!(saved.contains("command = \"echo ready\""));
+    }
+
+    #[test]
+    fn menu_discard_reverts_live_leader_change() {
+        let mut app = test_app();
+        app.open_menu(MenuTab::Settings);
+
+        app.apply_menu_action(MenuAction::CycleLeader).unwrap();
+        assert_eq!(app.loaded.config.settings.leader, Leader::AltBacktick);
+
+        app.handle_menu_exit_action(MenuExitAction::Discard)
+            .unwrap();
+        assert_eq!(app.loaded.config.settings.leader, Leader::AltJ);
+        assert!(app.menu.is_none());
+    }
+
+    #[test]
+    fn menu_save_affected_updates_task_and_requests_restart() {
+        let temp = tempdir().unwrap();
+        let mut app = test_app();
+        app.loaded.path = temp.path().join(CONFIG_FILE);
+        app.loaded.root = temp.path().to_path_buf();
+        app.tasks_started = true;
+        app.tasks[0].pid = Some(4242);
+        app.tasks[0].status = TaskStatus::Running;
+        app.open_menu(MenuTab::Tasks);
+        {
+            let menu = app.menu.as_mut().unwrap();
+            menu.draft.tasks[0].command = TaskCommand::Shell("echo changed".to_owned());
+        }
+
+        app.handle_menu_exit_action(MenuExitAction::SaveAffected)
+            .unwrap();
+
+        assert_eq!(app.tasks[0].task.command.display(), "echo changed");
+        assert!(app.tasks[0].restart_requested);
+    }
+
     fn test_task(name: &str) -> Task {
         Task {
             name: name.to_owned(),
             command: TaskCommand::Shell("echo ready".to_owned()),
             cwd: PathBuf::from("."),
             env: BTreeMap::new(),
+            depends_on: Vec::new(),
+            start_delay: None,
             watch: None,
             run_on_change: None,
             repeat: None,
@@ -4257,15 +5967,19 @@ mod tests {
     }
 
     fn test_app() -> App {
+        test_app_with_tasks(vec![test_task("one"), test_task("two")])
+    }
+
+    fn test_app_with_tasks(tasks: Vec<Task>) -> App {
         let loaded = LoadedConfig {
             path: PathBuf::from("/tmp/demons.toml"),
             root: PathBuf::from("."),
             config: Config {
                 settings: Settings::default(),
-                tasks: vec![test_task("one"), test_task("two")],
+                tasks,
             },
         };
         let (tx, rx) = mpsc::sync_channel(8);
-        App::new(loaded, tx, rx, Arc::new(Mutex::new(HashSet::new())))
+        App::new(loaded, tx, rx, Arc::new(Mutex::new(HashSet::new())), false)
     }
 }
