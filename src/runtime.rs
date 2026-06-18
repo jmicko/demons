@@ -48,6 +48,13 @@ const MODE_BUTTON_WIDTH: u16 = 13;
 const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(45);
 const NOTICE_DURATION: Duration = Duration::from_secs(3);
 const MAX_FULL_HISTORY_OSC52_BYTES: usize = 512 * 1024;
+const THEME_RED: Color = Color::Red;
+const THEME_GREEN: Color = Color::Green;
+const THEME_SNOW: Color = Color::Gray;
+const THEME_GOLD: Color = Color::Yellow;
+const THEME_HOLLY: Color = Color::DarkGray;
+const THEME_BLACK: Color = Color::Black;
+const THEME_WHITE: Color = Color::White;
 
 type ProcessRegistry = Arc<Mutex<HashSet<u32>>>;
 
@@ -285,10 +292,10 @@ impl App {
             }
             let focused = index == self.focus;
             let border_color = match (focused, self.mode) {
-                (true, AppMode::Input) => Color::Cyan,
-                (true, AppMode::Command) => Color::Yellow,
-                (true, AppMode::Search) => Color::Magenta,
-                _ => Color::DarkGray,
+                (true, AppMode::Input) => THEME_GREEN,
+                (true, AppMode::Command) => THEME_RED,
+                (true, AppMode::Search) => THEME_GOLD,
+                _ => THEME_HOLLY,
             };
             let (status, status_color) = self.tasks[index].status_label();
             let title = Line::from(vec![
@@ -303,7 +310,7 @@ impl App {
             ]);
             let restart = Line::from(Span::styled(
                 " [↻] ",
-                Style::default().fg(if focused { Color::Yellow } else { Color::Gray }),
+                Style::default().fg(if focused { THEME_GOLD } else { THEME_SNOW }),
             ))
             .right_aligned();
             let block = Block::default()
@@ -341,7 +348,7 @@ impl App {
                 .is_some_and(|(x, y)| contains(button_area, x, y));
             Paragraph::new(mode_label)
                 .alignment(ratatui::layout::Alignment::Center)
-                .style(Style::default().fg(Color::Black).bg(if mode_hovered {
+                .style(Style::default().fg(THEME_BLACK).bg(if mode_hovered {
                     mode_hover_color(mode_color)
                 } else {
                     mode_color
@@ -1356,7 +1363,7 @@ impl App {
             .as_ref()
             .filter(|_| self.mode == AppMode::Search)
         {
-            return ("SEARCH", Color::Magenta, search_footer_items(search));
+            return ("SEARCH", THEME_GOLD, search_footer_items(search));
         }
 
         if let Some(notice) = self.active_notice(now) {
@@ -1367,23 +1374,23 @@ impl App {
         match self.mode {
             AppMode::Input => (
                 "INPUT MODE",
-                Color::Cyan,
+                THEME_GREEN,
                 vec![
                     footer_status(self.tasks[self.focus].task.name.clone()),
                     footer_status("drag select"),
                     footer_status("right-click copy"),
                 ],
             ),
-            AppMode::Command => ("COMMAND MODE", Color::Yellow, command_footer_items()),
-            AppMode::Search => ("SEARCH", Color::Magenta, search_placeholder_footer_items()),
+            AppMode::Command => ("COMMAND MODE", THEME_RED, command_footer_items()),
+            AppMode::Search => ("SEARCH", THEME_GOLD, search_placeholder_footer_items()),
         }
     }
 
     fn mode_label_color(&self) -> (&'static str, Color) {
         match self.mode {
-            AppMode::Input => ("INPUT MODE", Color::Cyan),
-            AppMode::Command => ("COMMAND MODE", Color::Yellow),
-            AppMode::Search => ("SEARCH", Color::Magenta),
+            AppMode::Input => ("INPUT MODE", THEME_GREEN),
+            AppMode::Command => ("COMMAND MODE", THEME_RED),
+            AppMode::Search => ("SEARCH", THEME_GOLD),
         }
     }
 
@@ -1833,23 +1840,23 @@ impl TaskRuntime {
 
     fn status_label(&self) -> (String, Color) {
         match &self.status {
-            TaskStatus::NotStarted => ("⏸".to_owned(), Color::DarkGray),
-            TaskStatus::Starting => ("…".to_owned(), Color::Yellow),
-            TaskStatus::Running => ("●".to_owned(), Color::Green),
-            TaskStatus::Restarting => ("↻".to_owned(), Color::Yellow),
-            TaskStatus::Stopping => ("■".to_owned(), Color::Yellow),
-            TaskStatus::Failed => ("✗".to_owned(), Color::Red),
+            TaskStatus::NotStarted => ("⏸".to_owned(), THEME_HOLLY),
+            TaskStatus::Starting => ("…".to_owned(), THEME_GOLD),
+            TaskStatus::Running => ("●".to_owned(), THEME_GREEN),
+            TaskStatus::Restarting => ("↻".to_owned(), THEME_GOLD),
+            TaskStatus::Stopping => ("■".to_owned(), THEME_GOLD),
+            TaskStatus::Failed => ("✗".to_owned(), THEME_RED),
             TaskStatus::Exited {
                 code,
                 success,
                 signal,
             } => {
                 if *success {
-                    ("✓".to_owned(), Color::Green)
+                    ("✓".to_owned(), THEME_GREEN)
                 } else if let Some(signal) = signal {
-                    (format!("✗ {signal}"), Color::Red)
+                    (format!("✗ {signal}"), THEME_RED)
                 } else {
-                    (format!("✗ {code}"), Color::Red)
+                    (format!("✗ {code}"), THEME_RED)
                 }
             }
         }
@@ -2484,7 +2491,7 @@ fn render_footer_items(
         for column in 0..area.width {
             buffer[(area.x + column, area.y + row)]
                 .set_symbol(" ")
-                .set_style(Style::default().fg(Color::White).bg(Color::DarkGray));
+                .set_style(Style::default().fg(THEME_SNOW).bg(THEME_BLACK));
         }
     }
 
@@ -2545,7 +2552,7 @@ fn render_command_help(area: Rect, buffer: &mut Buffer, leader: &str) {
         Line::styled(
             "Command Help",
             Style::default()
-                .fg(Color::Yellow)
+                .fg(THEME_GREEN)
                 .add_modifier(Modifier::BOLD),
         ),
         Line::raw(""),
@@ -2570,15 +2577,15 @@ fn render_command_help(area: Rect, buffer: &mut Buffer, leader: &str) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow))
-                .style(Style::default().fg(Color::White).bg(Color::Black)),
+                .border_style(Style::default().fg(THEME_RED))
+                .style(Style::default().fg(THEME_SNOW).bg(THEME_BLACK)),
         )
         .wrap(Wrap { trim: false })
         .render(popup, buffer);
     if let Some(close) = command_help_close_rect(area) {
         Paragraph::new(" x ")
             .alignment(ratatui::layout::Alignment::Center)
-            .style(Style::default().fg(Color::Black).bg(Color::Yellow))
+            .style(Style::default().fg(THEME_BLACK).bg(THEME_SNOW))
             .render(close, buffer);
     }
 }
@@ -2608,7 +2615,7 @@ fn render_quit_confirm(area: Rect, buffer: &mut Buffer) {
     Paragraph::new(vec![
         Line::styled(
             "Close Demons?",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default().fg(THEME_RED).add_modifier(Modifier::BOLD),
         ),
         Line::raw(""),
         Line::raw("Press Ctrl-C or q again to close Demons."),
@@ -2617,8 +2624,8 @@ fn render_quit_confirm(area: Rect, buffer: &mut Buffer) {
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Red))
-            .style(Style::default().fg(Color::White).bg(Color::Black)),
+            .border_style(Style::default().fg(THEME_RED))
+            .style(Style::default().fg(THEME_SNOW).bg(THEME_BLACK)),
     )
     .wrap(Wrap { trim: false })
     .render(popup, buffer);
@@ -2840,10 +2847,10 @@ fn footer_status(label: impl Into<String>) -> FooterItem {
         format!(" {} ", label.into()),
         None,
         FooterItemStyle {
-            fg: Color::White,
-            bg: Color::DarkGray,
-            hover_fg: Color::White,
-            hover_bg: Color::DarkGray,
+            fg: THEME_BLACK,
+            bg: THEME_SNOW,
+            hover_fg: THEME_BLACK,
+            hover_bg: THEME_WHITE,
         },
     )
 }
@@ -2887,33 +2894,17 @@ fn search_placeholder_footer_items() -> Vec<FooterItem> {
 
 fn footer_action_style(action: FooterAction) -> FooterItemStyle {
     match action {
-        FooterAction::ToggleFullscreen => {
-            footer_style(Color::White, Color::Blue, Color::Black, Color::LightBlue)
-        }
+        FooterAction::ToggleFullscreen => christmas_style_for_index(0),
         FooterAction::StartSearch | FooterAction::SearchOlder | FooterAction::SearchNewer => {
-            footer_style(
-                Color::White,
-                Color::Magenta,
-                Color::Black,
-                Color::LightMagenta,
-            )
+            christmas_style_for_index(1)
         }
         FooterAction::SearchDone | FooterAction::ShowHelp | FooterAction::ClearFocused => {
-            footer_style(Color::White, Color::Gray, Color::Black, Color::White)
+            christmas_style_for_index(2)
         }
-        FooterAction::CopyVisible | FooterAction::CopyHistory => {
-            footer_style(Color::White, Color::Green, Color::Black, Color::LightGreen)
-        }
-        FooterAction::SaveHistory => footer_style(
-            Color::Black,
-            Color::Yellow,
-            Color::Black,
-            Color::LightYellow,
-        ),
-        FooterAction::RestartFocused | FooterAction::RestartAll => {
-            footer_style(Color::White, Color::Cyan, Color::Black, Color::LightCyan)
-        }
-        FooterAction::Quit => footer_style(Color::White, Color::Red, Color::Black, Color::LightRed),
+        FooterAction::CopyVisible | FooterAction::CopyHistory => christmas_style_for_index(3),
+        FooterAction::SaveHistory => christmas_style_for_index(4),
+        FooterAction::RestartFocused | FooterAction::RestartAll => christmas_style_for_index(5),
+        FooterAction::Quit => christmas_style_for_index(1),
     }
 }
 
@@ -2922,12 +2913,16 @@ fn footer_command_button(
     action: FooterAction,
     index: usize,
 ) -> FooterItem {
-    let style = if index % 2 == 0 {
-        footer_style(Color::Black, Color::Gray, Color::Black, Color::White)
-    } else {
-        footer_style(Color::Black, Color::Red, Color::Black, Color::LightRed)
-    };
+    let style = christmas_style_for_index(index);
     FooterItem::new(format!(" {} ", label.into()), Some(action), style)
+}
+
+fn christmas_style_for_index(index: usize) -> FooterItemStyle {
+    if index % 2 == 0 {
+        footer_style(THEME_BLACK, THEME_SNOW, THEME_BLACK, THEME_WHITE)
+    } else {
+        footer_style(THEME_BLACK, THEME_RED, THEME_BLACK, Color::LightRed)
+    }
 }
 
 fn footer_style(fg: Color, bg: Color, hover_fg: Color, hover_bg: Color) -> FooterItemStyle {
@@ -2941,10 +2936,10 @@ fn footer_style(fg: Color, bg: Color, hover_fg: Color, hover_bg: Color) -> Foote
 
 fn mode_hover_color(color: Color) -> Color {
     match color {
-        Color::Cyan => Color::LightCyan,
-        Color::Yellow => Color::LightYellow,
-        Color::Magenta => Color::LightMagenta,
-        _ => Color::White,
+        THEME_GREEN => Color::LightGreen,
+        THEME_RED => Color::LightRed,
+        THEME_GOLD => Color::LightYellow,
+        _ => THEME_WHITE,
     }
 }
 
@@ -3544,6 +3539,19 @@ mod tests {
                 && item.action == Some(FooterAction::RestartAll))
         );
         assert_eq!(items.last().unwrap().action, Some(FooterAction::ShowHelp));
+    }
+
+    #[test]
+    fn command_footer_uses_candy_cane_button_contrast() {
+        let items = command_footer_items();
+
+        for item in &items {
+            assert_eq!(item.style.fg, THEME_BLACK);
+        }
+        assert_eq!(items[0].style.bg, THEME_SNOW);
+        assert_eq!(items[1].style.bg, THEME_RED);
+        assert_eq!(items[2].style.bg, THEME_SNOW);
+        assert_eq!(items[3].style.bg, THEME_RED);
     }
 
     #[test]
