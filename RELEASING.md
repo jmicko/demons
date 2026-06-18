@@ -17,6 +17,22 @@ scripts/set-version.sh 0.2.0
 The script updates `Cargo.toml` and the root `demons` entry in `Cargo.lock`,
 then runs `cargo check --locked`.
 
+## First crates.io Publish
+
+Before the first crates.io release:
+
+1. Log in with a crates.io API token:
+
+   ```sh
+   cargo login
+   ```
+
+2. Confirm the crate name is available and the package metadata is correct:
+   `description`, `license`, `readme`, `repository`, `homepage`, `keywords`,
+   and `categories`.
+3. Run `cargo package --locked --list` and check that no local-only files are
+   included.
+
 ## Checklist
 
 1. Start from a clean working tree on the release branch.
