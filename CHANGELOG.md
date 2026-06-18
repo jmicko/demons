@@ -7,6 +7,7 @@ All notable user-facing changes should be recorded here before a release.
 - Added pane-local mouse text selection with scrollback autoscroll and
   right-click copy/paste support.
 - Added a tabbed runtime menu with Help, Tasks, Settings, and Exit sections.
+- Added task-menu state restoration and cwd Tab completion/validation.
 - Changed `demons init` to open the configurator without starting tasks.
 - Added task dependencies and `start_delay`, including dependent restarts.
 - Added centered pane countdowns for delayed starts.

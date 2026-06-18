@@ -112,7 +112,8 @@ The runtime menu is opened with `?` in command mode or by clicking the footer's
 - **Help** — command reference.
 - **Tasks** — task list. Enter or click a task to edit name, command, cwd, env,
   dependencies, and start delay. Dependencies are selected from a checkbox list
-  of other tasks.
+  of other tasks. Working-directory edits validate immediately and support Tab
+  completion for directories relative to the config file.
 - **Settings** — app-level settings that can apply immediately, such as the
   leader key.
 - **Exit** — discard, save without restarting, save and restart affected, or
@@ -121,7 +122,8 @@ The runtime menu is opened with `?` in command mode or by clicking the footer's
 
 Keyboard behavior follows common TUI menu conventions: arrows move, Enter
 activates, Space toggles dependency checkboxes, Esc backs out one level, and
-text fields support cursor movement and basic line editing.
+text fields support cursor movement and basic line editing. Tab completes
+directories while editing a task's working directory.
 
 ## 5. CLI
 

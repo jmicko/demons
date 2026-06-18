@@ -671,6 +671,7 @@ impl App {
                 return Ok(self.request_quit());
             }
             KeyCode::Enter => self.submit_menu_edit(),
+            KeyCode::Tab => self.complete_menu_cwd(),
             KeyCode::Backspace => self.delete_menu_edit_char_before_cursor(),
             KeyCode::Delete => self.delete_menu_edit_char_at_cursor(),
             KeyCode::Left => {
@@ -751,6 +752,9 @@ impl App {
         }
         if let Some(menu) = self.menu.as_mut() {
             menu.cursor = (menu.cursor as isize + delta).rem_euclid(count as isize) as usize;
+            if menu.tab == MenuTab::Tasks && menu.task_detail.is_none() {
+                menu.task_list_cursor = menu.cursor;
+            }
         }
     }
 
@@ -818,6 +822,7 @@ impl App {
             MenuAction::OpenTask(index) => {
                 if let Some(menu) = self.menu.as_mut() {
                     if index < menu.draft.tasks.len() {
+                        menu.task_list_cursor = index;
                         menu.task_detail = Some(index);
                         menu.cursor = 0;
                     }
@@ -847,7 +852,7 @@ impl App {
         }
         if menu.task_detail.is_some() {
             menu.task_detail = None;
-            menu.cursor = 0;
+            menu.cursor = task_list_cursor(menu);
             return Action::Continue;
         }
         if menu.dirty() {
@@ -880,7 +885,9 @@ impl App {
             run_on_change: None,
             repeat: None,
         });
-        menu.task_detail = Some(menu.draft.tasks.len() - 1);
+        let index = menu.draft.tasks.len() - 1;
+        menu.task_list_cursor = index;
+        menu.task_detail = Some(index);
         menu.cursor = 0;
     }
 
@@ -909,7 +916,7 @@ impl App {
             TaskField::Back => {
                 if let Some(menu) = self.menu.as_mut() {
                     menu.task_detail = None;
-                    menu.cursor = 0;
+                    menu.cursor = task_list_cursor(menu);
                 }
             }
         }
@@ -953,6 +960,7 @@ impl App {
     }
 
     fn apply_menu_edit(&mut self, edit: &MenuEdit, value: String) -> Result<()> {
+        let root = self.loaded.root.clone();
         let Some(menu) = self.menu.as_mut() else {
             return Ok(());
         };
@@ -973,7 +981,7 @@ impl App {
                 }
                 task.command = TaskCommand::Shell(value);
             }
-            TaskField::Cwd => task.cwd = PathBuf::from(if value.is_empty() { "." } else { &value }),
+            TaskField::Cwd => task.cwd = validate_menu_cwd(&root, &value)?,
             TaskField::Env => task.env = parse_env_inline(&value)?,
             TaskField::StartDelay => {
                 if value.is_empty() {
@@ -986,6 +994,34 @@ impl App {
             _ => {}
         }
         Ok(())
+    }
+
+    fn complete_menu_cwd(&mut self) {
+        let root = self.loaded.root.clone();
+        let Some((value, cursor)) = self.menu.as_ref().and_then(|menu| {
+            let edit = menu.edit.as_ref()?;
+            (edit.field == TaskField::Cwd).then(|| (edit.value.clone(), edit.cursor))
+        }) else {
+            return;
+        };
+
+        match complete_directory(&root, &value, cursor) {
+            Ok(DirectoryCompletion::Updated { value, cursor }) => {
+                if let Some(edit) = self.menu.as_mut().and_then(|menu| menu.edit.as_mut()) {
+                    edit.value = value;
+                    edit.cursor = cursor;
+                }
+            }
+            Ok(DirectoryCompletion::NoMatches) => {
+                self.set_notice("No matching directories.".to_owned());
+            }
+            Ok(DirectoryCompletion::Ambiguous { matches }) => {
+                self.set_notice(format!("{matches} matching directories. Keep typing."));
+            }
+            Err(error) => {
+                self.set_notice(format!("Completion failed: {error:#}"));
+            }
+        }
     }
 
     fn delete_menu_task(&mut self, task_index: usize) {
@@ -1001,7 +1037,12 @@ impl App {
             task.depends_on.retain(|dependency| dependency != &name);
         }
         menu.task_detail = None;
-        menu.cursor = menu.cursor.min(menu.draft.tasks.len());
+        menu.cursor = if menu.draft.tasks.is_empty() {
+            0
+        } else {
+            task_index.min(menu.draft.tasks.len() - 1)
+        };
+        menu.task_list_cursor = menu.cursor;
     }
 
     fn toggle_selected_dependency(&mut self) {
@@ -3195,6 +3236,7 @@ struct SearchState {
 struct MenuState {
     tab: MenuTab,
     cursor: usize,
+    task_list_cursor: usize,
     task_detail: Option<usize>,
     dependency_task: Option<usize>,
     dependency_cursor: usize,
@@ -3209,6 +3251,7 @@ impl MenuState {
         Self {
             tab,
             cursor: 0,
+            task_list_cursor: 0,
             task_detail: None,
             dependency_task: None,
             dependency_cursor: 0,
@@ -3295,6 +3338,13 @@ enum MenuAction {
     ToggleDependency(usize),
     CycleLeader,
     Exit(MenuExitAction),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DirectoryCompletion {
+    Updated { value: String, cursor: usize },
+    NoMatches,
+    Ambiguous { matches: usize },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3973,6 +4023,10 @@ fn menu_item_count(menu: &MenuState, configure_only: bool) -> usize {
     }
 }
 
+fn task_list_cursor(menu: &MenuState) -> usize {
+    menu.task_list_cursor.min(menu.draft.tasks.len())
+}
+
 fn task_detail_fields() -> &'static [TaskField] {
     &[
         TaskField::Name,
@@ -4138,6 +4192,121 @@ fn parse_env_inline(text: &str) -> Result<BTreeMap<String, String>> {
         env.insert(key.to_owned(), value.to_owned());
     }
     Ok(env)
+}
+
+fn validate_menu_cwd(root: &Path, value: &str) -> Result<PathBuf> {
+    let cwd = PathBuf::from(if value.is_empty() { "." } else { value });
+    let resolved = if cwd.is_absolute() {
+        cwd.clone()
+    } else {
+        root.join(&cwd)
+    };
+    if !resolved.is_dir() {
+        anyhow::bail!(
+            "working directory is not a directory: {}",
+            resolved.display()
+        );
+    }
+    Ok(cwd)
+}
+
+fn complete_directory(root: &Path, value: &str, cursor: usize) -> Result<DirectoryCompletion> {
+    let cursor_byte = byte_index_for_char(value, cursor);
+    let before = &value[..cursor_byte];
+    let after = &value[cursor_byte..];
+    let (parent_text, display_parent, prefix) = split_directory_completion_prefix(before);
+    let parent = if parent_text.is_empty() {
+        root.to_path_buf()
+    } else {
+        let parent = Path::new(parent_text);
+        if parent.is_absolute() {
+            parent.to_path_buf()
+        } else {
+            root.join(parent)
+        }
+    };
+
+    let entries = match fs::read_dir(&parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(DirectoryCompletion::NoMatches);
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    let mut matches = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !prefix.starts_with('.') && name.starts_with('.') {
+            continue;
+        }
+        if name.starts_with(prefix) {
+            matches.push(name);
+        }
+    }
+    matches.sort();
+
+    match matches.len() {
+        0 => Ok(DirectoryCompletion::NoMatches),
+        1 => {
+            let mut completed = format!("{display_parent}{}/", matches[0]);
+            completed.push_str(after);
+            let cursor = char_count(display_parent) + char_count(&matches[0]) + 1;
+            Ok(DirectoryCompletion::Updated {
+                value: completed,
+                cursor,
+            })
+        }
+        count => {
+            let common = common_prefix(&matches);
+            if common != prefix {
+                let mut completed = format!("{display_parent}{common}");
+                completed.push_str(after);
+                let cursor = char_count(display_parent) + char_count(&common);
+                Ok(DirectoryCompletion::Updated {
+                    value: completed,
+                    cursor,
+                })
+            } else {
+                Ok(DirectoryCompletion::Ambiguous { matches: count })
+            }
+        }
+    }
+}
+
+fn split_directory_completion_prefix(input: &str) -> (&str, &str, &str) {
+    if let Some(index) = input.rfind('/') {
+        let parent = if index == 0 { "/" } else { &input[..index] };
+        let display_parent = &input[..=index];
+        let prefix = &input[index + 1..];
+        (parent, display_parent, prefix)
+    } else {
+        ("", "", input)
+    }
+}
+
+fn common_prefix(values: &[String]) -> String {
+    let Some(first) = values.first() else {
+        return String::new();
+    };
+    let mut common = String::new();
+    for (index, character) in first.chars().enumerate() {
+        if values
+            .iter()
+            .all(|value| value.chars().nth(index) == Some(character))
+        {
+            common.push(character);
+        } else {
+            break;
+        }
+    }
+    common
 }
 
 fn render_history(task: &TaskRuntime, area: Rect, buffer: &mut Buffer) {
@@ -6038,6 +6207,108 @@ mod tests {
             app.menu.as_ref().unwrap().draft.tasks[1].depends_on,
             vec!["server", "worker"]
         );
+    }
+
+    #[test]
+    fn task_detail_back_restores_task_list_cursor() {
+        let mut app = test_app();
+        app.open_menu(MenuTab::Tasks);
+        app.move_menu_cursor(1);
+
+        app.apply_menu_action(MenuAction::OpenTask(1)).unwrap();
+        assert_eq!(app.menu.as_ref().unwrap().cursor, 0);
+
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+
+        let menu = app.menu.as_ref().unwrap();
+        assert!(menu.task_detail.is_none());
+        assert_eq!(menu.cursor, 1);
+    }
+
+    #[test]
+    fn deleted_task_selects_neighboring_task() {
+        let mut app =
+            test_app_with_tasks(vec![test_task("one"), test_task("two"), test_task("three")]);
+        app.open_menu(MenuTab::Tasks);
+        app.apply_menu_action(MenuAction::OpenTask(1)).unwrap();
+
+        app.apply_menu_action(MenuAction::TaskField(TaskField::Delete))
+            .unwrap();
+
+        let menu = app.menu.as_ref().unwrap();
+        assert!(menu.task_detail.is_none());
+        assert_eq!(menu.cursor, 1);
+        assert_eq!(menu.draft.tasks[1].name, "three");
+
+        app.apply_menu_action(MenuAction::OpenTask(1)).unwrap();
+        app.apply_menu_action(MenuAction::TaskField(TaskField::Delete))
+            .unwrap();
+
+        let menu = app.menu.as_ref().unwrap();
+        assert_eq!(menu.cursor, 0);
+        assert_eq!(menu.draft.tasks[0].name, "one");
+    }
+
+    #[test]
+    fn cwd_edit_validates_directory_before_apply() {
+        let temp = tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("web")).unwrap();
+        let mut app = test_app();
+        app.loaded.root = temp.path().to_path_buf();
+        app.open_menu(MenuTab::Tasks);
+        app.apply_menu_action(MenuAction::OpenTask(0)).unwrap();
+        app.apply_menu_action(MenuAction::TaskField(TaskField::Cwd))
+            .unwrap();
+
+        {
+            let edit = app.menu.as_mut().unwrap().edit.as_mut().unwrap();
+            edit.value = "missing".to_owned();
+            edit.cursor = char_count(&edit.value);
+        }
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.menu.as_ref().unwrap().edit.is_some());
+        assert_eq!(
+            app.menu.as_ref().unwrap().draft.tasks[0].cwd,
+            PathBuf::from(".")
+        );
+
+        {
+            let edit = app.menu.as_mut().unwrap().edit.as_mut().unwrap();
+            edit.value = "web".to_owned();
+            edit.cursor = char_count(&edit.value);
+        }
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        let menu = app.menu.as_ref().unwrap();
+        assert!(menu.edit.is_none());
+        assert_eq!(menu.draft.tasks[0].cwd, PathBuf::from("web"));
+    }
+
+    #[test]
+    fn cwd_edit_tab_completes_directories() {
+        let temp = tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("frontend_client")).unwrap();
+        let mut app = test_app();
+        app.loaded.root = temp.path().to_path_buf();
+        app.open_menu(MenuTab::Tasks);
+        app.apply_menu_action(MenuAction::OpenTask(0)).unwrap();
+        app.apply_menu_action(MenuAction::TaskField(TaskField::Cwd))
+            .unwrap();
+        {
+            let edit = app.menu.as_mut().unwrap().edit.as_mut().unwrap();
+            edit.value = "front".to_owned();
+            edit.cursor = char_count(&edit.value);
+        }
+
+        app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+
+        let edit = app.menu.as_ref().unwrap().edit.as_ref().unwrap();
+        assert_eq!(edit.value, "frontend_client/");
+        assert_eq!(edit.cursor, char_count("frontend_client/"));
     }
 
     #[test]

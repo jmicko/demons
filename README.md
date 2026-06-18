@@ -50,6 +50,8 @@ demons init
 tasks. Use the Tasks tab to add or edit tasks, Settings for app-level options,
 and Exit to save or discard changes. When an existing config is found in the
 current directory or a parent directory, `demons init` edits it in place.
+Working-directory fields validate before they are applied, and Tab completes
+directory names relative to the config file.
 
 Or create `demons.toml` yourself:
 
