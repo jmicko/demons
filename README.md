@@ -104,9 +104,8 @@ changing modes.
 
 Click a pane to focus it. Click `[↻]` in a pane header to restart that task.
 The mouse wheel scrolls pane history unless the child application has enabled
-terminal mouse reporting in input mode. Footer command chunks are clickable:
-plain click runs the lowercase/default action, and `Shift`-click runs the
-uppercase/alternate action when one is shown.
+terminal mouse reporting in input mode. Footer command buttons are clickable;
+paired commands like `y` / `Y` and `r` / `R` are shown as separate buttons.
 
 Drag inside a pane to select text. If the child application has enabled mouse
 reporting, use `Shift`-drag to select instead of sending the drag to the child.

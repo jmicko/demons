@@ -121,6 +121,7 @@ struct App {
     footer_rect: Option<Rect>,
     mode_button_rect: Option<Rect>,
     footer_hits: Vec<FooterHit>,
+    mouse_position: Option<(u16, u16)>,
     tx: SyncSender<ProcessEvent>,
     rx: Receiver<ProcessEvent>,
     registry: ProcessRegistry,
@@ -167,6 +168,7 @@ impl App {
             footer_rect: None,
             mode_button_rect: None,
             footer_hits: Vec::new(),
+            mouse_position: None,
             tx,
             rx,
             registry,
@@ -333,12 +335,19 @@ impl App {
                 footer_area.width.saturating_sub(button_area.width),
                 footer_area.height,
             );
-            let (mode_label, mode_color, help) = self.footer_parts(Instant::now());
+            let (mode_label, mode_color, items) = self.footer_parts(Instant::now());
+            let mode_hovered = self
+                .mouse_position
+                .is_some_and(|(x, y)| contains(button_area, x, y));
             Paragraph::new(mode_label)
                 .alignment(ratatui::layout::Alignment::Center)
-                .style(Style::default().fg(Color::Black).bg(mode_color))
+                .style(Style::default().fg(Color::Black).bg(if mode_hovered {
+                    mode_hover_color(mode_color)
+                } else {
+                    mode_color
+                }))
                 .render(button_area, buffer);
-            self.footer_hits = render_footer_text(&help, help_area, buffer);
+            self.footer_hits = render_footer_items(&items, help_area, buffer, self.mouse_position);
         }
 
         if self.show_help {
@@ -727,6 +736,8 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<Action> {
+        self.mouse_position = Some((mouse.column, mouse.row));
+
         if self.confirm_quit {
             return Ok(Action::Continue);
         }
@@ -751,6 +762,13 @@ impl App {
 
         if let Some(action) = self.footer_action_at(mouse) {
             return self.apply_footer_action(action);
+        }
+
+        if self
+            .footer_rect
+            .is_some_and(|rect| contains(rect, mouse.column, mouse.row))
+        {
+            return Ok(Action::Continue);
         }
 
         if self.mode == AppMode::Search {
@@ -843,13 +861,7 @@ impl App {
         self.footer_hits
             .iter()
             .find(|hit| contains(hit.rect, mouse.column, mouse.row))
-            .and_then(|hit| {
-                if mouse.modifiers.contains(KeyModifiers::SHIFT) {
-                    hit.alternate.or(hit.primary)
-                } else {
-                    hit.primary
-                }
-            })
+            .map(|hit| hit.action)
     }
 
     fn apply_footer_action(&mut self, action: FooterAction) -> Result<Action> {
@@ -874,11 +886,6 @@ impl App {
                 self.clear_selection_for(self.focus);
             }
             FooterAction::Quit => return Ok(self.request_quit()),
-            FooterAction::ReturnInput => {
-                self.search = None;
-                self.show_help = false;
-                self.mode = AppMode::Input;
-            }
         }
         Ok(Action::Continue)
     }
@@ -1338,48 +1345,37 @@ impl App {
         if help_width == 0 {
             return 1;
         }
-        let (_, _, help) = self.footer_parts(Instant::now());
-        let line_count = footer_line_count(&help, help_width);
+        let (_, _, items) = self.footer_parts(Instant::now());
+        let line_count = footer_line_count(&items, help_width);
         line_count.min(terminal_height.saturating_sub(3).max(1))
     }
 
-    fn footer_parts(&self, now: Instant) -> (&'static str, Color, String) {
+    fn footer_parts(&self, now: Instant) -> (&'static str, Color, Vec<FooterItem>) {
         if let Some(search) = self
             .search
             .as_ref()
             .filter(|_| self.mode == AppMode::Search)
         {
-            return ("SEARCH", Color::Magenta, search_footer_text(search));
+            return ("SEARCH", Color::Magenta, search_footer_items(search));
         }
 
         if let Some(notice) = self.active_notice(now) {
             let (label, color) = self.mode_label_color();
-            return (label, color, format!(" {notice} "));
+            return (label, color, vec![footer_status(notice.to_string())]);
         }
 
         match self.mode {
             AppMode::Input => (
                 "INPUT MODE",
                 Color::Cyan,
-                format!(
-                    " {} | {}: command | drag: select | right-click: copy ",
-                    self.tasks[self.focus].task.name,
-                    self.loaded.config.settings.leader.label()
-                ),
+                vec![
+                    footer_status(self.tasks[self.focus].task.name.clone()),
+                    footer_status("drag select"),
+                    footer_status("right-click copy"),
+                ],
             ),
-            AppMode::Command => (
-                "COMMAND MODE",
-                Color::Yellow,
-                format!(
-                    " arrows/hjkl: move | f: fullscreen | /: search | y/Y: copy | S: save | ?: help | r/R: restart | c: clear | q: quit | {}: input ",
-                    self.loaded.config.settings.leader.label()
-                ),
-            ),
-            AppMode::Search => (
-                "SEARCH",
-                Color::Magenta,
-                " /  Enter: jump | Esc: cancel ".to_owned(),
-            ),
+            AppMode::Command => ("COMMAND MODE", Color::Yellow, command_footer_items()),
+            AppMode::Search => ("SEARCH", Color::Magenta, search_placeholder_footer_items()),
         }
     }
 
@@ -2478,7 +2474,12 @@ fn render_selection(
     }
 }
 
-fn render_footer_text(text: &str, area: Rect, buffer: &mut Buffer) -> Vec<FooterHit> {
+fn render_footer_items(
+    items: &[FooterItem],
+    area: Rect,
+    buffer: &mut Buffer,
+    hover_position: Option<(u16, u16)>,
+) -> Vec<FooterHit> {
     for row in 0..area.height {
         for column in 0..area.width {
             buffer[(area.x + column, area.y + row)]
@@ -2490,11 +2491,11 @@ fn render_footer_text(text: &str, area: Rect, buffer: &mut Buffer) -> Vec<Footer
     let mut hits = Vec::new();
     let mut row = 0_u16;
     let mut column = 0_u16;
-    for chunk in footer_chunks(text, area.width) {
+    for item in items {
         if row >= area.height {
             break;
         }
-        if column > 0 && column.saturating_add(chunk.width) > area.width {
+        if column > 0 && column.saturating_add(item.width) > area.width {
             row += 1;
             column = 0;
         }
@@ -2504,7 +2505,16 @@ fn render_footer_text(text: &str, area: Rect, buffer: &mut Buffer) -> Vec<Footer
 
         let start_row = row;
         let start_column = column;
-        for character in chunk.text.chars() {
+        let rect = Rect::new(
+            area.x + start_column,
+            area.y + start_row,
+            item.width.min(area.width),
+            1,
+        );
+        let hovered =
+            item.action.is_some() && hover_position.is_some_and(|(x, y)| contains(rect, x, y));
+        let style = item.style(hovered);
+        for character in item.text.chars() {
             if column >= area.width {
                 row += 1;
                 column = 0;
@@ -2515,10 +2525,10 @@ fn render_footer_text(text: &str, area: Rect, buffer: &mut Buffer) -> Vec<Footer
             let mut encoded = [0_u8; 4];
             buffer[(area.x + column, area.y + row)]
                 .set_symbol(character.encode_utf8(&mut encoded))
-                .set_style(Style::default().fg(Color::White).bg(Color::DarkGray));
+                .set_style(style);
             column += 1;
         }
-        if let Some(hit) = chunk.hit_rect(area, start_row, start_column, row, column) {
+        if let Some(hit) = item.hit_rect(area, start_row, start_column, row, column) {
             hits.push(hit);
         }
     }
@@ -2545,7 +2555,7 @@ fn render_command_help(area: Rect, buffer: &mut Buffer, leader: &str) {
         Line::raw("PageUp/PageDown        Scroll focused pane"),
         Line::raw("Home/End               Jump to top/bottom of history"),
         Line::raw("drag / right-click     Select and copy pane text"),
-        Line::raw("footer click/Shift     Run default / alternate command"),
+        Line::raw("footer buttons         Click visible commands"),
         Line::raw("y / Y                  Copy visible text / full scrollback"),
         Line::raw("S                      Save full scrollback to a temp log"),
         Line::raw("/                      Search focused pane"),
@@ -2732,23 +2742,36 @@ fn search_footer_text(search: &SearchState) -> String {
     let mut query = search.query.clone();
     let cursor = byte_index_for_char(&query, search.cursor);
     query.insert(cursor, '|');
-    let suffix = search
-        .message
-        .as_ref()
-        .map(|message| format!(" | {message}"))
-        .unwrap_or_default();
-    format!(" /{query} | Enter: older | Shift+Enter: newer | Esc: done{suffix} ")
+    format!("/{query}")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct FooterChunk {
+struct FooterItem {
     text: String,
     width: u16,
-    primary: Option<FooterAction>,
-    alternate: Option<FooterAction>,
+    action: Option<FooterAction>,
+    style: FooterItemStyle,
 }
 
-impl FooterChunk {
+impl FooterItem {
+    fn new(text: String, action: Option<FooterAction>, style: FooterItemStyle) -> Self {
+        Self {
+            width: char_count(&text).min(usize::from(u16::MAX)) as u16,
+            text,
+            action,
+            style,
+        }
+    }
+
+    fn style(&self, hovered: bool) -> Style {
+        let (fg, bg) = if hovered {
+            (self.style.hover_fg, self.style.hover_bg)
+        } else {
+            (self.style.fg, self.style.bg)
+        };
+        Style::default().fg(fg).bg(bg)
+    }
+
     fn hit_rect(
         &self,
         area: Rect,
@@ -2757,7 +2780,8 @@ impl FooterChunk {
         end_row: u16,
         end_column: u16,
     ) -> Option<FooterHit> {
-        if self.primary.is_none() || start_row != end_row || end_column <= start_column {
+        let action = self.action?;
+        if start_row != end_row || end_column <= start_column {
             return None;
         }
         Some(FooterHit {
@@ -2767,17 +2791,23 @@ impl FooterChunk {
                 end_column - start_column,
                 1,
             ),
-            primary: self.primary,
-            alternate: self.alternate.or(self.primary),
+            action,
         })
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FooterItemStyle {
+    fg: Color,
+    bg: Color,
+    hover_fg: Color,
+    hover_bg: Color,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FooterHit {
     rect: Rect,
-    primary: Option<FooterAction>,
-    alternate: Option<FooterAction>,
+    action: FooterAction,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2795,95 +2825,126 @@ enum FooterAction {
     RestartAll,
     ClearFocused,
     Quit,
-    ReturnInput,
 }
 
-fn footer_chunks(text: &str, width: u16) -> Vec<FooterChunk> {
-    let width = usize::from(width.max(1));
-    if text.contains(" | ") {
-        return text
-            .trim()
-            .split(" | ")
-            .enumerate()
-            .flat_map(|(index, segment)| {
-                let prefix = if index == 0 { " " } else { " | " };
-                let (primary, alternate) = footer_actions_for_segment(segment);
-                split_footer_chunk(&format!("{prefix}{segment}"), width, primary, alternate)
-            })
-            .collect();
+fn footer_button(label: impl Into<String>, action: FooterAction) -> FooterItem {
+    FooterItem::new(
+        format!(" {} ", label.into()),
+        Some(action),
+        footer_action_style(action),
+    )
+}
+
+fn footer_status(label: impl Into<String>) -> FooterItem {
+    FooterItem::new(
+        format!(" {} ", label.into()),
+        None,
+        FooterItemStyle {
+            fg: Color::White,
+            bg: Color::DarkGray,
+            hover_fg: Color::White,
+            hover_bg: Color::DarkGray,
+        },
+    )
+}
+
+fn command_footer_items() -> Vec<FooterItem> {
+    vec![
+        footer_button("f fullscreen", FooterAction::ToggleFullscreen),
+        footer_button("/ search", FooterAction::StartSearch),
+        footer_button("y copy", FooterAction::CopyVisible),
+        footer_button("Y copy all", FooterAction::CopyHistory),
+        footer_button("S save", FooterAction::SaveHistory),
+        footer_button("r restart", FooterAction::RestartFocused),
+        footer_button("R restart all", FooterAction::RestartAll),
+        footer_button("c clear", FooterAction::ClearFocused),
+        footer_button("q quit", FooterAction::Quit),
+        footer_button("? help", FooterAction::ShowHelp),
+    ]
+}
+
+fn search_footer_items(search: &SearchState) -> Vec<FooterItem> {
+    let mut items = search_placeholder_footer_items();
+    items[0] = footer_status(search_footer_text(search));
+    if let Some(message) = search.message.as_ref() {
+        items.push(footer_status(message));
     }
-
-    split_footer_chunk(text, width, None, None)
+    items
 }
 
-fn split_footer_chunk(
-    text: &str,
-    width: usize,
-    primary: Option<FooterAction>,
-    alternate: Option<FooterAction>,
-) -> Vec<FooterChunk> {
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-    for character in text.chars() {
-        if char_count(&current) >= width {
-            chunks.push(FooterChunk {
-                width: char_count(&current).min(usize::from(u16::MAX)) as u16,
-                text: std::mem::take(&mut current),
-                primary,
-                alternate,
-            });
+fn search_placeholder_footer_items() -> Vec<FooterItem> {
+    vec![
+        footer_status("/"),
+        footer_button("Enter older", FooterAction::SearchOlder),
+        footer_button("Shift+Enter newer", FooterAction::SearchNewer),
+        footer_button("Esc done", FooterAction::SearchDone),
+    ]
+}
+
+fn footer_action_style(action: FooterAction) -> FooterItemStyle {
+    match action {
+        FooterAction::ToggleFullscreen => {
+            footer_style(Color::White, Color::Blue, Color::Black, Color::LightBlue)
         }
-        current.push(character);
-    }
-    if !current.is_empty() || chunks.is_empty() {
-        chunks.push(FooterChunk {
-            width: char_count(&current).min(usize::from(u16::MAX)) as u16,
-            text: current,
-            primary,
-            alternate,
-        });
-    }
-    chunks
-}
-
-fn footer_actions_for_segment(segment: &str) -> (Option<FooterAction>, Option<FooterAction>) {
-    match segment.trim() {
-        "f: fullscreen" => (Some(FooterAction::ToggleFullscreen), None),
-        "/: search" => (Some(FooterAction::StartSearch), None),
-        "Enter: older" => (Some(FooterAction::SearchOlder), None),
-        "Shift+Enter: newer" => (Some(FooterAction::SearchNewer), None),
-        "Esc: done" => (Some(FooterAction::SearchDone), None),
-        "y/Y: copy" => (
-            Some(FooterAction::CopyVisible),
-            Some(FooterAction::CopyHistory),
+        FooterAction::StartSearch | FooterAction::SearchOlder | FooterAction::SearchNewer => {
+            footer_style(
+                Color::White,
+                Color::Magenta,
+                Color::Black,
+                Color::LightMagenta,
+            )
+        }
+        FooterAction::SearchDone | FooterAction::ShowHelp | FooterAction::ClearFocused => {
+            footer_style(Color::White, Color::Gray, Color::Black, Color::White)
+        }
+        FooterAction::CopyVisible | FooterAction::CopyHistory => {
+            footer_style(Color::White, Color::Green, Color::Black, Color::LightGreen)
+        }
+        FooterAction::SaveHistory => footer_style(
+            Color::Black,
+            Color::Yellow,
+            Color::Black,
+            Color::LightYellow,
         ),
-        "S: save" => (Some(FooterAction::SaveHistory), None),
-        "?: help" => (Some(FooterAction::ShowHelp), None),
-        "r/R: restart" => (
-            Some(FooterAction::RestartFocused),
-            Some(FooterAction::RestartAll),
-        ),
-        "c: clear" => (Some(FooterAction::ClearFocused), None),
-        "q: quit" => (Some(FooterAction::Quit), None),
-        segment if segment.ends_with(": input") => (Some(FooterAction::ReturnInput), None),
-        _ => (None, None),
+        FooterAction::RestartFocused | FooterAction::RestartAll => {
+            footer_style(Color::White, Color::Cyan, Color::Black, Color::LightCyan)
+        }
+        FooterAction::Quit => footer_style(Color::White, Color::Red, Color::Black, Color::LightRed),
     }
 }
 
-fn footer_line_count(text: &str, width: u16) -> u16 {
+fn footer_style(fg: Color, bg: Color, hover_fg: Color, hover_bg: Color) -> FooterItemStyle {
+    FooterItemStyle {
+        fg,
+        bg,
+        hover_fg,
+        hover_bg,
+    }
+}
+
+fn mode_hover_color(color: Color) -> Color {
+    match color {
+        Color::Cyan => Color::LightCyan,
+        Color::Yellow => Color::LightYellow,
+        Color::Magenta => Color::LightMagenta,
+        _ => Color::White,
+    }
+}
+
+fn footer_line_count(items: &[FooterItem], width: u16) -> u16 {
     let mut lines = 1_u16;
     let mut column = 0_u16;
-    for chunk in footer_chunks(text, width) {
-        if column > 0 && column.saturating_add(chunk.width) > width {
+    for item in items {
+        if column > 0 && column.saturating_add(item.width) > width {
             lines = lines.saturating_add(1);
             column = 0;
         }
-        if chunk.width > width {
-            let extra = chunk.width.saturating_sub(1) / width.max(1);
+        if item.width > width {
+            let extra = item.width.saturating_sub(1) / width.max(1);
             lines = lines.saturating_add(extra);
-            column = chunk.width % width.max(1);
+            column = item.width % width.max(1);
         } else {
-            column = column.saturating_add(chunk.width);
+            column = column.saturating_add(item.width);
         }
     }
     lines.max(1)
@@ -3427,31 +3488,45 @@ mod tests {
     }
 
     #[test]
-    fn footer_chunks_keep_commands_together() {
-        let chunks = footer_chunks(" a: one | ?: help | q: quit ", 80);
+    fn footer_items_keep_buttons_together_when_wrapping() {
+        let items = vec![
+            footer_button("a one", FooterAction::ClearFocused),
+            footer_button("? help", FooterAction::ShowHelp),
+            footer_button("q quit", FooterAction::Quit),
+        ];
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 14, 3));
 
-        assert!(chunks.iter().any(|chunk| chunk.text == " | ?: help"));
-        assert!(!chunks.iter().any(|chunk| chunk.text == "?:"));
-        assert_eq!(footer_line_count(" a: one | ?: help | q: quit ", 14), 3);
+        let hits = render_footer_items(&items, Rect::new(0, 0, 14, 3), &mut buffer, None);
+
+        assert_eq!(footer_line_count(&items, 14), 3);
+        assert_eq!(hits[0].rect.y, 0);
+        assert_eq!(hits[1].rect.y, 1);
+        assert_eq!(hits[2].rect.y, 2);
     }
 
     #[test]
-    fn footer_chunks_keep_compact_primary_and_alternate_actions() {
-        let chunks = footer_chunks(" y/Y: copy | r/R: restart ", 80);
+    fn command_footer_splits_paired_actions_into_buttons() {
+        let items = command_footer_items();
 
-        let copy = chunks
-            .iter()
-            .find(|chunk| chunk.text == " y/Y: copy")
-            .unwrap();
-        assert_eq!(copy.primary, Some(FooterAction::CopyVisible));
-        assert_eq!(copy.alternate, Some(FooterAction::CopyHistory));
-
-        let restart = chunks
-            .iter()
-            .find(|chunk| chunk.text == " | r/R: restart")
-            .unwrap();
-        assert_eq!(restart.primary, Some(FooterAction::RestartFocused));
-        assert_eq!(restart.alternate, Some(FooterAction::RestartAll));
+        assert!(
+            items
+                .iter()
+                .any(|item| item.text == " y copy "
+                    && item.action == Some(FooterAction::CopyVisible))
+        );
+        assert!(
+            items.iter().any(|item| item.text == " Y copy all "
+                && item.action == Some(FooterAction::CopyHistory))
+        );
+        assert!(
+            items.iter().any(|item| item.text == " r restart "
+                && item.action == Some(FooterAction::RestartFocused))
+        );
+        assert!(
+            items.iter().any(|item| item.text == " R restart all "
+                && item.action == Some(FooterAction::RestartAll))
+        );
+        assert_eq!(items.last().unwrap().action, Some(FooterAction::ShowHelp));
     }
 
     #[test]
@@ -3565,14 +3640,11 @@ mod tests {
             message: None,
         };
 
-        assert_eq!(
-            search_footer_text(&search),
-            " /er|or | Enter: older | Shift+Enter: newer | Esc: done "
-        );
+        assert_eq!(search_footer_text(&search), "/er|or");
     }
 
     #[test]
-    fn footer_click_uses_primary_action_and_shift_click_uses_alternate() {
+    fn footer_copy_buttons_click_visible_and_full_history_actions() {
         let mut app = test_app();
         app.update_layout(Rect::new(0, 0, 100, 8));
         app.mode = AppMode::Command;
@@ -3582,22 +3654,25 @@ mod tests {
         app.tasks[0].scroll_up(10);
 
         let mut buffer = Buffer::empty(Rect::new(0, 0, 120, 2));
-        app.footer_hits = render_footer_text(
-            " y/Y: copy | r/R: restart ",
-            Rect::new(0, 0, 120, 2),
-            &mut buffer,
-        );
-        let copy = app
+        let items = command_footer_items();
+        app.footer_hits = render_footer_items(&items, Rect::new(0, 0, 120, 2), &mut buffer, None);
+        let copy_visible = app
             .footer_hits
             .iter()
-            .find(|hit| hit.alternate == Some(FooterAction::CopyHistory))
+            .find(|hit| hit.action == FooterAction::CopyVisible)
+            .unwrap()
+            .rect;
+        let copy_history = app
+            .footer_hits
+            .iter()
+            .find(|hit| hit.action == FooterAction::CopyHistory)
             .unwrap()
             .rect;
 
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
-            column: copy.x,
-            row: copy.y,
+            column: copy_visible.x,
+            row: copy_visible.y,
             modifiers: KeyModifiers::NONE,
         })
         .unwrap();
@@ -3607,9 +3682,9 @@ mod tests {
         app.clipboard.clear();
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
-            column: copy.x,
-            row: copy.y,
-            modifiers: KeyModifiers::SHIFT,
+            column: copy_history.x,
+            row: copy_history.y,
+            modifiers: KeyModifiers::NONE,
         })
         .unwrap();
         assert_eq!(app.clipboard.lines().next(), Some("line 0"));
@@ -3617,7 +3692,7 @@ mod tests {
     }
 
     #[test]
-    fn footer_shift_click_uses_restart_all_and_right_click_is_ignored() {
+    fn footer_restart_all_button_clicks_and_right_click_is_ignored() {
         let mut app = test_app();
         app.update_layout(Rect::new(0, 0, 120, 20));
         app.mode = AppMode::Command;
@@ -3626,15 +3701,12 @@ mod tests {
         }
 
         let mut buffer = Buffer::empty(Rect::new(0, 0, 120, 2));
-        app.footer_hits = render_footer_text(
-            " y/Y: copy | r/R: restart ",
-            Rect::new(0, 0, 120, 2),
-            &mut buffer,
-        );
+        let items = command_footer_items();
+        app.footer_hits = render_footer_items(&items, Rect::new(0, 0, 120, 2), &mut buffer, None);
         let restart = app
             .footer_hits
             .iter()
-            .find(|hit| hit.alternate == Some(FooterAction::RestartAll))
+            .find(|hit| hit.action == FooterAction::RestartAll)
             .unwrap()
             .rect;
 
@@ -3642,7 +3714,7 @@ mod tests {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: restart.x,
             row: restart.y,
-            modifiers: KeyModifiers::SHIFT,
+            modifiers: KeyModifiers::NONE,
         })
         .unwrap();
 

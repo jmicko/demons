@@ -176,8 +176,8 @@ Each pane has:
 - A one-line footer shows the current mode and available controls.
 - A fixed-width button at the left of the footer displays and toggles the
   current mode.
-- Footer command chunks are clickable. Plain click runs the lowercase/default
-  action; `Shift`-click runs the uppercase/alternate action when shown.
+- Footer command buttons are clickable. Paired shortcuts such as `y` / `Y` and
+  `r` / `R` are rendered as separate buttons.
 
 ### 6.3 Navigation
 
@@ -230,8 +230,7 @@ The configured leader key (default `Alt+J`) toggles between two modes.
 - Press the leader, click the footer mode button, or press `Esc` → return to
   input mode.
 - Clicking a pane selects it without leaving command mode.
-- Clicking a command footer chunk runs its default action; `Shift`-click runs
-  its alternate action when one is shown.
+- Clicking a command footer button runs that button's visible action.
 
 The leader is configurable in `[settings].leader`. Allowed values: `alt-j`
 (default), `alt-backtick`, `tab`, `ctrl-b`, `ctrl-q`, `ctrl-\`. The leader is
