@@ -10,7 +10,7 @@ All notable user-facing changes should be recorded here before a release.
 - Added task-menu state restoration and cwd Tab completion/validation.
 - Changed startup to command mode and replaced leader-key cycling with a picker.
 - Changed search mode so text input accepts `n`, mouse movement keeps search
-  open, and clicking another pane retargets the active search.
+  open, and Tab/Shift+Tab or clicking another pane retargets the active search.
 - Fixed search result rendering so visible-pane matches do not force scrollback
   layout.
 - Changed `demons init` to open the configurator without starting tasks.

@@ -227,7 +227,7 @@ The configured leader key (default `Alt+J`) toggles between two modes.
   file path.
 - `/`: open focused-pane search mode. In search mode, Enter searches older,
   Shift+Enter searches newer, Esc leaves search mode, and clicking another
-  pane retargets the active search.
+  pane or pressing Tab/Shift+Tab retargets the active search.
 - `r`: restart focused pane and its dependents.
 - `R`: restart all panes.
 - `c`: clear the focused pane and its scrollback.

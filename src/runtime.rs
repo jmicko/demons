@@ -1357,6 +1357,8 @@ impl App {
             KeyCode::Enter | KeyCode::Char('\n' | '\r') => {
                 self.submit_search(SearchDirection::Older)
             }
+            KeyCode::Tab => self.cycle_search_pane(1),
+            KeyCode::BackTab => self.cycle_search_pane(-1),
             KeyCode::Char('c' | 'C') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.cancel_search()
             }
@@ -1754,6 +1756,7 @@ impl App {
             FooterAction::StartSearch => self.start_search(),
             FooterAction::SearchOlder => self.submit_search(SearchDirection::Older),
             FooterAction::SearchNewer => self.submit_search(SearchDirection::Newer),
+            FooterAction::SearchNextPane => self.cycle_search_pane(1),
             FooterAction::SearchDone => self.cancel_search(),
             FooterAction::CopyVisible => self.copy_focused_visible(),
             FooterAction::CopyHistory => self.copy_focused_history(),
@@ -2234,6 +2237,21 @@ impl App {
             self.selection = None;
             self.notice = None;
         }
+    }
+
+    fn cycle_search_pane(&mut self, delta: isize) {
+        if self.tasks.is_empty() {
+            return;
+        }
+        let count = self.tasks.len() as isize;
+        let current = self
+            .search
+            .as_ref()
+            .map(|search| search.pane)
+            .unwrap_or(self.focus);
+        let next = (current as isize + delta).rem_euclid(count) as usize;
+        self.focus = next;
+        self.set_search_pane(next);
     }
 
     fn focused_page_rows(&self) -> usize {
@@ -3798,6 +3816,7 @@ fn render_menu_help(area: Rect, buffer: &mut Buffer, leader: &str) {
         "S                      Save full scrollback to a temp log".to_owned(),
         "/                      Search focused pane".to_owned(),
         "Enter / Shift-Enter    Search older / newer while searching".to_owned(),
+        "Tab / Shift-Tab        Change searched pane while searching".to_owned(),
         "r                      Restart focused task and dependents".to_owned(),
         "R                      Restart every task".to_owned(),
         "c                      Clear focused pane".to_owned(),
@@ -4893,6 +4912,7 @@ enum FooterAction {
     StartSearch,
     SearchOlder,
     SearchNewer,
+    SearchNextPane,
     SearchDone,
     CopyVisible,
     CopyHistory,
@@ -4958,6 +4978,7 @@ fn search_placeholder_footer_items() -> Vec<FooterItem> {
         footer_status("/"),
         footer_button("Enter older", FooterAction::SearchOlder),
         footer_button("Shift+Enter newer", FooterAction::SearchNewer),
+        footer_button("Tab pane", FooterAction::SearchNextPane),
         footer_button("Esc done", FooterAction::SearchDone),
     ]
 }
@@ -4965,9 +4986,10 @@ fn search_placeholder_footer_items() -> Vec<FooterItem> {
 fn footer_action_style(action: FooterAction) -> FooterItemStyle {
     match action {
         FooterAction::ToggleFullscreen => christmas_style_for_index(0),
-        FooterAction::StartSearch | FooterAction::SearchOlder | FooterAction::SearchNewer => {
-            christmas_style_for_index(1)
-        }
+        FooterAction::StartSearch
+        | FooterAction::SearchOlder
+        | FooterAction::SearchNewer
+        | FooterAction::SearchNextPane => christmas_style_for_index(1),
         FooterAction::SearchDone | FooterAction::ShowMenu | FooterAction::ClearFocused => {
             christmas_style_for_index(2)
         }
@@ -5768,6 +5790,12 @@ mod tests {
         };
 
         assert_eq!(search_footer_text(&search), "/er|or");
+        assert!(
+            search_footer_items(&search)
+                .iter()
+                .any(|item| item.text == " Tab pane "
+                    && item.action == Some(FooterAction::SearchNextPane))
+        );
     }
 
     #[test]
@@ -6273,6 +6301,43 @@ mod tests {
 
         assert_eq!(app.selection.as_ref().unwrap().pane, 1);
         assert_eq!(app.selected_text().unwrap(), "http://right.example");
+    }
+
+    #[test]
+    fn search_tab_retargets_active_search() {
+        let mut app = test_app();
+        app.update_layout(Rect::new(0, 0, 100, 8));
+        app.mode = AppMode::Command;
+        app.tasks[0].process_output(b"http://first.example\n");
+        app.tasks[1].process_output(b"http://second.example\n");
+
+        app.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE))
+            .unwrap();
+        for character in "http".chars() {
+            app.handle_key(key(KeyCode::Char(character), KeyModifiers::NONE))
+                .unwrap();
+        }
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.selected_text().unwrap(), "http://first.example");
+
+        app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.focus, 1);
+        assert_eq!(app.search.as_ref().unwrap().pane, 1);
+        assert_eq!(app.search.as_ref().unwrap().query, "http");
+        assert!(app.search.as_ref().unwrap().current.is_none());
+        assert!(app.selection.is_none());
+
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.selected_text().unwrap(), "http://second.example");
+
+        app.handle_key(key(KeyCode::BackTab, KeyModifiers::SHIFT))
+            .unwrap();
+        assert_eq!(app.focus, 0);
+        assert_eq!(app.search.as_ref().unwrap().pane, 0);
+        assert!(app.selection.is_none());
     }
 
     #[test]

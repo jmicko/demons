@@ -125,7 +125,8 @@ In command mode, `y` copies the focused pane's visible text and `Y` copies its
 full scrollback. `S` saves the focused pane's full scrollback to a temp log file
 and copies the file path. `/` opens a focused-pane search prompt; press Enter to
 search older, `Shift+Enter` to search newer, or `Esc` to leave search mode.
-Click another pane while the prompt is open to search that pane instead.
+Press `Tab`/`Shift+Tab` or click another pane while the prompt is open to
+search that pane instead.
 
 Closing Demons is confirmed: press `q` or `Ctrl+C`, then press it again to
 close, or `Esc` to cancel. In input mode, those keys still go to a running
