@@ -16,7 +16,7 @@ fn prints_help_and_version() {
     assert!(version.status.success());
     assert_eq!(
         String::from_utf8_lossy(&version.stdout).trim(),
-        "demons 0.1.0"
+        format!("demons {}", env!("CARGO_PKG_VERSION"))
     );
 }
 
