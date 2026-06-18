@@ -176,8 +176,6 @@ struct App {
     fullscreen: bool,
     search: Option<SearchState>,
     menu: Option<MenuState>,
-    show_help: bool,
-    help_close_rect: Option<Rect>,
     confirm_quit: bool,
     quit_when_menu_closes: bool,
     tasks_started: bool,
@@ -230,8 +228,6 @@ impl App {
             fullscreen: false,
             search: None,
             menu: None,
-            show_help: false,
-            help_close_rect: None,
             confirm_quit: false,
             quit_when_menu_closes,
             tasks_started: false,
@@ -334,7 +330,6 @@ impl App {
         let frame_area = frame.area();
         self.update_layout(frame_area);
         let buffer = frame.buffer_mut();
-        self.help_close_rect = None;
         self.footer_hits.clear();
 
         for index in 0..self.tasks.len() {
@@ -410,15 +405,6 @@ impl App {
             self.footer_hits = render_footer_items(&items, help_area, buffer, self.mouse_position);
         }
 
-        if self.show_help {
-            self.help_close_rect = command_help_close_rect(frame_area);
-            render_command_help(
-                frame_area,
-                buffer,
-                self.loaded.config.settings.leader.label(),
-            );
-        }
-
         if let Some(menu) = self.menu.as_mut() {
             render_menu(
                 frame_area,
@@ -485,10 +471,6 @@ impl App {
         if is_paste_key(key) {
             self.paste_clipboard_to_focus()?;
             return Ok(Action::Continue);
-        }
-
-        if self.show_help {
-            return self.handle_help_key(key);
         }
 
         let leader = self.loaded.config.settings.leader;
@@ -591,7 +573,6 @@ impl App {
             return Action::Quit;
         }
         self.confirm_quit = true;
-        self.show_help = false;
         self.search = None;
         self.notice = None;
         Action::Continue
@@ -609,21 +590,8 @@ impl App {
         Ok(Action::Continue)
     }
 
-    fn handle_help_key(&mut self, key: KeyEvent) -> Result<Action> {
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('?') => self.show_help = false,
-            KeyCode::Char('q') => return Ok(Action::Quit),
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                return Ok(Action::Quit);
-            }
-            _ => {}
-        }
-        Ok(Action::Continue)
-    }
-
     fn open_menu(&mut self, tab: MenuTab) {
         self.menu = Some(MenuState::new(self.loaded.config.clone(), tab));
-        self.show_help = false;
         self.search = None;
         self.notice = None;
         self.confirm_quit = false;
@@ -1355,7 +1323,6 @@ impl App {
         });
         self.selection = None;
         self.notice = None;
-        self.show_help = false;
         self.mode = AppMode::Search;
     }
 
@@ -1486,17 +1453,6 @@ impl App {
 
         if self.menu.is_some() {
             return self.handle_menu_mouse(mouse);
-        }
-
-        if self.show_help {
-            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-                && self
-                    .help_close_rect
-                    .is_some_and(|rect| contains(rect, mouse.column, mouse.row))
-            {
-                self.show_help = false;
-            }
-            return Ok(Action::Continue);
         }
 
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
@@ -1636,7 +1592,7 @@ impl App {
             FooterAction::CopyVisible => self.copy_focused_visible(),
             FooterAction::CopyHistory => self.copy_focused_history(),
             FooterAction::SaveHistory => self.save_focused_history()?,
-            FooterAction::ShowHelp => self.open_menu(MenuTab::Help),
+            FooterAction::ShowMenu => self.open_menu(MenuTab::Help),
             FooterAction::RestartFocused => self.request_restart(self.focus),
             FooterAction::RestartAll => self.request_restart_all(),
             FooterAction::ClearFocused => {
@@ -1655,7 +1611,6 @@ impl App {
             AppMode::Input => AppMode::Command,
             AppMode::Command | AppMode::Search => {
                 self.search = None;
-                self.show_help = false;
                 AppMode::Input
             }
         };
@@ -4159,70 +4114,6 @@ fn render_footer_items(
     hits
 }
 
-fn render_command_help(area: Rect, buffer: &mut Buffer, leader: &str) {
-    let popup = command_help_rect(area);
-    if popup.width == 0 || popup.height == 0 {
-        return;
-    }
-    Clear.render(popup, buffer);
-    let lines = vec![
-        Line::styled(
-            "Command Help",
-            Style::default()
-                .fg(THEME_GREEN)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Line::raw(""),
-        Line::raw("arrows / h j k l       Move focus"),
-        Line::raw("Tab / Shift-Tab        Cycle panes"),
-        Line::raw("f                      Toggle fullscreen pane"),
-        Line::raw("PageUp/PageDown        Scroll focused pane"),
-        Line::raw("Home/End               Jump to top/bottom of history"),
-        Line::raw("drag / right-click     Select and copy pane text"),
-        Line::raw("footer buttons         Click visible commands"),
-        Line::raw("y / Y                  Copy visible text / full scrollback"),
-        Line::raw("S                      Save full scrollback to a temp log"),
-        Line::raw("/                      Search focused pane"),
-        Line::raw("Enter / Shift-Enter    Search older / newer while searching"),
-        Line::raw("r / R                  Restart focused task / all tasks"),
-        Line::raw("c                      Clear focused pane"),
-        Line::raw("q or Ctrl-C            Quit"),
-        Line::raw(format!("{leader} or Esc          Return to input mode")),
-        Line::raw("? or Esc               Close this help"),
-    ];
-    Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(THEME_RED))
-                .style(Style::default().fg(THEME_SNOW).bg(THEME_BLACK)),
-        )
-        .wrap(Wrap { trim: false })
-        .render(popup, buffer);
-    if let Some(close) = command_help_close_rect(area) {
-        Paragraph::new(" x ")
-            .alignment(ratatui::layout::Alignment::Center)
-            .style(Style::default().fg(THEME_BLACK).bg(THEME_SNOW))
-            .render(close, buffer);
-    }
-}
-
-fn command_help_rect(area: Rect) -> Rect {
-    centered_rect(area, 74, 17)
-}
-
-fn command_help_close_rect(area: Rect) -> Option<Rect> {
-    let popup = command_help_rect(area);
-    (popup.width >= 6 && popup.height > 0).then(|| {
-        Rect::new(
-            popup.right().saturating_sub(5),
-            popup.y,
-            3.min(popup.width),
-            1,
-        )
-    })
-}
-
 fn render_quit_confirm(area: Rect, buffer: &mut Buffer) {
     let popup = centered_rect(area, 56, 7);
     if popup.width == 0 || popup.height == 0 {
@@ -4444,7 +4335,7 @@ enum FooterAction {
     CopyVisible,
     CopyHistory,
     SaveHistory,
-    ShowHelp,
+    ShowMenu,
     RestartFocused,
     RestartAll,
     ClearFocused,
@@ -4483,7 +4374,7 @@ fn command_footer_items() -> Vec<FooterItem> {
         ("R restart all", FooterAction::RestartAll),
         ("c clear", FooterAction::ClearFocused),
         ("q quit", FooterAction::Quit),
-        ("? menu", FooterAction::ShowHelp),
+        ("? menu", FooterAction::ShowMenu),
     ]
     .into_iter()
     .enumerate()
@@ -4515,7 +4406,7 @@ fn footer_action_style(action: FooterAction) -> FooterItemStyle {
         FooterAction::StartSearch | FooterAction::SearchOlder | FooterAction::SearchNewer => {
             christmas_style_for_index(1)
         }
-        FooterAction::SearchDone | FooterAction::ShowHelp | FooterAction::ClearFocused => {
+        FooterAction::SearchDone | FooterAction::ShowMenu | FooterAction::ClearFocused => {
             christmas_style_for_index(2)
         }
         FooterAction::CopyVisible | FooterAction::CopyHistory => christmas_style_for_index(3),
@@ -5074,41 +4965,7 @@ mod tests {
     }
 
     #[test]
-    fn help_overlay_stays_open_for_mouse_movement_and_closes_on_x() {
-        let mut app = test_app();
-        app.update_layout(Rect::new(0, 0, 100, 20));
-        app.mode = AppMode::Command;
-        app.show_help = true;
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 20));
-        app.help_close_rect = command_help_close_rect(Rect::new(0, 0, 100, 20));
-        render_command_help(
-            Rect::new(0, 0, 100, 20),
-            &mut buffer,
-            app.loaded.config.settings.leader.label(),
-        );
-
-        app.handle_mouse(MouseEvent {
-            kind: MouseEventKind::Moved,
-            column: 10,
-            row: 10,
-            modifiers: KeyModifiers::NONE,
-        })
-        .unwrap();
-        assert!(app.show_help);
-
-        let close = app.help_close_rect.unwrap();
-        app.handle_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: close.x,
-            row: close.y,
-            modifiers: KeyModifiers::NONE,
-        })
-        .unwrap();
-        assert!(!app.show_help);
-    }
-
-    #[test]
-    fn footer_height_wraps_long_command_help() {
+    fn footer_height_wraps_long_command_buttons() {
         let mut app = test_app();
         app.mode = AppMode::Command;
 
@@ -5120,7 +4977,7 @@ mod tests {
     fn footer_items_keep_buttons_together_when_wrapping() {
         let items = vec![
             footer_button("a one", FooterAction::ClearFocused),
-            footer_button("? menu", FooterAction::ShowHelp),
+            footer_button("? menu", FooterAction::ShowMenu),
             footer_button("q quit", FooterAction::Quit),
         ];
         let mut buffer = Buffer::empty(Rect::new(0, 0, 14, 3));
@@ -5155,7 +5012,7 @@ mod tests {
             items.iter().any(|item| item.text == " R restart all "
                 && item.action == Some(FooterAction::RestartAll))
         );
-        assert_eq!(items.last().unwrap().action, Some(FooterAction::ShowHelp));
+        assert_eq!(items.last().unwrap().action, Some(FooterAction::ShowMenu));
     }
 
     #[test]
