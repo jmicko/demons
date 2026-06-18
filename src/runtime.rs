@@ -800,6 +800,7 @@ impl App {
         match action {
             MenuAction::Tab(tab) => {
                 if let Some(menu) = self.menu.as_mut() {
+                    menu.edit = None;
                     menu.tab = tab;
                     menu.cursor = 0;
                     menu.task_detail = None;
@@ -828,6 +829,10 @@ impl App {
         let Some(menu) = self.menu.as_mut() else {
             return Action::Continue;
         };
+        if menu.edit.is_some() {
+            menu.edit = None;
+            return Action::Continue;
+        }
         if menu.dependency_task.is_some() {
             menu.dependency_task = None;
             menu.dependency_cursor = 0;
@@ -5852,6 +5857,24 @@ mod tests {
             .unwrap();
         assert_eq!(app.loaded.config.settings.leader, Leader::AltJ);
         assert!(app.menu.is_none());
+    }
+
+    #[test]
+    fn menu_tab_click_cancels_active_text_edit() {
+        let mut app = test_app();
+        app.open_menu(MenuTab::Tasks);
+        app.apply_menu_action(MenuAction::OpenTask(0)).unwrap();
+        app.apply_menu_action(MenuAction::TaskField(TaskField::Name))
+            .unwrap();
+        assert!(app.menu.as_ref().unwrap().edit.is_some());
+
+        app.apply_menu_action(MenuAction::Tab(MenuTab::Settings))
+            .unwrap();
+
+        let menu = app.menu.as_ref().unwrap();
+        assert_eq!(menu.tab, MenuTab::Settings);
+        assert!(menu.edit.is_none());
+        assert!(menu.task_detail.is_none());
     }
 
     #[test]
