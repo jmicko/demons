@@ -52,6 +52,7 @@ const THEME_RED: Color = Color::Red;
 const THEME_GREEN: Color = Color::Green;
 const THEME_SNOW: Color = Color::Gray;
 const THEME_GOLD: Color = Color::Yellow;
+const THEME_COMMAND: Color = Color::Rgb(255, 196, 0);
 const THEME_HOLLY: Color = Color::DarkGray;
 const THEME_BLACK: Color = Color::Black;
 const THEME_WHITE: Color = Color::White;
@@ -346,7 +347,7 @@ impl App {
             let focused = index == self.focus;
             let border_color = match (focused, self.mode) {
                 (true, AppMode::Input) => THEME_GREEN,
-                (true, AppMode::Command) => THEME_RED,
+                (true, AppMode::Command) => THEME_COMMAND,
                 (true, AppMode::Search) => THEME_GOLD,
                 _ => THEME_HOLLY,
             };
@@ -2185,7 +2186,7 @@ impl App {
                     footer_status("right-click copy"),
                 ],
             ),
-            AppMode::Command => ("COMMAND MODE", THEME_RED, command_footer_items()),
+            AppMode::Command => ("COMMAND MODE", THEME_COMMAND, command_footer_items()),
             AppMode::Search => ("SEARCH", THEME_GOLD, search_placeholder_footer_items()),
         }
     }
@@ -2193,7 +2194,7 @@ impl App {
     fn mode_label_color(&self) -> (&'static str, Color) {
         match self.mode {
             AppMode::Input => ("INPUT MODE", THEME_GREEN),
-            AppMode::Command => ("COMMAND MODE", THEME_RED),
+            AppMode::Command => ("COMMAND MODE", THEME_COMMAND),
             AppMode::Search => ("SEARCH", THEME_GOLD),
         }
     }
@@ -4787,6 +4788,7 @@ fn mode_hover_color(color: Color) -> Color {
         THEME_GREEN => Color::LightGreen,
         THEME_RED => Color::LightRed,
         THEME_GOLD => Color::LightYellow,
+        THEME_COMMAND => Color::LightYellow,
         _ => THEME_WHITE,
     }
 }
@@ -5383,6 +5385,14 @@ mod tests {
         assert_eq!(items[1].style.bg, THEME_RED);
         assert_eq!(items[2].style.bg, THEME_SNOW);
         assert_eq!(items[3].style.bg, THEME_RED);
+    }
+
+    #[test]
+    fn command_mode_uses_gold_mode_color() {
+        let mut app = test_app();
+        app.mode = AppMode::Command;
+
+        assert_eq!(app.mode_label_color(), ("COMMAND MODE", THEME_COMMAND));
     }
 
     #[test]
