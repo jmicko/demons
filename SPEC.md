@@ -167,7 +167,9 @@ Calculated at startup and on terminal resize.
 
 Each pane has:
 
-- A 1-line header with: task name, status icon (`●` running, `✓` exited 0, `✗` exited N, `⏸` not yet started), and a clickable `[↻]` restart button on the right.
+- A 1-line header with: task name, status icon (`●` running, `✓` exited 0,
+  `✗` exited N, `⏸` not yet started, `⏱` waiting on dependencies or delay),
+  and a clickable `[↻]` restart button on the right.
 - A scrollback buffer (default 10,000 lines; configurable in v2).
 - A pane-local text selection buffer derived from task output, used for deep
   scrollback selection and clipboard copy.
