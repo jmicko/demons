@@ -5080,6 +5080,23 @@ mod tests {
     }
 
     #[test]
+    fn mouse_movement_does_not_close_menu() {
+        let mut app = test_app();
+        app.open_menu(MenuTab::Help);
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 12,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+
+        assert!(app.menu.is_some());
+        assert_eq!(app.mouse_position, Some((12, 4)));
+    }
+
+    #[test]
     fn footer_height_wraps_long_command_buttons() {
         let mut app = test_app();
         app.mode = AppMode::Command;
