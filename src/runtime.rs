@@ -4529,15 +4529,89 @@ fn render_selection(
     let Some(selection) = selection else {
         return;
     };
+    if selection.history_backed
+        && task.scroll_offset == 0
+        && render_live_history_selection(selection, task, area, buffer)
+    {
+        return;
+    }
+    render_history_selection(selection, task, area, buffer);
+}
+
+fn render_history_selection(
+    selection: &Selection,
+    task: &TaskRuntime,
+    area: Rect,
+    buffer: &mut Buffer,
+) {
     for row in 0..area.height {
         let line = task.history_index_for_visible_row(row, area.height);
         let Some((start, end)) = selection.columns_for_line(line, area.width) else {
             continue;
         };
-        for column in start..end {
-            buffer[(area.x + column, area.y + row)]
-                .set_style(Style::default().fg(Color::Black).bg(Color::White));
+        paint_selection_row(area, buffer, row, start, end);
+    }
+}
+
+fn render_live_history_selection(
+    selection: &Selection,
+    task: &TaskRuntime,
+    area: Rect,
+    buffer: &mut Buffer,
+) -> bool {
+    let (start, end) = selection.ordered_points();
+    if start.line != end.line || area.width == 0 {
+        return false;
+    }
+
+    let Some(line) = task.history.line(start.line) else {
+        return false;
+    };
+    let expected = slice_chars(&line.text, 0, usize::from(area.width));
+    let expected = expected.trim_end();
+    if expected.is_empty() {
+        return false;
+    }
+
+    for row in 0..area.height {
+        if screen_row_text(&task.parser, row, area.width).trim_end() == expected {
+            let start_column = start.column.min(area.width);
+            let end_column = end.column.saturating_add(1).min(area.width);
+            if start_column < end_column {
+                paint_selection_row(area, buffer, row, start_column, end_column);
+                return true;
+            }
         }
+    }
+
+    false
+}
+
+fn screen_row_text(parser: &Parser, row: u16, width: u16) -> String {
+    let screen = parser.screen();
+    let mut text = String::new();
+    for column in 0..width {
+        let Some(cell) = screen.cell(row, column) else {
+            text.push(' ');
+            continue;
+        };
+        if cell.is_wide_continuation() {
+            continue;
+        }
+        let contents = cell.contents();
+        if contents.is_empty() {
+            text.push(' ');
+        } else {
+            text.push_str(&contents);
+        }
+    }
+    text
+}
+
+fn paint_selection_row(area: Rect, buffer: &mut Buffer, row: u16, start: u16, end: u16) {
+    for column in start..end {
+        buffer[(area.x + column, area.y + row)]
+            .set_style(Style::default().fg(Color::Black).bg(Color::White));
     }
 }
 
@@ -6219,6 +6293,53 @@ mod tests {
 
         assert_eq!(app.tasks[0].scroll_offset, 0);
         assert_eq!(app.selected_text().unwrap(), "http://localhostXY");
+    }
+
+    #[test]
+    fn search_selection_tracks_live_screen_after_cursor_movement() {
+        let mut app = test_app();
+        app.update_layout(Rect::new(0, 0, 100, 20));
+        app.mode = AppMode::Command;
+        app.focus = 1;
+        app.tasks[1].process_output(
+            format!(
+                "{}\x1b[30A  Network: http://localhost:5173/\n",
+                "\n".repeat(30)
+            )
+            .as_bytes(),
+        );
+
+        app.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE))
+            .unwrap();
+        for character in "Network".chars() {
+            app.handle_key(key(KeyCode::Char(character), KeyModifiers::NONE))
+                .unwrap();
+        }
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        let area = app.content_rects[1];
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 20));
+        render_screen(&app.tasks[1].parser, area, &mut buffer);
+        render_selection(app.selection.as_ref(), &app.tasks[1], area, &mut buffer);
+
+        let screen_row = (0..area.height)
+            .find(|row| screen_row_text(&app.tasks[1].parser, *row, area.width).contains("Network"))
+            .unwrap();
+        let selection = app.selection.as_ref().unwrap();
+        let history_row = selection
+            .anchor
+            .line
+            .saturating_sub(
+                app.tasks[1]
+                    .history
+                    .visible_start(area.height, app.tasks[1].scroll_offset),
+            )
+            .min(u64::from(area.height.saturating_sub(1))) as u16;
+
+        assert_ne!(screen_row, history_row);
+        assert_eq!(buffer[(area.x, area.y + screen_row)].bg, Color::White);
+        assert_ne!(buffer[(area.x, area.y + history_row)].bg, Color::White);
     }
 
     #[test]
