@@ -1,6 +1,5 @@
 mod cli;
 mod config;
-#[allow(dead_code)]
 mod init;
 mod layout;
 mod runtime;
