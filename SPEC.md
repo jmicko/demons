@@ -52,7 +52,7 @@ Demons is intentionally minimal: it is **not** a session manager, a process supe
 # based on terminal aspect ratio. v2 may add "tabs".
 layout = "grid"
 # Leader key to toggle command mode.
-# Options: "alt-j" (default), "alt-backtick", "tab", "ctrl-b", "ctrl-q", "ctrl-\".
+# Options: "alt-j" (default), "alt-backtick", "tab", "ctrl-b", "ctrl-q", "ctrl-\\".
 leader = "alt-j"
 # Reserved for v2. It must remain false in v1.
 logging = false
