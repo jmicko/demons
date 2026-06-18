@@ -39,7 +39,8 @@ The binary will be at `target/release/demons`.
 
 ## Quick Start
 
-Run the interactive setup from a project root:
+Run the interactive setup from a project root, or from a subdirectory of a
+project that already has a `demons.toml`:
 
 ```sh
 demons init
@@ -48,7 +49,8 @@ demons init
 The wizard uses numbered choices for fixed options and supports normal line
 editing keys while entering text. It also offers starter tasks when it detects
 common project files such as `Cargo.toml`, package scripts in `package.json`,
-or `Makefile`.
+or `Makefile`. When an existing config is found in the current directory or a
+parent directory, `demons init` can edit it in place.
 
 Or create `demons.toml` yourself:
 

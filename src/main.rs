@@ -34,7 +34,7 @@ fn try_main() -> Result<()> {
     let cwd = env::current_dir().context("failed to determine current directory")?;
 
     if matches!(cli.command, Some(Command::Init)) {
-        let path = init_path(cli.config, &cwd);
+        let path = init_path(cli.config, &cwd)?;
         let result = init::run(path)?;
         if result.start {
             runtime::run(LoadedConfig::load(result.path)?)?;
@@ -76,10 +76,45 @@ fn try_main() -> Result<()> {
     runtime::run(loaded)
 }
 
-fn init_path(explicit: Option<PathBuf>, cwd: &std::path::Path) -> PathBuf {
-    match explicit {
-        Some(path) if path.is_absolute() => path,
-        Some(path) => cwd.join(path),
-        None => cwd.join(CONFIG_FILE),
+fn init_path(explicit: Option<PathBuf>, cwd: &std::path::Path) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        return Ok(if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        });
+    }
+
+    Ok(explicit_or_discover(None, cwd)?.unwrap_or_else(|| cwd.join(CONFIG_FILE)))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    fn init_path_uses_nearest_existing_config_without_explicit_path() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        let nested = root.join("app/src");
+        fs::create_dir_all(&nested).unwrap();
+        let config = root.join(CONFIG_FILE);
+        fs::write(&config, "").unwrap();
+
+        assert_eq!(init_path(None, &nested).unwrap(), config);
+    }
+
+    #[test]
+    fn init_path_creates_in_current_directory_when_no_config_exists() {
+        let temp = tempdir().unwrap();
+
+        assert_eq!(
+            init_path(None, temp.path()).unwrap(),
+            temp.path().join(CONFIG_FILE)
+        );
     }
 }

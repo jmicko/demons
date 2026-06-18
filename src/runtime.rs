@@ -2849,18 +2849,22 @@ fn footer_status(label: impl Into<String>) -> FooterItem {
 }
 
 fn command_footer_items() -> Vec<FooterItem> {
-    vec![
-        footer_button("f fullscreen", FooterAction::ToggleFullscreen),
-        footer_button("/ search", FooterAction::StartSearch),
-        footer_button("y copy", FooterAction::CopyVisible),
-        footer_button("Y copy all", FooterAction::CopyHistory),
-        footer_button("S save", FooterAction::SaveHistory),
-        footer_button("r restart", FooterAction::RestartFocused),
-        footer_button("R restart all", FooterAction::RestartAll),
-        footer_button("c clear", FooterAction::ClearFocused),
-        footer_button("q quit", FooterAction::Quit),
-        footer_button("? help", FooterAction::ShowHelp),
+    [
+        ("f fullscreen", FooterAction::ToggleFullscreen),
+        ("/ search", FooterAction::StartSearch),
+        ("y copy", FooterAction::CopyVisible),
+        ("Y copy all", FooterAction::CopyHistory),
+        ("S save", FooterAction::SaveHistory),
+        ("r restart", FooterAction::RestartFocused),
+        ("R restart all", FooterAction::RestartAll),
+        ("c clear", FooterAction::ClearFocused),
+        ("q quit", FooterAction::Quit),
+        ("? help", FooterAction::ShowHelp),
     ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, (label, action))| footer_command_button(label, action, index))
+    .collect()
 }
 
 fn search_footer_items(search: &SearchState) -> Vec<FooterItem> {
@@ -2911,6 +2915,19 @@ fn footer_action_style(action: FooterAction) -> FooterItemStyle {
         }
         FooterAction::Quit => footer_style(Color::White, Color::Red, Color::Black, Color::LightRed),
     }
+}
+
+fn footer_command_button(
+    label: impl Into<String>,
+    action: FooterAction,
+    index: usize,
+) -> FooterItem {
+    let style = if index % 2 == 0 {
+        footer_style(Color::Black, Color::Gray, Color::Black, Color::White)
+    } else {
+        footer_style(Color::Black, Color::Red, Color::Black, Color::LightRed)
+    };
+    FooterItem::new(format!(" {} ", label.into()), Some(action), style)
 }
 
 fn footer_style(fg: Color, bg: Color, hover_fg: Color, hover_bg: Color) -> FooterItemStyle {

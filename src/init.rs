@@ -188,7 +188,7 @@ fn edit_config(
     for (index, task) in config.tasks.iter().enumerate() {
         tasks.push(prompt_task(input, output, Some(task), index + 1)?);
     }
-    while prompt_yes_no_with(input, output, "Add a new task?", true)? {
+    while prompt_yes_no_with(input, output, "Add a new task?", false)? {
         let number = tasks.len() + 1;
         let detected = detected_task_templates(root)
             .into_iter()
@@ -866,6 +866,40 @@ mod tests {
             config.tasks[1].command,
             TaskCommand::Shell(ref command) if command == "npm run dev"
         ));
+    }
+
+    #[test]
+    fn edit_existing_config_preserves_multiple_tasks_by_default() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join(crate::config::CONFIG_FILE);
+        fs::write(
+            &path,
+            r#"
+                [[task]]
+                name = "backend"
+                command = "cargo run"
+
+                [[task]]
+                name = "frontend"
+                command = "npm run dev"
+            "#,
+        )
+        .unwrap();
+        let answers =
+            ["", "", "", "", "", "", "", "", "", "", "", "", "", "", "n"].join("\n") + "\n";
+        let mut input = Cursor::new(answers.into_bytes());
+        let mut output = Vec::new();
+
+        let result = run_with_io(path.clone(), &mut input, &mut output).unwrap();
+
+        assert!(!result.start);
+        let config = parse_file(&path).unwrap();
+        assert_eq!(config.tasks.len(), 2);
+        assert_eq!(config.tasks[0].name, "backend");
+        assert_eq!(config.tasks[1].name, "frontend");
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("Task 1:"));
+        assert!(output.contains("Task 2:"));
     }
 
     #[test]
