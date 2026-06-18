@@ -350,7 +350,7 @@ impl App {
                 (true, AppMode::Search) => THEME_GOLD,
                 _ => THEME_HOLLY,
             };
-            let (status, status_color) = self.tasks[index].status_label(now);
+            let (status, status_color) = self.tasks[index].status_label();
             let title = Line::from(vec![
                 Span::raw(" "),
                 Span::styled(status, Style::default().fg(status_color)),
@@ -378,6 +378,7 @@ impl App {
             } else {
                 render_history(&self.tasks[index], content, buffer);
             }
+            render_waiting_countdown(&self.tasks[index], content, now, buffer);
             render_selection(
                 self.selection
                     .as_ref()
@@ -2771,19 +2772,10 @@ impl TaskRuntime {
         ));
     }
 
-    fn status_label(&self, now: Instant) -> (String, Color) {
+    fn status_label(&self) -> (String, Color) {
         match &self.status {
             TaskStatus::NotStarted => ("⏸".to_owned(), THEME_HOLLY),
-            TaskStatus::Waiting => {
-                if let Some(deadline) = self.pending_start {
-                    (
-                        format!("⏱ {}s", countdown_seconds(deadline, now)),
-                        THEME_GOLD,
-                    )
-                } else {
-                    ("⏱".to_owned(), THEME_GOLD)
-                }
-            }
+            TaskStatus::Waiting => ("⏱".to_owned(), THEME_GOLD),
             TaskStatus::Starting => ("…".to_owned(), THEME_GOLD),
             TaskStatus::Running => ("●".to_owned(), THEME_GREEN),
             TaskStatus::Restarting => ("↻".to_owned(), THEME_GOLD),
@@ -4184,6 +4176,31 @@ fn render_screen(parser: &Parser, area: Rect, buffer: &mut Buffer) {
                 .set_style(cell_style(source));
         }
     }
+}
+
+fn render_waiting_countdown(task: &TaskRuntime, area: Rect, now: Instant, buffer: &mut Buffer) {
+    let Some(deadline) = task.pending_start else {
+        return;
+    };
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let seconds = countdown_seconds(deadline, now);
+    let text = if seconds == 0 {
+        "[demons] starting...".to_owned()
+    } else {
+        format!("[demons] starting in {seconds}s...")
+    };
+    let width = char_count(&text).min(usize::from(area.width)) as u16;
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height / 2;
+    render_text(
+        buffer,
+        Rect::new(x, y, width, 1),
+        &text,
+        Style::default().fg(THEME_GOLD),
+    );
 }
 
 fn render_selection(
@@ -5955,21 +5972,27 @@ mod tests {
     }
 
     #[test]
-    fn waiting_status_label_counts_down_to_start() {
+    fn waiting_status_label_uses_icon() {
         let now = Instant::now();
         let mut task = TaskRuntime::new(test_task("web"), PathBuf::from("."));
         task.status = TaskStatus::Waiting;
         task.pending_start = Some(now + Duration::from_millis(3200));
 
-        assert_eq!(task.status_label(now).0, "⏱ 4s");
-        assert_eq!(
-            task.status_label(now + Duration::from_millis(1200)).0,
-            "⏱ 2s"
-        );
-        assert_eq!(
-            task.status_label(now + Duration::from_millis(2600)).0,
-            "⏱ 1s"
-        );
+        assert_eq!(task.status_label().0, "⏱");
+    }
+
+    #[test]
+    fn waiting_countdown_renders_in_pane_body() {
+        let now = Instant::now();
+        let mut task = TaskRuntime::new(test_task("web"), PathBuf::from("."));
+        task.status = TaskStatus::Waiting;
+        task.pending_start = Some(now + Duration::from_millis(3200));
+        let area = Rect::new(0, 0, 40, 5);
+        let mut buffer = Buffer::empty(area);
+
+        render_waiting_countdown(&task, area, now, &mut buffer);
+
+        assert!(buffer_line(&buffer, 2, 40).contains("[demons] starting in 4s..."));
     }
 
     #[test]
@@ -6196,5 +6219,13 @@ mod tests {
         };
         let (tx, rx) = mpsc::sync_channel(8);
         App::new(loaded, tx, rx, Arc::new(Mutex::new(HashSet::new())), false)
+    }
+
+    fn buffer_line(buffer: &Buffer, row: u16, width: u16) -> String {
+        let mut line = String::new();
+        for column in 0..width {
+            line.push_str(buffer[(column, row)].symbol());
+        }
+        line
     }
 }

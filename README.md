@@ -181,7 +181,7 @@ env = { RUST_LOG = "debug" }
 Tasks can depend on other tasks. A dependent task starts only after all of its
 dependencies have started, then waits its own optional `start_delay`. Restarting
 a task also restarts its dependents. While a task is waiting for a delayed
-start, its pane header shows the countdown to launch.
+start, the pane body shows the countdown to launch.
 
 ```toml
 [[task]]

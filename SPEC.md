@@ -250,8 +250,8 @@ For each task:
 - Manual restart (`r` or click `[↻]`): kill the process group and any dependent
   task process groups, wait for exits, then respawn them in dependency order.
   Each dependent's `start_delay` starts after its dependencies have started.
-- While a task is waiting on `start_delay`, the pane status shows a countdown
-  to launch.
+- While a task is waiting on `start_delay`, the pane body shows a countdown to
+  launch.
 - v2: file-watch-driven restart, `run_on_change`, and `repeat` — schema reserved.
 - On demons quit: send SIGTERM to every process group, wait 2s, send SIGKILL to any that are still alive. Exit only when all children are reaped.
 - External `SIGINT`, `SIGTERM`, and `SIGHUP` signals trigger the same graceful
