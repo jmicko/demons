@@ -52,7 +52,7 @@ const THEME_RED: Color = Color::Red;
 const THEME_GREEN: Color = Color::Green;
 const THEME_SNOW: Color = Color::Gray;
 const THEME_GOLD: Color = Color::Yellow;
-const THEME_COMMAND: Color = Color::Rgb(255, 196, 0);
+const THEME_COMMAND: Color = THEME_GOLD;
 const THEME_HOLLY: Color = Color::DarkGray;
 const THEME_BLACK: Color = Color::Black;
 const THEME_WHITE: Color = Color::White;
@@ -4788,7 +4788,6 @@ fn mode_hover_color(color: Color) -> Color {
         THEME_GREEN => Color::LightGreen,
         THEME_RED => Color::LightRed,
         THEME_GOLD => Color::LightYellow,
-        THEME_COMMAND => Color::LightYellow,
         _ => THEME_WHITE,
     }
 }
