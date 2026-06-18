@@ -2176,8 +2176,9 @@ impl App {
         if self.stopping {
             return;
         }
+        let indexes = self.restart_order(indexes);
         let now = Instant::now();
-        for &index in indexes {
+        for &index in &indexes {
             if index >= self.tasks.len() {
                 continue;
             }
@@ -2202,6 +2203,44 @@ impl App {
             }
         }
         self.tick_dependency_starts(now);
+    }
+
+    fn restart_order(&self, indexes: &[usize]) -> Vec<usize> {
+        let mut requested = vec![false; self.tasks.len()];
+        for &index in indexes {
+            if index < requested.len() {
+                requested[index] = true;
+            }
+        }
+
+        let mut seen = vec![false; self.tasks.len()];
+        let mut visiting = vec![false; self.tasks.len()];
+        let mut ordered = Vec::new();
+        for &index in indexes {
+            self.collect_restart_order(index, &requested, &mut seen, &mut visiting, &mut ordered);
+        }
+        ordered
+    }
+
+    fn collect_restart_order(
+        &self,
+        index: usize,
+        requested: &[bool],
+        seen: &mut [bool],
+        visiting: &mut [bool],
+        ordered: &mut Vec<usize>,
+    ) {
+        if index >= requested.len() || !requested[index] || seen[index] || visiting[index] {
+            return;
+        }
+
+        visiting[index] = true;
+        for &dependency in self.dependency_indexes.get(index).into_iter().flatten() {
+            self.collect_restart_order(dependency, requested, seen, visiting, ordered);
+        }
+        visiting[index] = false;
+        seen[index] = true;
+        ordered.push(index);
     }
 
     fn restart_closure(&self, index: usize) -> Vec<usize> {
@@ -5811,6 +5850,18 @@ mod tests {
         let (dependencies, dependents) = dependency_graph(&[server, web]);
         assert_eq!(dependencies[0], vec![1]);
         assert_eq!(dependents[1], vec![0]);
+    }
+
+    #[test]
+    fn restart_order_starts_dependencies_before_dependents() {
+        let mut web = test_task("web");
+        web.depends_on = vec!["server".to_owned()];
+        let server = test_task("server");
+        let app = test_app_with_tasks(vec![web, server]);
+
+        assert_eq!(app.restart_order(&[0, 1]), vec![1, 0]);
+        assert_eq!(app.restart_order(&[0]), vec![0]);
+        assert_eq!(app.restart_closure(1), vec![1, 0]);
     }
 
     #[test]
