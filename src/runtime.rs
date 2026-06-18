@@ -208,7 +208,7 @@ impl App {
             loaded,
             tasks,
             focus: 0,
-            mode: AppMode::Input,
+            mode: AppMode::Command,
             grid: Grid {
                 columns: 1,
                 rows: 1,
@@ -522,7 +522,6 @@ impl App {
 
         match key.code {
             KeyCode::Esc if self.selection.is_some() => self.selection = None,
-            KeyCode::Esc => self.mode = AppMode::Input,
             KeyCode::Tab => self.cycle_focus(1),
             KeyCode::BackTab => self.cycle_focus(-1),
             KeyCode::Left | KeyCode::Char('h') => self.move_focus(Direction::Left),
@@ -622,6 +621,9 @@ impl App {
         {
             return self.handle_menu_dependency_key(key);
         }
+        if self.menu.as_ref().is_some_and(|menu| menu.leader_picker) {
+            return self.handle_menu_leader_key(key);
+        }
 
         match key.code {
             KeyCode::Esc => return Ok(self.menu_back_or_close()),
@@ -653,6 +655,25 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => self.move_menu_dependency_cursor(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_menu_dependency_cursor(1),
             KeyCode::Enter | KeyCode::Char(' ') => self.toggle_selected_dependency(),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Ok(self.request_quit());
+            }
+            _ => {}
+        }
+        Ok(Action::Continue)
+    }
+
+    fn handle_menu_leader_key(&mut self, key: KeyEvent) -> Result<Action> {
+        match key.code {
+            KeyCode::Esc => {
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.leader_picker = false;
+                    menu.leader_cursor = 0;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.move_menu_leader_cursor(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_menu_leader_cursor(1),
+            KeyCode::Enter | KeyCode::Char(' ') => self.select_menu_leader(),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 return Ok(self.request_quit());
             }
@@ -776,6 +797,24 @@ impl App {
         }
     }
 
+    fn move_menu_leader_cursor(&mut self, delta: isize) {
+        let count = all_leaders().len();
+        if let Some(menu) = self.menu.as_mut() {
+            menu.leader_cursor =
+                (menu.leader_cursor as isize + delta).rem_euclid(count as isize) as usize;
+        }
+    }
+
+    fn select_menu_leader(&mut self) {
+        let Some(index) = self.menu.as_ref().map(|menu| menu.leader_cursor) else {
+            return;
+        };
+        let Some(&leader) = all_leaders().get(index) else {
+            return;
+        };
+        self.set_menu_leader(leader);
+    }
+
     fn activate_selected_menu_item(&mut self) -> Result<Action> {
         let Some(action) = self.selected_menu_action() else {
             return Ok(Action::Continue);
@@ -800,7 +839,7 @@ impl App {
                     Some(MenuAction::AddTask)
                 }
             }
-            MenuTab::Settings => Some(MenuAction::CycleLeader),
+            MenuTab::Settings => Some(MenuAction::OpenLeaderPicker),
             MenuTab::Exit => exit_actions(self.quit_when_menu_closes || !self.tasks_started)
                 .get(menu.cursor)
                 .copied()
@@ -817,6 +856,7 @@ impl App {
                     menu.cursor = 0;
                     menu.task_detail = None;
                     menu.dependency_task = None;
+                    menu.leader_picker = false;
                 }
             }
             MenuAction::Close => return Ok(self.menu_back_or_close()),
@@ -832,7 +872,8 @@ impl App {
             MenuAction::AddTask => self.add_menu_task(),
             MenuAction::TaskField(field) => self.activate_task_field(field),
             MenuAction::ToggleDependency(candidate) => self.toggle_dependency(candidate),
-            MenuAction::CycleLeader => self.cycle_menu_leader(),
+            MenuAction::OpenLeaderPicker => self.open_menu_leader_picker(),
+            MenuAction::SelectLeader(leader) => self.set_menu_leader(leader),
             MenuAction::Exit(action) => return self.handle_menu_exit_action(action),
         }
         Ok(Action::Continue)
@@ -849,6 +890,11 @@ impl App {
         if menu.dependency_task.is_some() {
             menu.dependency_task = None;
             menu.dependency_cursor = 0;
+            return Action::Continue;
+        }
+        if menu.leader_picker {
+            menu.leader_picker = false;
+            menu.leader_cursor = 0;
             return Action::Continue;
         }
         if menu.task_detail.is_some() {
@@ -1086,19 +1132,25 @@ impl App {
         }
     }
 
-    fn cycle_menu_leader(&mut self) {
+    fn open_menu_leader_picker(&mut self) {
         let Some(menu) = self.menu.as_mut() else {
             return;
         };
         let leaders = all_leaders();
         let current = menu.draft.settings.leader;
-        let index = leaders
+        menu.leader_cursor = leaders
             .iter()
             .position(|leader| *leader == current)
             .unwrap_or(0);
-        let next = leaders[(index + 1) % leaders.len()];
-        menu.draft.settings.leader = next;
-        self.loaded.config.settings.leader = next;
+        menu.leader_picker = true;
+    }
+
+    fn set_menu_leader(&mut self, leader: Leader) {
+        if let Some(menu) = self.menu.as_mut() {
+            menu.draft.settings.leader = leader;
+            menu.leader_picker = false;
+        }
+        self.loaded.config.settings.leader = leader;
     }
 
     fn handle_menu_exit_action(&mut self, action: MenuExitAction) -> Result<Action> {
@@ -1622,6 +1674,8 @@ impl App {
                     .is_some_and(|menu| menu.dependency_task.is_some())
                 {
                     self.move_menu_dependency_cursor(-1);
+                } else if self.menu.as_ref().is_some_and(|menu| menu.leader_picker) {
+                    self.move_menu_leader_cursor(-1);
                 } else {
                     self.move_menu_cursor(-1);
                 }
@@ -1634,6 +1688,8 @@ impl App {
                     .is_some_and(|menu| menu.dependency_task.is_some())
                 {
                     self.move_menu_dependency_cursor(1);
+                } else if self.menu.as_ref().is_some_and(|menu| menu.leader_picker) {
+                    self.move_menu_leader_cursor(1);
                 } else {
                     self.move_menu_cursor(1);
                 }
@@ -2475,7 +2531,7 @@ impl App {
                     task.write_input(b"\x1b")?;
                 }
             }
-            AppMode::Command => self.mode = AppMode::Input,
+            AppMode::Command => {}
             AppMode::Search => self.cancel_search(),
         }
         Ok(())
@@ -3241,6 +3297,8 @@ struct MenuState {
     task_detail: Option<usize>,
     dependency_task: Option<usize>,
     dependency_cursor: usize,
+    leader_picker: bool,
+    leader_cursor: usize,
     edit: Option<MenuEdit>,
     draft: crate::config::Config,
     original: crate::config::Config,
@@ -3256,6 +3314,8 @@ impl MenuState {
             task_detail: None,
             dependency_task: None,
             dependency_cursor: 0,
+            leader_picker: false,
+            leader_cursor: 0,
             edit: None,
             draft: config.clone(),
             original: config,
@@ -3337,7 +3397,8 @@ enum MenuAction {
     AddTask,
     TaskField(TaskField),
     ToggleDependency(usize),
-    CycleLeader,
+    OpenLeaderPicker,
+    SelectLeader(Leader),
     Exit(MenuExitAction),
 }
 
@@ -3659,6 +3720,10 @@ fn render_menu(
         render_menu_dependencies(body, buffer, menu, task, hover_position);
         return;
     }
+    if menu.leader_picker {
+        render_menu_leaders(body, buffer, menu, hover_position);
+        return;
+    }
 
     match menu.tab {
         MenuTab::Help => render_menu_help(body, buffer, leader),
@@ -3693,7 +3758,7 @@ fn render_menu_help(area: Rect, buffer: &mut Buffer, leader: &str) {
         "c                      Clear focused pane".to_owned(),
         "?                      Open this menu".to_owned(),
         "q or Ctrl-C            Close Demons with confirmation".to_owned(),
-        format!("{leader} or Esc          Return to input mode outside the menu"),
+        format!("{leader}                 Return to input mode outside the menu"),
         "".to_owned(),
         "Menu".to_owned(),
         "arrows / wheel         Move through visible options".to_owned(),
@@ -3884,10 +3949,47 @@ fn render_menu_settings(
         Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
         &format!("Leader key: {}", menu.draft.settings.leader.label()),
         menu.cursor == 0,
-        Some(MenuAction::CycleLeader),
+        Some(MenuAction::OpenLeaderPicker),
         &mut menu.hits,
         hover_position,
     );
+}
+
+fn render_menu_leaders(
+    area: Rect,
+    buffer: &mut Buffer,
+    menu: &mut MenuState,
+    hover_position: Option<(u16, u16)>,
+) {
+    render_text(
+        buffer,
+        Rect::new(area.x, area.y, area.width, 1),
+        "Leader key",
+        Style::default()
+            .fg(THEME_GREEN)
+            .bg(THEME_BLACK)
+            .add_modifier(Modifier::BOLD),
+    );
+    let leaders = all_leaders();
+    let rows = area.height.saturating_sub(1);
+    let start = scroll_start(menu.leader_cursor, leaders.len(), usize::from(rows));
+    for row in 0..rows {
+        let index = start + usize::from(row);
+        let Some(&leader) = leaders.get(index) else {
+            break;
+        };
+        let selected = leader == menu.draft.settings.leader;
+        let text = format!("[{}] {}", if selected { "x" } else { " " }, leader.label());
+        render_menu_row(
+            buffer,
+            Rect::new(area.x, area.y + row + 1, area.width, 1),
+            &text,
+            index == menu.leader_cursor,
+            Some(MenuAction::SelectLeader(leader)),
+            &mut menu.hits,
+            hover_position,
+        );
+    }
 }
 
 fn render_menu_exit(
@@ -5171,6 +5273,7 @@ mod tests {
     #[test]
     fn recognizes_legacy_escape_encoded_alt_j() {
         let mut app = test_app();
+        app.mode = AppMode::Input;
 
         app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
             .unwrap();
@@ -5184,6 +5287,7 @@ mod tests {
     #[test]
     fn recognizes_legacy_escape_encoded_alt_backtick() {
         let mut app = test_app();
+        app.mode = AppMode::Input;
         app.loaded.config.settings.leader = Leader::AltBacktick;
 
         app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
@@ -5282,6 +5386,24 @@ mod tests {
         .unwrap();
 
         assert_eq!(app.mode, AppMode::Input);
+    }
+
+    #[test]
+    fn starts_in_command_mode() {
+        let app = test_app();
+
+        assert_eq!(app.mode, AppMode::Command);
+    }
+
+    #[test]
+    fn esc_does_not_leave_command_mode() {
+        let mut app = test_app();
+        app.loaded.config.settings.leader = Leader::CtrlB;
+
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(app.mode, AppMode::Command);
     }
 
     #[test]
@@ -5409,6 +5531,7 @@ mod tests {
     #[test]
     fn fullscreen_layout_only_resizes_focused_pane() {
         let mut app = test_app();
+        app.mode = AppMode::Input;
         app.update_layout(Rect::new(0, 0, 100, 20));
         let hidden_size = app.tasks[0].pty_size;
         app.focus = 1;
@@ -5511,6 +5634,7 @@ mod tests {
     #[test]
     fn footer_copy_buttons_click_visible_and_full_history_actions() {
         let mut app = test_app();
+        app.mode = AppMode::Input;
         app.update_layout(Rect::new(0, 0, 100, 8));
         app.mode = AppMode::Command;
         for line in 0..20 {
@@ -5798,6 +5922,7 @@ mod tests {
     #[test]
     fn command_mode_y_copies_scrolled_history_window() {
         let mut app = test_app();
+        app.mode = AppMode::Input;
         app.update_layout(Rect::new(0, 0, 100, 8));
         app.mode = AppMode::Command;
         for line in 0..20 {
@@ -6045,6 +6170,7 @@ mod tests {
     #[test]
     fn plain_child_mouse_click_clears_existing_selection() {
         let mut app = test_app();
+        app.mode = AppMode::Input;
         app.update_layout(Rect::new(0, 0, 100, 20));
         app.tasks[0].parser.process(b"\x1b[?1000h");
         app.selection = Some(Selection {
@@ -6350,13 +6476,36 @@ mod tests {
         let mut app = test_app();
         app.open_menu(MenuTab::Settings);
 
-        app.apply_menu_action(MenuAction::CycleLeader).unwrap();
+        app.apply_menu_action(MenuAction::OpenLeaderPicker).unwrap();
+        app.apply_menu_action(MenuAction::SelectLeader(Leader::AltBacktick))
+            .unwrap();
         assert_eq!(app.loaded.config.settings.leader, Leader::AltBacktick);
+        assert!(!app.menu.as_ref().unwrap().leader_picker);
 
         app.handle_menu_exit_action(MenuExitAction::Discard)
             .unwrap();
         assert_eq!(app.loaded.config.settings.leader, Leader::AltJ);
         assert!(app.menu.is_none());
+    }
+
+    #[test]
+    fn settings_leader_picker_selects_with_keyboard() {
+        let mut app = test_app();
+        app.open_menu(MenuTab::Settings);
+
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.menu.as_ref().unwrap().leader_picker);
+
+        app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        let menu = app.menu.as_ref().unwrap();
+        assert_eq!(menu.draft.settings.leader, Leader::AltBacktick);
+        assert_eq!(app.loaded.config.settings.leader, Leader::AltBacktick);
+        assert!(!menu.leader_picker);
     }
 
     #[test]

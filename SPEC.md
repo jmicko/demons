@@ -189,7 +189,7 @@ Each pane has:
 
 The configured leader key (default `Alt+J`) toggles between two modes.
 
-**Input mode** (default after startup):
+**Input mode**:
 
 - Keyboard input goes to the selected pane.
 - Mouse scroll: scrolls the pane under the pointer.
@@ -211,7 +211,7 @@ The configured leader key (default `Alt+J`) toggles between two modes.
   forwarded to that child.
 - Press the leader or click the footer mode button → enter command mode.
 
-**Command mode**:
+**Command mode** (default after startup):
 
 - Keyboard is captured by demons.
 - `Tab` / `Shift+Tab`: cycle panes, except that `Tab` toggles modes when it is
@@ -233,8 +233,7 @@ The configured leader key (default `Alt+J`) toggles between two modes.
 - `?`: open the menu.
 - `q` or `Ctrl+C`: show quit confirmation. Press `q` or `Ctrl+C` again to
   quit (sends SIGTERM, waits 2s, then SIGKILL) or `Esc` to cancel.
-- Press the leader, click the footer mode button, or press `Esc` → return to
-  input mode.
+- Press the leader or click the footer mode button → return to input mode.
 - Clicking a pane selects it without leaving command mode.
 - Clicking a command footer button runs that button's visible action.
 

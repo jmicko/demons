@@ -83,9 +83,9 @@ Demons has two modes:
 * **Input mode**: keyboard and child mouse input goes to the selected task.
 * **Command mode**: keyboard input controls Demons.
 
-Demons starts in input mode. Press `Alt+J` or click the fixed mode button at
-the left of the footer to switch modes. Clicking a pane selects it without
-changing modes.
+Demons starts in command mode. Press `Alt+J` or click the fixed mode button at
+the left of the footer to switch between command mode and input mode. Clicking
+a pane selects it without changing modes.
 
 | Key | Command mode |
 | --- | --- |
@@ -103,7 +103,7 @@ changing modes.
 | `c` | Clear the focused pane and its scrollback |
 | `?` | Open the menu |
 | `q` or `Ctrl+C` | Ask to close Demons |
-| Leader or `Esc` | Return to input mode |
+| Leader | Return to input mode |
 
 Click a pane to focus it. Click `[↻]` in a pane header to restart that task.
 The mouse wheel scrolls pane history unless the child application has enabled
@@ -133,9 +133,9 @@ same close confirmation.
 
 Because the leader is intercepted, it cannot be sent to a child while in input
 mode. Set a different leader if an application or window manager needs
-`Alt+J`. The Settings tab can cycle the leader at runtime, and the Exit tab can
-save or discard that change. `Alt+Backtick` is available for one-hand use, but
-some desktops use it for window switching, so it is not the default.
+`Alt+J`. The Settings tab can change the leader at runtime, and the Exit tab
+can save or discard that change. `Alt+Backtick` is available for one-hand use,
+but some desktops use it for window switching, so it is not the default.
 
 ```toml
 [settings]
