@@ -178,8 +178,9 @@ Each pane has:
 - A scrollback buffer (default 10,000 lines; configurable in v2).
 - A pane-local text selection buffer derived from task output, used for deep
   scrollback selection and clipboard copy.
-- Mouse selection supports drag selection, double-click word selection, and
-  triple-click visible-line selection within one pane at a time.
+- Mouse selection supports drag selection, double-click word selection with
+  word-granularity dragging, and triple-click visible-line selection with
+  line-granularity dragging within one pane at a time.
 - A PTY-backed child process.
 - Visible focus state: the selected pane's border is green in input mode, red
   in command mode, and yellow in search mode.

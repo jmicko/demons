@@ -1590,6 +1590,8 @@ impl App {
                 line,
                 column: end_column,
             },
+            granularity: SelectionGranularity::Character,
+            origin: None,
             history_backed: true,
             dragging: false,
             dragged: true,
@@ -1914,6 +1916,8 @@ impl App {
             pane: index,
             anchor: point,
             cursor: point,
+            granularity: SelectionGranularity::Character,
+            origin: None,
             history_backed: false,
             dragging: true,
             dragged: false,
@@ -1925,8 +1929,8 @@ impl App {
     fn handle_multi_click_selection(&mut self, index: usize, mouse: MouseEvent) -> bool {
         let click_count = self.register_left_click(index, mouse);
         match click_count {
-            2 => self.select_word_at(index, mouse),
-            3.. => self.select_line_at(index, mouse),
+            2 => self.start_granular_selection(index, mouse, SelectionGranularity::Word),
+            3.. => self.start_granular_selection(index, mouse, SelectionGranularity::Line),
             _ => false,
         }
     }
@@ -1955,37 +1959,82 @@ impl App {
         count
     }
 
-    fn select_word_at(&mut self, index: usize, mouse: MouseEvent) -> bool {
-        let Some((point, text)) = self.selection_line_for_mouse(index, mouse.column, mouse.row)
+    fn start_granular_selection(
+        &mut self,
+        index: usize,
+        mouse: MouseEvent,
+        granularity: SelectionGranularity,
+    ) -> bool {
+        let Some(span) = self.selection_span_for_mouse(index, mouse.column, mouse.row, granularity)
         else {
             return false;
         };
-        let Some((start, end)) = word_columns_at(&text, point.column) else {
-            self.selection = None;
-            return true;
-        };
-        self.set_click_selection(index, point.line, start, end);
+        self.focus = index;
+        self.selection = Some(Selection {
+            pane: index,
+            anchor: span.start,
+            cursor: span.end,
+            granularity,
+            origin: Some(span),
+            history_backed: false,
+            dragging: true,
+            dragged: true,
+            last_mouse: Some((mouse.column, mouse.row)),
+            last_scroll: Instant::now(),
+        });
         true
     }
 
-    fn select_line_at(&mut self, index: usize, mouse: MouseEvent) -> bool {
-        let Some((point, text)) = self.selection_line_for_mouse(index, mouse.column, mouse.row)
-        else {
-            return false;
-        };
-        let width = self
-            .content_rects
-            .get(index)
-            .map(|rect| rect.width)
-            .unwrap_or_default();
-        let len = char_count(text.trim_end()).min(usize::from(width));
-        if len == 0 {
-            self.selection = None;
-            return true;
+    fn selection_span_for_mouse(
+        &self,
+        index: usize,
+        x: u16,
+        y: u16,
+        granularity: SelectionGranularity,
+    ) -> Option<SelectionSpan> {
+        if granularity == SelectionGranularity::Character {
+            return self
+                .selection_point_for_mouse(index, x, y)
+                .map(SelectionSpan::single);
         }
-        let end = len.saturating_sub(1).min(usize::from(u16::MAX)) as u16;
-        self.set_click_selection(index, point.line, 0, end);
-        true
+
+        let (point, text) = self.selection_line_for_mouse(index, x, y)?;
+
+        match granularity {
+            SelectionGranularity::Character => Some(SelectionSpan::single(point)),
+            SelectionGranularity::Word => {
+                let (start, end) = word_columns_at(&text, point.column)?;
+                Some(SelectionSpan {
+                    start: SelectionPoint {
+                        line: point.line,
+                        column: start,
+                    },
+                    end: SelectionPoint {
+                        line: point.line,
+                        column: end,
+                    },
+                })
+            }
+            SelectionGranularity::Line => {
+                let width = self
+                    .content_rects
+                    .get(index)
+                    .map(|rect| rect.width)
+                    .unwrap_or_default();
+                let len = char_count(text.trim_end()).min(usize::from(width));
+                let end = len.saturating_sub(1).min(usize::from(u16::MAX)) as u16;
+                Some(SelectionSpan {
+                    start: SelectionPoint {
+                        line: point.line,
+                        column: 0,
+                    },
+                    end: SelectionPoint {
+                        line: point.line,
+                        column: end,
+                    },
+                })
+            }
+        }
     }
 
     fn selection_line_for_mouse(
@@ -2009,23 +2058,6 @@ impl App {
                 .unwrap_or_default()
         };
         Some((point, text))
-    }
-
-    fn set_click_selection(&mut self, index: usize, line: u64, start: u16, end: u16) {
-        self.focus = index;
-        self.selection = Some(Selection {
-            pane: index,
-            anchor: SelectionPoint {
-                line,
-                column: start,
-            },
-            cursor: SelectionPoint { line, column: end },
-            history_backed: false,
-            dragging: false,
-            dragged: true,
-            last_mouse: None,
-            last_scroll: Instant::now(),
-        });
     }
 
     fn handle_selection_drag(&mut self, mouse: MouseEvent) -> bool {
@@ -2074,12 +2106,7 @@ impl App {
             selection.dragged |= dragged;
         }
         self.autoscroll_selection(Instant::now(), true);
-        let Some(point) = self.selection_point_for_mouse(pane, x, y) else {
-            return;
-        };
-        if let Some(selection) = self.selection.as_mut() {
-            selection.cursor = point;
-        }
+        self.update_selection_cursor_from_mouse(pane, x, y);
     }
 
     fn scroll_selection_from_mouse(&mut self, x: u16, y: u16, up: bool) {
@@ -2096,13 +2123,26 @@ impl App {
             self.tasks[pane].scroll_down(3)
         };
         if changed {
-            let Some(point) = self.selection_point_for_mouse(pane, x, y) else {
-                return;
-            };
             if let Some(selection) = self.selection.as_mut() {
-                selection.cursor = point;
                 selection.last_scroll = Instant::now();
             }
+            self.update_selection_cursor_from_mouse(pane, x, y);
+        }
+    }
+
+    fn update_selection_cursor_from_mouse(&mut self, pane: usize, x: u16, y: u16) {
+        let Some(granularity) = self
+            .selection
+            .as_ref()
+            .map(|selection| selection.granularity)
+        else {
+            return;
+        };
+        let Some(span) = self.selection_span_for_mouse(pane, x, y, granularity) else {
+            return;
+        };
+        if let Some(selection) = self.selection.as_mut() {
+            selection.set_cursor_span(span);
         }
     }
 
@@ -2155,11 +2195,7 @@ impl App {
             if let Some(selection) = self.selection.as_mut() {
                 selection.last_scroll = now;
             }
-            if let Some(point) = self.selection_point_for_mouse(pane, x, y) {
-                if let Some(selection) = self.selection.as_mut() {
-                    selection.cursor = point;
-                }
-            }
+            self.update_selection_cursor_from_mouse(pane, x, y);
         }
         changed
     }
@@ -3168,11 +3204,35 @@ struct SelectionPoint {
     column: u16,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SelectionSpan {
+    start: SelectionPoint,
+    end: SelectionPoint,
+}
+
+impl SelectionSpan {
+    fn single(point: SelectionPoint) -> Self {
+        Self {
+            start: point,
+            end: point,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectionGranularity {
+    Character,
+    Word,
+    Line,
+}
+
 #[derive(Clone, Debug)]
 struct Selection {
     pane: usize,
     anchor: SelectionPoint,
     cursor: SelectionPoint,
+    granularity: SelectionGranularity,
+    origin: Option<SelectionSpan>,
     history_backed: bool,
     dragging: bool,
     dragged: bool,
@@ -3195,6 +3255,21 @@ impl Selection {
             (self.anchor, self.cursor)
         } else {
             (self.cursor, self.anchor)
+        }
+    }
+
+    fn set_cursor_span(&mut self, span: SelectionSpan) {
+        let Some(origin) = self.origin else {
+            self.cursor = span.end;
+            return;
+        };
+
+        if span.end < origin.start {
+            self.anchor = origin.end;
+            self.cursor = span.start;
+        } else {
+            self.anchor = origin.start;
+            self.cursor = span.end;
         }
     }
 
@@ -4007,8 +4082,9 @@ fn render_menu_help(area: Rect, buffer: &mut Buffer, leader: &str) {
         "f                      Toggle fullscreen pane".to_owned(),
         "PageUp/PageDown        Scroll focused pane".to_owned(),
         "Home/End               Jump to top/bottom of history".to_owned(),
-        "drag / double-click    Select text / word".to_owned(),
-        "triple-click           Select a full line".to_owned(),
+        "drag                   Select text".to_owned(),
+        "double-click/drag      Select whole words".to_owned(),
+        "triple-click/drag      Select whole lines".to_owned(),
         "right-click            Copy selection or paste".to_owned(),
         "y / Y                  Copy visible text / full scrollback".to_owned(),
         "S                      Save full scrollback to a temp log".to_owned(),
@@ -6256,6 +6332,8 @@ mod tests {
             pane: 0,
             anchor: SelectionPoint { line: 0, column: 0 },
             cursor: SelectionPoint { line: 0, column: 4 },
+            granularity: SelectionGranularity::Character,
+            origin: None,
             history_backed: false,
             dragging: false,
             dragged: true,
@@ -6402,6 +6480,139 @@ mod tests {
             .unwrap();
 
         assert_eq!(app.selected_text().unwrap(), "alpha beta/gamma");
+    }
+
+    #[test]
+    fn double_click_drag_expands_selection_by_whole_words() {
+        let mut app = test_app();
+        app.update_layout(Rect::new(0, 0, 100, 20));
+        app.mode = AppMode::Command;
+        app.tasks[0].process_output(b"alpha beta gamma delta\n");
+
+        let first = app.content_rects[0];
+        let beta = first.x + 8;
+        let gamma = first.x + 13;
+        let row = first.y;
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), beta, row))
+            .unwrap();
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), beta, row))
+            .unwrap();
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), beta, row))
+            .unwrap();
+
+        assert_eq!(
+            app.selection.as_ref().unwrap().granularity,
+            SelectionGranularity::Word
+        );
+        assert!(app.selection.as_ref().unwrap().dragging);
+        assert_eq!(app.selected_text().unwrap(), "beta");
+
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), gamma, row))
+            .unwrap();
+        assert_eq!(app.selected_text().unwrap(), "beta gamma");
+
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), gamma, row))
+            .unwrap();
+        assert!(!app.selection.as_ref().unwrap().dragging);
+        assert_eq!(app.selected_text().unwrap(), "beta gamma");
+    }
+
+    #[test]
+    fn double_click_drag_left_keeps_the_anchor_word_complete() {
+        let mut app = test_app();
+        app.update_layout(Rect::new(0, 0, 100, 20));
+        app.mode = AppMode::Command;
+        app.tasks[0].process_output(b"alpha beta gamma delta\n");
+
+        let first = app.content_rects[0];
+        let beta = first.x + 8;
+        let gamma = first.x + 13;
+        let row = first.y;
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), gamma, row))
+            .unwrap();
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), gamma, row))
+            .unwrap();
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), gamma, row))
+            .unwrap();
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), beta, row))
+            .unwrap();
+
+        assert_eq!(app.selected_text().unwrap(), "beta gamma");
+    }
+
+    #[test]
+    fn triple_click_drag_expands_selection_by_whole_lines() {
+        let mut app = test_app();
+        app.update_layout(Rect::new(0, 0, 100, 20));
+        app.mode = AppMode::Command;
+        app.tasks[0].process_output(b"line one\r\nline two\r\nline three\r\n");
+
+        let first = app.content_rects[0];
+        let column = first.x + 1;
+        let first_row = first.y;
+        let third_row = first.y + 2;
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            column,
+            first_row,
+        ))
+        .unwrap();
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            column,
+            first_row,
+        ))
+        .unwrap();
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            column,
+            first_row,
+        ))
+        .unwrap();
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            column,
+            first_row,
+        ))
+        .unwrap();
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            column,
+            first_row,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            app.selection.as_ref().unwrap().granularity,
+            SelectionGranularity::Line
+        );
+        assert_eq!(app.selected_text().unwrap(), "line one");
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            column,
+            third_row,
+        ))
+        .unwrap();
+        assert_eq!(
+            app.selected_text().unwrap(),
+            "line one\nline two\nline three"
+        );
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            column,
+            third_row,
+        ))
+        .unwrap();
+        assert!(!app.selection.as_ref().unwrap().dragging);
+        assert_eq!(
+            app.selected_text().unwrap(),
+            "line one\nline two\nline three"
+        );
     }
 
     #[test]
@@ -6880,6 +7091,8 @@ mod tests {
             pane: 0,
             anchor: SelectionPoint { line: 0, column: 0 },
             cursor: SelectionPoint { line: 0, column: 3 },
+            granularity: SelectionGranularity::Character,
+            origin: None,
             history_backed: false,
             dragging: false,
             dragged: true,
@@ -6903,6 +7116,8 @@ mod tests {
             pane: 0,
             anchor: SelectionPoint { line: 0, column: 0 },
             cursor: SelectionPoint { line: 0, column: 3 },
+            granularity: SelectionGranularity::Character,
+            origin: None,
             history_backed: false,
             dragging: false,
             dragged: true,

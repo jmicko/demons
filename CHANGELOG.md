@@ -6,8 +6,8 @@ All notable user-facing changes should be recorded here before a release.
 
 - Added pane-local mouse text selection with scrollback autoscroll and
   right-click copy/paste support.
-- Added double-click word selection, triple-click line selection, and
-  configurable multi-click timing.
+- Added double-click word selection, triple-click line selection, word/line
+  drag expansion, and configurable multi-click timing.
 - Added a tabbed runtime menu with Help, Tasks, Settings, and Exit sections.
 - Added task-menu state restoration and cwd Tab completion/validation.
 - Changed startup to command mode and replaced leader-key cycling with a picker.
