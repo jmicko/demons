@@ -4,6 +4,8 @@ All notable user-facing changes should be recorded here before a release.
 
 ## Unreleased
 
+## 0.2.0 - 2026-06-19
+
 - Added pane-local mouse text selection with scrollback autoscroll and
   right-click copy/paste support.
 - Added double-click word selection, triple-click line selection, word/line
