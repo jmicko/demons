@@ -21,6 +21,8 @@ All notable user-facing changes should be recorded here before a release.
   stale pre-clear output.
 - Changed the first pane-height of scrollback to render from the terminal
   parser, preserving colors and terminal layout while scrolling.
+- Fixed drag-selection highlighting so it stays attached to parser-rendered
+  scrollback while the pane auto-scrolls.
 - Changed `demons init` to open the configurator without starting tasks.
 - Added task dependencies and `start_delay`, including dependent restarts.
 - Added centered pane countdowns for delayed starts.

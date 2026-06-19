@@ -1593,6 +1593,9 @@ impl App {
             granularity: SelectionGranularity::Character,
             origin: None,
             history_backed: true,
+            parser_anchor: None,
+            parser_cursor: None,
+            parser_origin: None,
             dragging: false,
             dragged: true,
             last_mouse: None,
@@ -1911,6 +1914,7 @@ impl App {
         let Some(point) = self.selection_point_for_mouse(index, mouse.column, mouse.row) else {
             return;
         };
+        let parser_point = self.parser_selection_point_for_mouse(index, mouse.column, mouse.row);
         self.focus = index;
         self.selection = Some(Selection {
             pane: index,
@@ -1919,6 +1923,9 @@ impl App {
             granularity: SelectionGranularity::Character,
             origin: None,
             history_backed: false,
+            parser_anchor: parser_point,
+            parser_cursor: parser_point,
+            parser_origin: None,
             dragging: true,
             dragged: false,
             last_mouse: Some((mouse.column, mouse.row)),
@@ -1969,6 +1976,8 @@ impl App {
         else {
             return false;
         };
+        let parser_span =
+            self.parser_selection_span_for_mouse(index, mouse.column, mouse.row, granularity);
         self.focus = index;
         self.selection = Some(Selection {
             pane: index,
@@ -1977,6 +1986,9 @@ impl App {
             granularity,
             origin: Some(span),
             history_backed: false,
+            parser_anchor: parser_span.map(|span| span.start),
+            parser_cursor: parser_span.map(|span| span.end),
+            parser_origin: parser_span,
             dragging: true,
             dragged: true,
             last_mouse: Some((mouse.column, mouse.row)),
@@ -1992,18 +2004,26 @@ impl App {
         y: u16,
         granularity: SelectionGranularity,
     ) -> Option<SelectionSpan> {
+        let point = self.selection_point_for_mouse(index, x, y)?;
         if granularity == SelectionGranularity::Character {
-            return self
-                .selection_point_for_mouse(index, x, y)
-                .map(SelectionSpan::single);
+            return Some(SelectionSpan::single(point));
         }
 
-        let (point, text) = self.selection_line_for_mouse(index, x, y)?;
+        let text = self.selection_text_for_mouse(index, x, y)?;
+        self.selection_span_for_point(index, point, &text, granularity)
+    }
 
+    fn selection_span_for_point(
+        &self,
+        index: usize,
+        point: SelectionPoint,
+        text: &str,
+        granularity: SelectionGranularity,
+    ) -> Option<SelectionSpan> {
         match granularity {
             SelectionGranularity::Character => Some(SelectionSpan::single(point)),
             SelectionGranularity::Word => {
-                let (start, end) = word_columns_at(&text, point.column)?;
+                let (start, end) = word_columns_at(text, point.column)?;
                 Some(SelectionSpan {
                     start: SelectionPoint {
                         line: point.line,
@@ -2037,27 +2057,23 @@ impl App {
         }
     }
 
-    fn selection_line_for_mouse(
-        &self,
-        index: usize,
-        x: u16,
-        y: u16,
-    ) -> Option<(SelectionPoint, String)> {
+    fn selection_text_for_mouse(&self, index: usize, x: u16, y: u16) -> Option<String> {
         let point = self.selection_point_for_mouse(index, x, y)?;
         let content = *self.content_rects.get(index)?;
         let row = y
             .saturating_sub(content.y)
             .min(content.height.saturating_sub(1));
-        let text = if self.tasks[index].renders_with_terminal_parser(content.height) {
-            screen_row_text(&self.tasks[index].parser, row, content.width)
-        } else {
-            self.tasks[index]
-                .history
-                .line(point.line)
-                .map(|line| line.text.clone())
-                .unwrap_or_default()
-        };
-        Some((point, text))
+        Some(
+            if self.tasks[index].renders_with_terminal_parser(content.height) {
+                screen_row_text(&self.tasks[index].parser, row, content.width)
+            } else {
+                self.tasks[index]
+                    .history
+                    .line(point.line)
+                    .map(|line| line.text.clone())
+                    .unwrap_or_default()
+            },
+        )
     }
 
     fn handle_selection_drag(&mut self, mouse: MouseEvent) -> bool {
@@ -2141,12 +2157,53 @@ impl App {
         let Some(span) = self.selection_span_for_mouse(pane, x, y, granularity) else {
             return;
         };
+        let parser_span = self.parser_selection_span_for_mouse(pane, x, y, granularity);
         if let Some(selection) = self.selection.as_mut() {
             selection.set_cursor_span(span);
+            selection.set_parser_cursor_span(parser_span);
         }
     }
 
     fn selection_point_for_mouse(&self, pane: usize, x: u16, y: u16) -> Option<SelectionPoint> {
+        let (content, column, row) = self.selection_mouse_cell(pane, x, y)?;
+        let line = self.tasks[pane].history_index_for_visible_row(row, content.height);
+        Some(SelectionPoint { line, column })
+    }
+
+    fn parser_selection_point_for_mouse(
+        &self,
+        pane: usize,
+        x: u16,
+        y: u16,
+    ) -> Option<SelectionPoint> {
+        let (content, column, row) = self.selection_mouse_cell(pane, x, y)?;
+        let task = &self.tasks[pane];
+        if !task.renders_with_terminal_parser(content.height) {
+            return None;
+        }
+        Some(SelectionPoint {
+            line: task.parser_index_for_visible_row(row),
+            column,
+        })
+    }
+
+    fn parser_selection_span_for_mouse(
+        &self,
+        index: usize,
+        x: u16,
+        y: u16,
+        granularity: SelectionGranularity,
+    ) -> Option<SelectionSpan> {
+        let point = self.parser_selection_point_for_mouse(index, x, y)?;
+        if granularity == SelectionGranularity::Character {
+            return Some(SelectionSpan::single(point));
+        }
+
+        let text = self.selection_text_for_mouse(index, x, y)?;
+        self.selection_span_for_point(index, point, &text, granularity)
+    }
+
+    fn selection_mouse_cell(&self, pane: usize, x: u16, y: u16) -> Option<(Rect, u16, u16)> {
         let content = *self.content_rects.get(pane)?;
         if content.width == 0 || content.height == 0 {
             return None;
@@ -2165,10 +2222,7 @@ impl App {
         } else {
             y - content.y
         };
-        Some(SelectionPoint {
-            line: self.tasks[pane].history_index_for_visible_row(row, content.height),
-            column,
-        })
+        Some((content, column, row))
     }
 
     fn autoscroll_selection(&mut self, now: Instant, force: bool) -> bool {
@@ -2229,9 +2283,18 @@ impl App {
         if !task.renders_with_terminal_parser(area.height) {
             return None;
         }
-        let visible_start = task.history.visible_start(area.height, task.scroll_offset);
+        let (start, end, visible_start) =
+            if let Some((start, end)) = selection.parser_ordered_points() {
+                (start, end, task.parser_index_for_visible_row(0))
+            } else {
+                let (start, end) = selection.ordered_points();
+                (
+                    start,
+                    end,
+                    task.history.visible_start(area.height, task.scroll_offset),
+                )
+            };
         let visible_end = visible_start.saturating_add(u64::from(area.height));
-        let (start, end) = selection.ordered_points();
         if start.line < visible_start || end.line >= visible_end {
             return None;
         }
@@ -3210,6 +3273,12 @@ impl TaskRuntime {
             .saturating_add(u64::from(row))
     }
 
+    fn parser_index_for_visible_row(&self, row: u16) -> u64 {
+        let scrollback = self.parser.screen().scrollback();
+        (self.terminal_scrollback_len.saturating_sub(scrollback) as u64)
+            .saturating_add(u64::from(row))
+    }
+
     fn record_spawn_error(&mut self, error: &anyhow::Error) {
         self.pid = None;
         self.writer = None;
@@ -3282,6 +3351,9 @@ struct Selection {
     granularity: SelectionGranularity,
     origin: Option<SelectionSpan>,
     history_backed: bool,
+    parser_anchor: Option<SelectionPoint>,
+    parser_cursor: Option<SelectionPoint>,
+    parser_origin: Option<SelectionSpan>,
     dragging: bool,
     dragged: bool,
     last_mouse: Option<(u16, u16)>,
@@ -3306,6 +3378,16 @@ impl Selection {
         }
     }
 
+    fn parser_ordered_points(&self) -> Option<(SelectionPoint, SelectionPoint)> {
+        let anchor = self.parser_anchor?;
+        let cursor = self.parser_cursor?;
+        Some(if anchor <= cursor {
+            (anchor, cursor)
+        } else {
+            (cursor, anchor)
+        })
+    }
+
     fn set_cursor_span(&mut self, span: SelectionSpan) {
         let Some(origin) = self.origin else {
             self.cursor = span.end;
@@ -3321,29 +3403,69 @@ impl Selection {
         }
     }
 
+    fn set_parser_cursor_span(&mut self, span: Option<SelectionSpan>) {
+        let Some(span) = span else {
+            self.parser_cursor = None;
+            return;
+        };
+        if self.parser_anchor.is_none() {
+            self.parser_anchor = Some(span.start);
+        }
+
+        let Some(origin) = self.parser_origin else {
+            self.parser_cursor = Some(span.end);
+            return;
+        };
+
+        if span.end < origin.start {
+            self.parser_anchor = Some(origin.end);
+            self.parser_cursor = Some(span.start);
+        } else {
+            self.parser_anchor = Some(origin.start);
+            self.parser_cursor = Some(span.end);
+        }
+    }
+
     fn columns_for_line(&self, line: u64, width: u16) -> Option<(u16, u16)> {
         if !self.dragged || width == 0 {
             return None;
         }
         let (start, end) = self.ordered_points();
-        if line < start.line || line > end.line {
+        columns_for_ordered_points(start, end, line, width)
+    }
+
+    fn columns_for_parser_line(&self, line: u64, width: u16) -> Option<(u16, u16)> {
+        if !self.dragged || width == 0 {
             return None;
         }
-
-        let range = if start.line == end.line {
-            (
-                start.column.min(width),
-                end.column.saturating_add(1).min(width),
-            )
-        } else if line == start.line {
-            (start.column.min(width), width)
-        } else if line == end.line {
-            (0, end.column.saturating_add(1).min(width))
-        } else {
-            (0, width)
-        };
-        (range.0 < range.1).then_some(range)
+        let (start, end) = self.parser_ordered_points()?;
+        columns_for_ordered_points(start, end, line, width)
     }
+}
+
+fn columns_for_ordered_points(
+    start: SelectionPoint,
+    end: SelectionPoint,
+    line: u64,
+    width: u16,
+) -> Option<(u16, u16)> {
+    if line < start.line || line > end.line {
+        return None;
+    }
+
+    let range = if start.line == end.line {
+        (
+            start.column.min(width),
+            end.column.saturating_add(1).min(width),
+        )
+    } else if line == start.line {
+        (start.column.min(width), width)
+    } else if line == end.line {
+        (0, end.column.saturating_add(1).min(width))
+    } else {
+        (0, width)
+    };
+    (range.0 < range.1).then_some(range)
 }
 
 #[derive(Clone, Debug)]
@@ -5026,12 +5148,32 @@ fn render_selection(
         return;
     };
     if selection.history_backed
-        && task.scroll_offset == 0
+        && task.renders_with_terminal_parser(area.height)
         && render_live_history_selection(selection, task, area, buffer)
     {
         return;
     }
+    if selection.parser_ordered_points().is_some() && task.renders_with_terminal_parser(area.height)
+    {
+        render_parser_selection(selection, task, area, buffer);
+        return;
+    }
     render_history_selection(selection, task, area, buffer);
+}
+
+fn render_parser_selection(
+    selection: &Selection,
+    task: &TaskRuntime,
+    area: Rect,
+    buffer: &mut Buffer,
+) {
+    for row in 0..area.height {
+        let line = task.parser_index_for_visible_row(row);
+        let Some((start, end)) = selection.columns_for_parser_line(line, area.width) else {
+            continue;
+        };
+        paint_selection_row(area, buffer, row, start, end);
+    }
 }
 
 fn render_history_selection(
@@ -6516,6 +6658,9 @@ mod tests {
             granularity: SelectionGranularity::Character,
             origin: None,
             history_backed: false,
+            parser_anchor: None,
+            parser_cursor: None,
+            parser_origin: None,
             dragging: false,
             dragged: true,
             last_mouse: None,
@@ -6592,6 +6737,47 @@ mod tests {
         assert_eq!(app.selection.as_ref().unwrap().pane, 0);
         assert!(app.tasks[0].scroll_offset > 0);
         assert_eq!(app.tasks[1].scroll_offset, 0);
+    }
+
+    #[test]
+    fn parser_backed_drag_selection_stays_attached_while_autoscrolling() {
+        let mut app = test_app_with_tasks(vec![test_task("one")]);
+        app.update_layout(Rect::new(0, 0, 60, 8));
+        app.mode = AppMode::Command;
+        let area = app.content_rects[0];
+        for line in 0..(area.height + 4) {
+            app.tasks[0].process_output(format!("line {line}\r\n").as_bytes());
+        }
+        assert!(app.tasks[0].terminal_scrollback_len > 0);
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            area.x,
+            area.bottom() - 1,
+        ))
+        .unwrap();
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            area.x + 5,
+            area.y.saturating_sub(1),
+        ))
+        .unwrap();
+
+        assert!(app.tasks[0].scroll_offset > 0);
+        assert!(
+            app.selection
+                .as_ref()
+                .unwrap()
+                .parser_ordered_points()
+                .is_some()
+        );
+
+        app.tasks[0].history.clear();
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 60, 8));
+        render_screen(&app.tasks[0].parser, area, &mut buffer);
+        render_selection(app.selection.as_ref(), &app.tasks[0], area, &mut buffer);
+
+        assert_eq!(buffer[(area.x + 5, area.y)].bg, Color::White);
     }
 
     #[test]
@@ -7307,6 +7493,9 @@ mod tests {
             granularity: SelectionGranularity::Character,
             origin: None,
             history_backed: false,
+            parser_anchor: None,
+            parser_cursor: None,
+            parser_origin: None,
             dragging: false,
             dragged: true,
             last_mouse: None,
@@ -7332,6 +7521,9 @@ mod tests {
             granularity: SelectionGranularity::Character,
             origin: None,
             history_backed: false,
+            parser_anchor: None,
+            parser_cursor: None,
+            parser_origin: None,
             dragging: false,
             dragged: true,
             last_mouse: None,
