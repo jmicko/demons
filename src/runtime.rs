@@ -1377,12 +1377,14 @@ impl App {
                     search.query.clear();
                     search.cursor = 0;
                 }
+                self.refresh_search_results(None);
             }
             KeyCode::Char('k' | 'K') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(search) = self.search.as_mut() {
                     let index = byte_index_for_char(&search.query, search.cursor);
                     search.query.truncate(index);
                 }
+                self.refresh_search_results(None);
             }
             KeyCode::Backspace => self.delete_search_char_before_cursor(),
             KeyCode::Delete => self.delete_search_char_at_cursor(),
@@ -1428,6 +1430,8 @@ impl App {
             query: String::new(),
             cursor: 0,
             current: None,
+            current_index: None,
+            match_count: 0,
             message: None,
         });
         self.selection = None;
@@ -1441,46 +1445,86 @@ impl App {
     }
 
     fn submit_search(&mut self, direction: SearchDirection) {
+        self.move_search_result(direction);
+    }
+
+    fn refresh_search_results(&mut self, empty_message: Option<&'static str>) {
+        let Some(search) = self.search.as_ref() else {
+            return;
+        };
+        let pane = search.pane;
+        let query = search.query.trim().to_owned();
+        if query.is_empty() {
+            self.clear_search_results(empty_message.map(str::to_owned));
+            return;
+        }
+        let history = &self.tasks[pane].history;
+        let matches = history.matching_lines(&query);
+        if matches.is_empty() {
+            self.clear_search_results(Some("0 matches".to_owned()));
+            return;
+        }
+
+        self.select_search_match(pane, &matches, 0);
+    }
+
+    fn move_search_result(&mut self, direction: SearchDirection) {
         let Some(search) = self.search.as_ref() else {
             return;
         };
         let pane = search.pane;
         let query = search.query.trim().to_owned();
         let current = search.current;
+        let stored_index = search.current_index;
         if query.is_empty() {
-            if let Some(search) = self.search.as_mut() {
-                search.message = Some("type a query".to_owned());
-            }
+            self.clear_search_results(Some("type a query".to_owned()));
             return;
         }
-        let history = &self.tasks[pane].history;
-        let line = match direction {
-            SearchDirection::Older => current
-                .and_then(|line| history.find_line_before(&query, line))
-                .or_else(|| history.find_last_line(&query)),
-            SearchDirection::Newer => current
-                .and_then(|line| history.find_line_after(&query, line))
-                .or_else(|| history.find_first_line(&query)),
+
+        let matches = self.tasks[pane].history.matching_lines(&query);
+        if matches.is_empty() {
+            self.clear_search_results(Some("0 matches".to_owned()));
+            return;
+        }
+
+        let current_index = current
+            .and_then(|line| matches.iter().position(|candidate| *candidate == line))
+            .or_else(|| stored_index.filter(|index| *index < matches.len()));
+        let next_index = match (direction, current_index) {
+            (SearchDirection::Older, Some(0)) => matches.len() - 1,
+            (SearchDirection::Older, Some(index)) => index - 1,
+            (SearchDirection::Newer, Some(index)) => (index + 1) % matches.len(),
+            (_, None) => 0,
         };
-        let Some(line) = line else {
-            if let Some(search) = self.search.as_mut() {
-                search.current = None;
-                search.message = Some("no matches".to_owned());
-            }
+
+        self.select_search_match(pane, &matches, next_index);
+    }
+
+    fn select_search_match(&mut self, pane: usize, matches: &[u64], index: usize) {
+        let Some(&line) = matches.get(index) else {
             return;
         };
 
-        self.jump_to_search_line(pane, line, &query);
+        self.jump_to_search_line(pane, line);
         if let Some(search) = self.search.as_mut() {
             search.current = Some(line);
-            search.message = Some(match direction {
-                SearchDirection::Older => "older match".to_owned(),
-                SearchDirection::Newer => "newer match".to_owned(),
-            });
+            search.current_index = Some(index);
+            search.match_count = matches.len();
+            search.message = None;
         }
     }
 
-    fn jump_to_search_line(&mut self, pane: usize, line: u64, query: &str) {
+    fn clear_search_results(&mut self, message: Option<String>) {
+        if let Some(search) = self.search.as_mut() {
+            search.current = None;
+            search.current_index = None;
+            search.match_count = 0;
+            search.message = message;
+        }
+        self.selection = None;
+    }
+
+    fn jump_to_search_line(&mut self, pane: usize, line: u64) {
         self.focus = pane;
         let height = self
             .content_rects
@@ -1508,19 +1552,21 @@ impl App {
             last_mouse: None,
             last_scroll: Instant::now(),
         });
-        self.set_notice(format!(
-            "Found {query:?} in {}.",
-            self.tasks[pane].task.name
-        ));
     }
 
     fn insert_search_text(&mut self, text: &str) {
         for character in text.chars().filter(|character| !character.is_control()) {
-            self.insert_search_char(character);
+            self.insert_search_char_raw(character);
         }
+        self.refresh_search_results(None);
     }
 
     fn insert_search_char(&mut self, character: char) {
+        self.insert_search_char_raw(character);
+        self.refresh_search_results(None);
+    }
+
+    fn insert_search_char_raw(&mut self, character: char) {
         let Some(search) = self.search.as_mut() else {
             return;
         };
@@ -1540,6 +1586,7 @@ impl App {
         let end = byte_index_for_char(&search.query, search.cursor);
         search.query.replace_range(start..end, "");
         search.cursor -= 1;
+        self.refresh_search_results(None);
     }
 
     fn delete_search_char_at_cursor(&mut self) {
@@ -1552,6 +1599,7 @@ impl App {
         let start = byte_index_for_char(&search.query, search.cursor);
         let end = byte_index_for_char(&search.query, search.cursor + 1);
         search.query.replace_range(start..end, "");
+        self.refresh_search_results(None);
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<Action> {
@@ -2233,9 +2281,12 @@ impl App {
         if search.pane != pane {
             search.pane = pane;
             search.current = None;
+            search.current_index = None;
+            search.match_count = 0;
             search.message = None;
             self.selection = None;
             self.notice = None;
+            self.refresh_search_results(None);
         }
     }
 
@@ -3266,35 +3317,14 @@ impl TextHistory {
         )
     }
 
-    fn find_last_line(&self, query: &str) -> Option<u64> {
-        let needle = search_needle(query)?;
+    fn matching_lines(&self, query: &str) -> Vec<u64> {
+        let Some(needle) = search_needle(query) else {
+            return Vec::new();
+        };
 
         (self.first_index..self.line_count())
-            .rev()
-            .find(|line_index| self.line_matches(*line_index, &needle))
-    }
-
-    fn find_first_line(&self, query: &str) -> Option<u64> {
-        let needle = search_needle(query)?;
-
-        (self.first_index..self.line_count())
-            .find(|line_index| self.line_matches(*line_index, &needle))
-    }
-
-    fn find_line_before(&self, query: &str, before: u64) -> Option<u64> {
-        let needle = search_needle(query)?;
-        let end = before.min(self.line_count());
-
-        (self.first_index..end)
-            .rev()
-            .find(|line_index| self.line_matches(*line_index, &needle))
-    }
-
-    fn find_line_after(&self, query: &str, after: u64) -> Option<u64> {
-        let needle = search_needle(query)?;
-        let start = after.saturating_add(1).max(self.first_index);
-
-        (start..self.line_count()).find(|line_index| self.line_matches(*line_index, &needle))
+            .filter(|line_index| self.line_matches(*line_index, &needle))
+            .collect()
     }
 
     fn line_char_count(&self, index: u64) -> Option<usize> {
@@ -3349,6 +3379,8 @@ struct SearchState {
     query: String,
     cursor: usize,
     current: Option<u64>,
+    current_index: Option<usize>,
+    match_count: usize,
     message: Option<String>,
 }
 
@@ -3815,7 +3847,7 @@ fn render_menu_help(area: Rect, buffer: &mut Buffer, leader: &str) {
         "y / Y                  Copy visible text / full scrollback".to_owned(),
         "S                      Save full scrollback to a temp log".to_owned(),
         "/                      Search focused pane".to_owned(),
-        "Enter / Shift-Enter    Search older / newer while searching".to_owned(),
+        "Enter / Shift-Enter    Previous / next search match".to_owned(),
         "Tab / Shift-Tab        Change searched pane while searching".to_owned(),
         "r                      Restart focused task and dependents".to_owned(),
         "R                      Restart every task".to_owned(),
@@ -4924,14 +4956,6 @@ enum FooterAction {
     Quit,
 }
 
-fn footer_button(label: impl Into<String>, action: FooterAction) -> FooterItem {
-    FooterItem::new(
-        format!(" {} ", label.into()),
-        Some(action),
-        footer_action_style(action),
-    )
-}
-
 fn footer_status(label: impl Into<String>) -> FooterItem {
     FooterItem::new(
         format!(" {} ", label.into()),
@@ -4967,8 +4991,8 @@ fn command_footer_items() -> Vec<FooterItem> {
 fn search_footer_items(search: &SearchState) -> Vec<FooterItem> {
     let mut items = search_placeholder_footer_items();
     items[0] = footer_status(search_footer_text(search));
-    if let Some(message) = search.message.as_ref() {
-        items.push(footer_status(message));
+    if let Some(status) = search_result_status(search) {
+        items.push(footer_status(status));
     }
     items
 }
@@ -4976,28 +5000,21 @@ fn search_footer_items(search: &SearchState) -> Vec<FooterItem> {
 fn search_placeholder_footer_items() -> Vec<FooterItem> {
     vec![
         footer_status("/"),
-        footer_button("Enter older", FooterAction::SearchOlder),
-        footer_button("Shift+Enter newer", FooterAction::SearchNewer),
-        footer_button("Tab pane", FooterAction::SearchNextPane),
-        footer_button("Esc done", FooterAction::SearchDone),
+        footer_command_button("Enter previous", FooterAction::SearchOlder, 1),
+        footer_command_button("Shift+Enter next", FooterAction::SearchNewer, 2),
+        footer_command_button("Tab pane", FooterAction::SearchNextPane, 3),
+        footer_command_button("Esc done", FooterAction::SearchDone, 4),
     ]
 }
 
-fn footer_action_style(action: FooterAction) -> FooterItemStyle {
-    match action {
-        FooterAction::ToggleFullscreen => christmas_style_for_index(0),
-        FooterAction::StartSearch
-        | FooterAction::SearchOlder
-        | FooterAction::SearchNewer
-        | FooterAction::SearchNextPane => christmas_style_for_index(1),
-        FooterAction::SearchDone | FooterAction::ShowMenu | FooterAction::ClearFocused => {
-            christmas_style_for_index(2)
+fn search_result_status(search: &SearchState) -> Option<String> {
+    if let (Some(index), count) = (search.current_index, search.match_count) {
+        if count > 0 {
+            let noun = if count == 1 { "match" } else { "matches" };
+            return Some(format!("{}/{} {noun}", index + 1, count));
         }
-        FooterAction::CopyVisible | FooterAction::CopyHistory => christmas_style_for_index(3),
-        FooterAction::SaveHistory => christmas_style_for_index(4),
-        FooterAction::RestartFocused | FooterAction::RestartAll => christmas_style_for_index(5),
-        FooterAction::Quit => christmas_style_for_index(1),
     }
+    search.message.clone()
 }
 
 fn footer_command_button(
@@ -5617,9 +5634,9 @@ mod tests {
     #[test]
     fn footer_items_keep_buttons_together_when_wrapping() {
         let items = vec![
-            footer_button("a one", FooterAction::ClearFocused),
-            footer_button("? menu", FooterAction::ShowMenu),
-            footer_button("q quit", FooterAction::Quit),
+            footer_command_button("a one", FooterAction::ClearFocused, 0),
+            footer_command_button("? menu", FooterAction::ShowMenu, 1),
+            footer_command_button("q quit", FooterAction::Quit, 2),
         ];
         let mut buffer = Buffer::empty(Rect::new(0, 0, 14, 3));
 
@@ -5768,15 +5785,12 @@ mod tests {
     }
 
     #[test]
-    fn text_history_finds_latest_matching_line_case_insensitively() {
+    fn text_history_finds_matching_lines_case_insensitively() {
         let mut history = TextHistory::new(80, 100);
         history.process(b"alpha\nerror one\nERROR two\n");
 
-        assert_eq!(history.find_first_line("error"), Some(1));
-        assert_eq!(history.find_last_line("error"), Some(2));
-        assert_eq!(history.find_line_before("error", 2), Some(1));
-        assert_eq!(history.find_line_after("error", 1), Some(2));
-        assert_eq!(history.find_last_line("missing"), None);
+        assert_eq!(history.matching_lines("error"), vec![1, 2]);
+        assert!(history.matching_lines("missing").is_empty());
     }
 
     #[test]
@@ -5786,16 +5800,23 @@ mod tests {
             query: "eror".to_owned(),
             cursor: 2,
             current: None,
+            current_index: None,
+            match_count: 0,
             message: None,
         };
 
         assert_eq!(search_footer_text(&search), "/er|or");
+        let items = search_footer_items(&search);
         assert!(
-            search_footer_items(&search)
-                .iter()
-                .any(|item| item.text == " Tab pane "
-                    && item.action == Some(FooterAction::SearchNextPane))
+            items.iter().any(|item| item.text == " Tab pane "
+                && item.action == Some(FooterAction::SearchNextPane))
         );
+        assert_eq!(items[1].text, " Enter previous ");
+        assert_eq!(items[2].text, " Shift+Enter next ");
+        assert_eq!(items[1].style.bg, THEME_RED);
+        assert_eq!(items[2].style.bg, THEME_SNOW);
+        assert_eq!(items[3].style.bg, THEME_RED);
+        assert_eq!(items[4].style.bg, THEME_SNOW);
     }
 
     #[test]
@@ -6269,6 +6290,35 @@ mod tests {
     }
 
     #[test]
+    fn search_updates_matches_while_typing_and_reports_position() {
+        let mut app = test_app();
+        app.update_layout(Rect::new(0, 0, 100, 8));
+        app.mode = AppMode::Command;
+        app.tasks[0].process_output(b"alpha\nbeta one\nbeta two\n");
+
+        app.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE))
+            .unwrap();
+        for character in "beta".chars() {
+            app.handle_key(key(KeyCode::Char(character), KeyModifiers::NONE))
+                .unwrap();
+        }
+
+        let search = app.search.as_ref().unwrap();
+        assert_eq!(search.current_index, Some(0));
+        assert_eq!(search.match_count, 2);
+        assert_eq!(search_result_status(search).as_deref(), Some("1/2 matches"));
+        assert_eq!(app.selected_text().unwrap(), "beta one");
+
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::SHIFT))
+            .unwrap();
+
+        let search = app.search.as_ref().unwrap();
+        assert_eq!(search.current_index, Some(1));
+        assert_eq!(search_result_status(search).as_deref(), Some("2/2 matches"));
+        assert_eq!(app.selected_text().unwrap(), "beta two");
+    }
+
+    #[test]
     fn search_clicking_pane_retargets_active_search() {
         let mut app = test_app();
         app.update_layout(Rect::new(0, 0, 100, 8));
@@ -6294,11 +6344,8 @@ mod tests {
 
         assert_eq!(app.focus, 1);
         assert_eq!(app.search.as_ref().unwrap().pane, 1);
-        assert!(app.selection.is_none());
-
-        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
-            .unwrap();
-
+        assert_eq!(app.search.as_ref().unwrap().current_index, Some(0));
+        assert_eq!(app.search.as_ref().unwrap().match_count, 1);
         assert_eq!(app.selection.as_ref().unwrap().pane, 1);
         assert_eq!(app.selected_text().unwrap(), "http://right.example");
     }
@@ -6317,8 +6364,6 @@ mod tests {
             app.handle_key(key(KeyCode::Char(character), KeyModifiers::NONE))
                 .unwrap();
         }
-        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
-            .unwrap();
         assert_eq!(app.selected_text().unwrap(), "http://first.example");
 
         app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
@@ -6326,18 +6371,15 @@ mod tests {
         assert_eq!(app.focus, 1);
         assert_eq!(app.search.as_ref().unwrap().pane, 1);
         assert_eq!(app.search.as_ref().unwrap().query, "http");
-        assert!(app.search.as_ref().unwrap().current.is_none());
-        assert!(app.selection.is_none());
-
-        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
-            .unwrap();
+        assert_eq!(app.search.as_ref().unwrap().current_index, Some(0));
+        assert_eq!(app.search.as_ref().unwrap().match_count, 1);
         assert_eq!(app.selected_text().unwrap(), "http://second.example");
 
         app.handle_key(key(KeyCode::BackTab, KeyModifiers::SHIFT))
             .unwrap();
         assert_eq!(app.focus, 0);
         assert_eq!(app.search.as_ref().unwrap().pane, 0);
-        assert!(app.selection.is_none());
+        assert_eq!(app.selected_text().unwrap(), "http://first.example");
     }
 
     #[test]
@@ -6427,7 +6469,7 @@ mod tests {
         assert!(app.selection.is_none());
         assert_eq!(
             app.search.as_ref().unwrap().message.as_deref(),
-            Some("no matches")
+            Some("0 matches")
         );
     }
 

@@ -123,8 +123,10 @@ input mode.
 
 In command mode, `y` copies the focused pane's visible text and `Y` copies its
 full scrollback. `S` saves the focused pane's full scrollback to a temp log file
-and copies the file path. `/` opens a focused-pane search prompt; press Enter to
-search older, `Shift+Enter` to search newer, or `Esc` to leave search mode.
+and copies the file path. `/` opens a focused-pane search prompt; typing jumps
+to the first match and shows the current/total match count. Press Enter to go
+to the previous match, `Shift+Enter` to go to the next match, or `Esc` to leave
+search mode.
 Press `Tab`/`Shift+Tab` or click another pane while the prompt is open to
 search that pane instead.
 

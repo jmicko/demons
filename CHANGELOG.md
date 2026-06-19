@@ -11,6 +11,8 @@ All notable user-facing changes should be recorded here before a release.
 - Changed startup to command mode and replaced leader-key cycling with a picker.
 - Changed search mode so text input accepts `n`, mouse movement keeps search
   open, and Tab/Shift+Tab or clicking another pane retargets the active search.
+- Added live search updates and current/total match counts in the search
+  footer.
 - Fixed search result rendering so visible-pane matches do not force scrollback
   layout.
 - Changed `demons init` to open the configurator without starting tasks.
