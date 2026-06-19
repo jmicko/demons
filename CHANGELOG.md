@@ -19,6 +19,8 @@ All notable user-facing changes should be recorded here before a release.
   layout.
 - Fixed Vite-style home-clear redraws so the first scroll does not jump to
   stale pre-clear output.
+- Changed the first pane-height of scrollback to render from the terminal
+  parser, preserving colors and terminal layout while scrolling.
 - Changed `demons init` to open the configurator without starting tasks.
 - Added task dependencies and `start_delay`, including dependent restarts.
 - Added centered pane countdowns for delayed starts.

@@ -379,7 +379,7 @@ impl App {
                 .title(restart);
             block.render(area, buffer);
 
-            if self.tasks[index].scroll_offset == 0 {
+            if self.tasks[index].renders_with_terminal_parser(content.height) {
                 render_screen(&self.tasks[index].parser, content, buffer);
             } else {
                 render_history(&self.tasks[index], content, buffer);
@@ -2048,7 +2048,7 @@ impl App {
         let row = y
             .saturating_sub(content.y)
             .min(content.height.saturating_sub(1));
-        let text = if self.tasks[index].scroll_offset == 0 {
+        let text = if self.tasks[index].renders_with_terminal_parser(content.height) {
             screen_row_text(&self.tasks[index].parser, row, content.width)
         } else {
             self.tasks[index]
@@ -2222,14 +2222,14 @@ impl App {
 
     fn visible_selection_text(&self, selection: &Selection) -> Option<String> {
         let task = self.tasks.get(selection.pane)?;
-        if task.scroll_offset != 0 {
-            return None;
-        }
         let area = *self.content_rects.get(selection.pane)?;
         if area.width == 0 || area.height == 0 {
             return None;
         }
-        let visible_start = task.history.visible_start(area.height, 0);
+        if !task.renders_with_terminal_parser(area.height) {
+            return None;
+        }
+        let visible_start = task.history.visible_start(area.height, task.scroll_offset);
         let visible_end = visible_start.saturating_add(u64::from(area.height));
         let (start, end) = selection.ordered_points();
         if start.line < visible_start || end.line >= visible_end {
@@ -2358,7 +2358,7 @@ impl App {
         if area.width == 0 || area.height == 0 {
             return None;
         }
-        if task.scroll_offset == 0 {
+        if task.renders_with_terminal_parser(area.height) {
             return Some(task.parser.screen().contents());
         }
 
@@ -2901,6 +2901,7 @@ struct TaskRuntime {
     kill_deadline: Option<Instant>,
     pty_size: PtySize,
     scroll_offset: usize,
+    terminal_scrollback_len: usize,
     history: TextHistory,
 }
 
@@ -2933,6 +2934,7 @@ impl TaskRuntime {
             kill_deadline: None,
             pty_size,
             scroll_offset: 0,
+            terminal_scrollback_len: 0,
             history: TextHistory::new(pty_size.cols, pty_size.rows, SCROLLBACK_LINES),
         }
     }
@@ -2948,6 +2950,7 @@ impl TaskRuntime {
         let generation = self.generation;
         self.status = TaskStatus::Starting;
         self.scroll_offset = 0;
+        self.sync_parser_scrollback();
 
         let pair = native_pty_system()
             .openpty(size)
@@ -3067,8 +3070,10 @@ impl TaskRuntime {
         }
         self.pty_size = size;
         self.history.set_size(size.cols, size.rows);
-        self.scroll_offset = self.scroll_offset.min(self.max_scroll_offset());
         self.parser.set_size(size.rows, size.cols);
+        self.refresh_terminal_scrollback_len();
+        self.scroll_offset = self.scroll_offset.min(self.max_scroll_offset());
+        self.sync_parser_scrollback();
         if let Some(master) = &self.master {
             master.resize(size).ok();
         }
@@ -3091,6 +3096,7 @@ impl TaskRuntime {
     fn clear(&mut self) {
         self.parser = Parser::new(self.pty_size.rows, self.pty_size.cols, SCROLLBACK_LINES);
         self.scroll_offset = 0;
+        self.terminal_scrollback_len = 0;
         self.history.clear();
     }
 
@@ -3100,24 +3106,28 @@ impl TaskRuntime {
             .scroll_offset
             .saturating_add(rows)
             .min(self.max_scroll_offset());
+        self.sync_parser_scrollback();
         self.scroll_offset != previous
     }
 
     fn scroll_down(&mut self, rows: usize) -> bool {
         let previous = self.scroll_offset;
         self.scroll_offset = self.scroll_offset.saturating_sub(rows);
+        self.sync_parser_scrollback();
         self.scroll_offset != previous
     }
 
     fn scroll_to_top(&mut self) -> bool {
         let previous = self.scroll_offset;
         self.scroll_offset = self.max_scroll_offset();
+        self.sync_parser_scrollback();
         self.scroll_offset != previous
     }
 
     fn scroll_to_bottom(&mut self) -> bool {
         let previous = self.scroll_offset;
         self.scroll_offset = 0;
+        self.sync_parser_scrollback();
         self.scroll_offset != previous
     }
 
@@ -3130,30 +3140,68 @@ impl TaskRuntime {
         self.scroll_offset = max_offset
             .saturating_sub(target_start)
             .min(usize::MAX as u64) as usize;
+        self.sync_parser_scrollback();
     }
 
     fn max_scroll_offset(&self) -> usize {
-        self.history
+        let history_scrollback = self
+            .history
             .line_count()
             .saturating_sub(u64::from(self.pty_size.rows))
-            .min(usize::MAX as u64) as usize
+            .min(usize::MAX as u64) as usize;
+        history_scrollback.max(self.parser_scrollback_limit(self.pty_size.rows))
+    }
+
+    fn renders_with_terminal_parser(&self, height: u16) -> bool {
+        self.scroll_offset <= self.parser_scrollback_limit(height)
+    }
+
+    fn parser_scrollback_limit(&self, height: u16) -> usize {
+        self.terminal_scrollback_len.min(usize::from(height))
+    }
+
+    fn sync_parser_scrollback(&mut self) {
+        self.parser.set_scrollback(
+            self.scroll_offset
+                .min(self.parser_scrollback_limit(self.pty_size.rows)),
+        );
+    }
+
+    fn refresh_terminal_scrollback_len(&mut self) {
+        let current = self.parser.screen().scrollback();
+        self.parser.set_scrollback(usize::MAX);
+        self.terminal_scrollback_len = self.parser.screen().scrollback();
+        self.parser
+            .set_scrollback(current.min(self.terminal_scrollback_len));
     }
 
     fn message(&mut self, message: &str) {
         self.scroll_offset = 0;
+        self.sync_parser_scrollback();
         self.history.process(message.as_bytes());
         self.parser.process(message.as_bytes());
+        self.refresh_terminal_scrollback_len();
+        self.sync_parser_scrollback();
     }
 
     fn process_output(&mut self, bytes: &[u8]) {
+        let parser_offset = self.parser.screen().scrollback();
         let added_rows = self.history.process(bytes);
         self.parser.process(bytes);
+        let parser_added_rows = self
+            .parser
+            .screen()
+            .scrollback()
+            .saturating_sub(parser_offset);
+        self.refresh_terminal_scrollback_len();
         if self.scroll_offset > 0 {
+            let added_rows = added_rows.max(parser_added_rows);
             if added_rows > 0 {
                 self.scroll_offset = self.scroll_offset.saturating_add(added_rows);
             }
             self.scroll_offset = self.scroll_offset.min(self.max_scroll_offset());
         }
+        self.sync_parser_scrollback();
     }
 
     fn history_index_for_visible_row(&self, row: u16, height: u16) -> u64 {
@@ -6260,7 +6308,8 @@ mod tests {
 
         task.process_output(b"\x1b[1;1H\x1b[0Jnew screen\r\n");
 
-        assert_eq!(task.scroll_offset, task.max_scroll_offset());
+        let max_scroll_offset = task.max_scroll_offset();
+        assert_eq!(task.scroll_offset, max_scroll_offset);
     }
 
     #[test]
@@ -6831,6 +6880,38 @@ mod tests {
     }
 
     #[test]
+    fn first_scrollback_page_renders_from_terminal_parser() {
+        let mut task = TaskRuntime::new(test_task("web"), PathBuf::from("."));
+        task.resize(20, 4);
+        task.process_output(
+            b"\x1b[32mgreen row\x1b[0m\r\nplain one\r\nplain two\r\nplain three\r\nplain four\r\n",
+        );
+
+        assert!(task.scroll_up(2));
+
+        let area = Rect::new(0, 0, 20, 4);
+        let mut buffer = Buffer::empty(area);
+        render_screen(&task.parser, area, &mut buffer);
+
+        assert_eq!(buffer_line(&buffer, 0, 20).trim_end(), "green row");
+        assert_eq!(buffer[(0, 0)].fg, Color::Indexed(2));
+    }
+
+    #[test]
+    fn scroll_up_uses_terminal_parser_scrollback_when_text_history_lags() {
+        let mut task = TaskRuntime::new(test_task("web"), PathBuf::from("."));
+        task.resize(20, 4);
+        task.process_output(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\n");
+        assert!(task.terminal_scrollback_len > 0);
+
+        task.history.clear();
+
+        assert!(task.scroll_up(1));
+        assert_eq!(task.scroll_offset, 1);
+        assert_eq!(task.parser.screen().scrollback(), 1);
+    }
+
+    #[test]
     fn command_mode_shift_y_copies_full_focused_history() {
         let mut app = test_app();
         app.update_layout(Rect::new(0, 0, 100, 8));
@@ -7281,7 +7362,9 @@ mod tests {
 
         task.resize(40, 40);
 
-        assert_eq!(task.scroll_offset, 0);
+        assert!(task.scroll_offset <= task.max_scroll_offset());
+        assert!(task.renders_with_terminal_parser(40));
+        assert_eq!(task.parser.screen().scrollback(), task.scroll_offset);
     }
 
     #[test]
