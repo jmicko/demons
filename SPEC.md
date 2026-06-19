@@ -54,6 +54,8 @@ layout = "grid"
 # Leader key to toggle command mode.
 # Options: "alt-j" (default), "alt-backtick", "tab", "ctrl-b", "ctrl-q", "ctrl-\\".
 leader = "alt-j"
+# Double/triple-click selection threshold in milliseconds.
+multi_click_ms = 500
 # Reserved for v2. It must remain false in v1.
 logging = false
 
@@ -93,6 +95,7 @@ Validation rules (enforced at startup, fail loudly):
   itself, and cannot form dependency cycles.
 - `start_delay` must be a non-negative integer with an optional unit of `ms`,
   `s`, `m`, or `h`; no unit means seconds.
+- `settings.multi_click_ms` must be between 150 and 1000 milliseconds.
 - Unknown keys are an error (no silent ignoring — the configurator owns the schema).
 - Reserved v2 fields are parseable so future files have a stable schema, but
   v1 rejects `logging = true` and any task that sets `watch`,
@@ -115,15 +118,15 @@ The runtime menu is opened with `?` in command mode or by clicking the footer's
   of other tasks. Working-directory edits validate immediately and support Tab
   completion for directories relative to the config file.
 - **Settings** — app-level settings that can apply immediately, such as the
-  leader key.
+  leader key and double/triple-click timing.
 - **Exit** — discard, save without restarting, save and restart affected, or
   save and restart all. In `demons init`, save/discard closes the configurator
   without starting tasks.
 
 Keyboard behavior follows common TUI menu conventions: arrows move, Enter
-activates, Space toggles dependency checkboxes, Esc backs out one level, and
-text fields support cursor movement and basic line editing. Tab completes
-directories while editing a task's working directory.
+activates, Space toggles dependency checkboxes, Left/Right adjust sliders, Esc
+backs out one level, and text fields support cursor movement and basic line
+editing. Tab completes directories while editing a task's working directory.
 
 ## 5. CLI
 
@@ -175,6 +178,8 @@ Each pane has:
 - A scrollback buffer (default 10,000 lines; configurable in v2).
 - A pane-local text selection buffer derived from task output, used for deep
   scrollback selection and clipboard copy.
+- Mouse selection supports drag selection, double-click word selection, and
+  triple-click visible-line selection within one pane at a time.
 - A PTY-backed child process.
 - Visible focus state: the selected pane's border is green in input mode, red
   in command mode, and yellow in search mode.

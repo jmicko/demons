@@ -9,6 +9,10 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 pub const CONFIG_FILE: &str = "demons.toml";
+pub const DEFAULT_MULTI_CLICK_MS: u64 = 500;
+pub const MIN_MULTI_CLICK_MS: u64 = 150;
+pub const MAX_MULTI_CLICK_MS: u64 = 1000;
+pub const MULTI_CLICK_STEP_MS: u64 = 50;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -24,6 +28,11 @@ pub struct Config {
 pub struct Settings {
     pub layout: Layout,
     pub leader: Leader,
+    #[serde(
+        default = "default_multi_click_ms",
+        skip_serializing_if = "is_default_multi_click_ms"
+    )]
+    pub multi_click_ms: u64,
     #[serde(skip_serializing_if = "is_false")]
     pub logging: bool,
 }
@@ -39,9 +48,18 @@ impl Default for Settings {
         Self {
             layout: Layout::Grid,
             leader: Leader::AltJ,
+            multi_click_ms: DEFAULT_MULTI_CLICK_MS,
             logging: false,
         }
     }
+}
+
+fn default_multi_click_ms() -> u64 {
+    DEFAULT_MULTI_CLICK_MS
+}
+
+fn is_default_multi_click_ms(value: &u64) -> bool {
+    *value == DEFAULT_MULTI_CLICK_MS
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -207,6 +225,12 @@ pub fn validate_for_path(config: &Config, path: &Path) -> Result<()> {
     if config.settings.logging {
         bail!(
             "{}: settings.logging is reserved for a future release and cannot be enabled",
+            path.display()
+        );
+    }
+    if !(MIN_MULTI_CLICK_MS..=MAX_MULTI_CLICK_MS).contains(&config.settings.multi_click_ms) {
+        bail!(
+            "{}: settings.multi_click_ms must be between {MIN_MULTI_CLICK_MS} and {MAX_MULTI_CLICK_MS}",
             path.display()
         );
     }
@@ -683,6 +707,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.settings.leader, Leader::AltJ);
+        assert_eq!(config.settings.multi_click_ms, DEFAULT_MULTI_CLICK_MS);
     }
 
     #[test]
@@ -701,5 +726,36 @@ mod tests {
 
         assert_eq!(config.settings.leader, Leader::AltBacktick);
         assert_eq!(config.settings.leader.label(), "Alt-`");
+    }
+
+    #[test]
+    fn validates_multi_click_timing() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join(CONFIG_FILE);
+        let config: Config = toml::from_str(
+            r#"
+                [settings]
+                multi_click_ms = 400
+
+                [[task]]
+                name = "server"
+                command = "echo ready"
+            "#,
+        )
+        .unwrap();
+        validate_for_path(&config, &path).unwrap();
+
+        let invalid: Config = toml::from_str(
+            r#"
+                [settings]
+                multi_click_ms = 20
+
+                [[task]]
+                name = "server"
+                command = "echo ready"
+            "#,
+        )
+        .unwrap();
+        assert!(validate_for_path(&invalid, &path).is_err());
     }
 }

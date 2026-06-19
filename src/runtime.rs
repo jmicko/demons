@@ -35,7 +35,10 @@ use ratatui::{
 use vt100::{MouseProtocolEncoding, MouseProtocolMode, Parser};
 
 use crate::{
-    config::{Leader, LoadedConfig, Task, TaskCommand, parse_start_delay},
+    config::{
+        Leader, LoadedConfig, MAX_MULTI_CLICK_MS, MIN_MULTI_CLICK_MS, MULTI_CLICK_STEP_MS, Task,
+        TaskCommand, parse_start_delay,
+    },
     layout::{Grid, choose_grid, pane_rects},
 };
 
@@ -174,6 +177,7 @@ struct App {
     stopping: bool,
     pending_escape: Option<Instant>,
     selection: Option<Selection>,
+    last_click: Option<ClickState>,
     clipboard: String,
     notice: Option<Notice>,
     fullscreen: bool,
@@ -227,6 +231,7 @@ impl App {
             stopping: false,
             pending_escape: None,
             selection: None,
+            last_click: None,
             clipboard: String::new(),
             notice: None,
             fullscreen: false,
@@ -627,6 +632,12 @@ impl App {
 
         match key.code {
             KeyCode::Esc => return Ok(self.menu_back_or_close()),
+            KeyCode::Left if self.selected_menu_slider() => {
+                self.adjust_menu_multi_click(-(MULTI_CLICK_STEP_MS as i64));
+            }
+            KeyCode::Right if self.selected_menu_slider() => {
+                self.adjust_menu_multi_click(MULTI_CLICK_STEP_MS as i64);
+            }
             KeyCode::Left => self.cycle_menu_tab(-1),
             KeyCode::Right | KeyCode::Tab => self.cycle_menu_tab(1),
             KeyCode::BackTab => self.cycle_menu_tab(-1),
@@ -839,7 +850,11 @@ impl App {
                     Some(MenuAction::AddTask)
                 }
             }
-            MenuTab::Settings => Some(MenuAction::OpenLeaderPicker),
+            MenuTab::Settings => match menu.cursor {
+                0 => Some(MenuAction::OpenLeaderPicker),
+                1 => Some(MenuAction::AdjustMultiClick(MULTI_CLICK_STEP_MS as i64)),
+                _ => None,
+            },
             MenuTab::Exit => exit_actions(self.quit_when_menu_closes || !self.tasks_started)
                 .get(menu.cursor)
                 .copied()
@@ -874,6 +889,8 @@ impl App {
             MenuAction::ToggleDependency(candidate) => self.toggle_dependency(candidate),
             MenuAction::OpenLeaderPicker => self.open_menu_leader_picker(),
             MenuAction::SelectLeader(leader) => self.set_menu_leader(leader),
+            MenuAction::AdjustMultiClick(delta) => self.adjust_menu_multi_click(delta),
+            MenuAction::SetMultiClick(value) => self.set_menu_multi_click(value),
             MenuAction::Exit(action) => return self.handle_menu_exit_action(action),
         }
         Ok(Action::Continue)
@@ -1151,6 +1168,33 @@ impl App {
             menu.leader_picker = false;
         }
         self.loaded.config.settings.leader = leader;
+    }
+
+    fn selected_menu_slider(&self) -> bool {
+        self.menu
+            .as_ref()
+            .is_some_and(|menu| menu.tab == MenuTab::Settings && menu.cursor == 1)
+    }
+
+    fn adjust_menu_multi_click(&mut self, delta: i64) {
+        let current = self
+            .menu
+            .as_ref()
+            .map(|menu| menu.draft.settings.multi_click_ms)
+            .unwrap_or(self.loaded.config.settings.multi_click_ms);
+        let next = (current as i64)
+            .saturating_add(delta)
+            .clamp(MIN_MULTI_CLICK_MS as i64, MAX_MULTI_CLICK_MS as i64) as u64;
+        self.set_menu_multi_click(next);
+    }
+
+    fn set_menu_multi_click(&mut self, value: u64) {
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        let next = rounded_multi_click_ms(value);
+        menu.draft.settings.multi_click_ms = next;
+        self.loaded.config.settings.multi_click_ms = next;
     }
 
     fn handle_menu_exit_action(&mut self, action: MenuExitAction) -> Result<Action> {
@@ -1672,6 +1716,9 @@ impl App {
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             && self.should_start_selection(index, mouse)
         {
+            if self.handle_multi_click_selection(index, mouse) {
+                return Ok(Action::Continue);
+            }
             self.start_selection(index, mouse);
             return Ok(Action::Continue);
         }
@@ -1773,7 +1820,7 @@ impl App {
                 }
                 return Ok(Action::Continue);
             }
-            MouseEventKind::Down(MouseButton::Left) => {}
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {}
             _ => return Ok(Action::Continue),
         }
         let action = self.menu.as_ref().and_then(|menu| {
@@ -1871,6 +1918,112 @@ impl App {
             dragging: true,
             dragged: false,
             last_mouse: Some((mouse.column, mouse.row)),
+            last_scroll: Instant::now(),
+        });
+    }
+
+    fn handle_multi_click_selection(&mut self, index: usize, mouse: MouseEvent) -> bool {
+        let click_count = self.register_left_click(index, mouse);
+        match click_count {
+            2 => self.select_word_at(index, mouse),
+            3.. => self.select_line_at(index, mouse),
+            _ => false,
+        }
+    }
+
+    fn register_left_click(&mut self, index: usize, mouse: MouseEvent) -> u8 {
+        let now = Instant::now();
+        let threshold = Duration::from_millis(self.loaded.config.settings.multi_click_ms);
+        let count = self
+            .last_click
+            .filter(|click| {
+                click.pane == index
+                    && click.x == mouse.column
+                    && click.y == mouse.row
+                    && now.duration_since(click.at) <= threshold
+            })
+            .map(|click| click.count.saturating_add(1).min(3))
+            .unwrap_or(1);
+
+        self.last_click = Some(ClickState {
+            pane: index,
+            x: mouse.column,
+            y: mouse.row,
+            at: now,
+            count,
+        });
+        count
+    }
+
+    fn select_word_at(&mut self, index: usize, mouse: MouseEvent) -> bool {
+        let Some((point, text)) = self.selection_line_for_mouse(index, mouse.column, mouse.row)
+        else {
+            return false;
+        };
+        let Some((start, end)) = word_columns_at(&text, point.column) else {
+            self.selection = None;
+            return true;
+        };
+        self.set_click_selection(index, point.line, start, end);
+        true
+    }
+
+    fn select_line_at(&mut self, index: usize, mouse: MouseEvent) -> bool {
+        let Some((point, text)) = self.selection_line_for_mouse(index, mouse.column, mouse.row)
+        else {
+            return false;
+        };
+        let width = self
+            .content_rects
+            .get(index)
+            .map(|rect| rect.width)
+            .unwrap_or_default();
+        let len = char_count(text.trim_end()).min(usize::from(width));
+        if len == 0 {
+            self.selection = None;
+            return true;
+        }
+        let end = len.saturating_sub(1).min(usize::from(u16::MAX)) as u16;
+        self.set_click_selection(index, point.line, 0, end);
+        true
+    }
+
+    fn selection_line_for_mouse(
+        &self,
+        index: usize,
+        x: u16,
+        y: u16,
+    ) -> Option<(SelectionPoint, String)> {
+        let point = self.selection_point_for_mouse(index, x, y)?;
+        let content = *self.content_rects.get(index)?;
+        let row = y
+            .saturating_sub(content.y)
+            .min(content.height.saturating_sub(1));
+        let text = if self.tasks[index].scroll_offset == 0 {
+            screen_row_text(&self.tasks[index].parser, row, content.width)
+        } else {
+            self.tasks[index]
+                .history
+                .line(point.line)
+                .map(|line| line.text.clone())
+                .unwrap_or_default()
+        };
+        Some((point, text))
+    }
+
+    fn set_click_selection(&mut self, index: usize, line: u64, start: u16, end: u16) {
+        self.focus = index;
+        self.selection = Some(Selection {
+            pane: index,
+            anchor: SelectionPoint {
+                line,
+                column: start,
+            },
+            cursor: SelectionPoint { line, column: end },
+            history_backed: false,
+            dragging: false,
+            dragged: true,
+            last_mouse: None,
             last_scroll: Instant::now(),
         });
     }
@@ -3027,6 +3180,15 @@ struct Selection {
     last_scroll: Instant,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ClickState {
+    pane: usize,
+    x: u16,
+    y: u16,
+    at: Instant,
+    count: u8,
+}
+
 impl Selection {
     fn ordered_points(&self) -> (SelectionPoint, SelectionPoint) {
         if self.anchor <= self.cursor {
@@ -3494,6 +3656,8 @@ enum MenuAction {
     ToggleDependency(usize),
     OpenLeaderPicker,
     SelectLeader(Leader),
+    AdjustMultiClick(i64),
+    SetMultiClick(u64),
     Exit(MenuExitAction),
 }
 
@@ -3843,7 +4007,9 @@ fn render_menu_help(area: Rect, buffer: &mut Buffer, leader: &str) {
         "f                      Toggle fullscreen pane".to_owned(),
         "PageUp/PageDown        Scroll focused pane".to_owned(),
         "Home/End               Jump to top/bottom of history".to_owned(),
-        "drag / right-click     Select and copy pane text".to_owned(),
+        "drag / double-click    Select text / word".to_owned(),
+        "triple-click           Select a full line".to_owned(),
+        "right-click            Copy selection or paste".to_owned(),
         "y / Y                  Copy visible text / full scrollback".to_owned(),
         "S                      Save full scrollback to a temp log".to_owned(),
         "/                      Search focused pane".to_owned(),
@@ -3858,6 +4024,7 @@ fn render_menu_help(area: Rect, buffer: &mut Buffer, leader: &str) {
         "".to_owned(),
         "Menu".to_owned(),
         "arrows / wheel         Move through visible options".to_owned(),
+        "Left / Right           Adjust slider settings".to_owned(),
         "Enter / click          Activate an option".to_owned(),
         "Space                  Toggle dependency checkboxes".to_owned(),
         "Esc                    Back out one level".to_owned(),
@@ -4049,6 +4216,68 @@ fn render_menu_settings(
         &mut menu.hits,
         hover_position,
     );
+    render_menu_multi_click_row(
+        buffer,
+        Rect::new(area.x, area.y.saturating_add(2), area.width, 1),
+        menu,
+        hover_position,
+    );
+}
+
+fn render_menu_multi_click_row(
+    buffer: &mut Buffer,
+    rect: Rect,
+    menu: &mut MenuState,
+    hover_position: Option<(u16, u16)>,
+) {
+    if rect.width == 0 {
+        return;
+    }
+
+    let value = menu.draft.settings.multi_click_ms;
+    let bar_width = multi_click_slider_width();
+    let bar = slider_bar(value, MIN_MULTI_CLICK_MS, MAX_MULTI_CLICK_MS, bar_width);
+    let prefix = format!("Multi-click timing: {value}ms  ");
+    let text = format!("{prefix}< [{bar}] >");
+    let hovered = hover_position.is_some_and(|(x, y)| contains(rect, x, y));
+    let style = if menu.cursor == 1 {
+        Style::default().fg(THEME_BLACK).bg(THEME_SNOW)
+    } else if hovered {
+        Style::default().fg(THEME_BLACK).bg(THEME_GOLD)
+    } else {
+        Style::default().fg(THEME_SNOW).bg(THEME_BLACK)
+    };
+    render_text(buffer, rect, &text, style);
+
+    let minus_x = rect.x.saturating_add(to_u16(char_count(&prefix)));
+    if minus_x < rect.right() {
+        menu.hits.push(MenuHit {
+            rect: Rect::new(minus_x, rect.y, 1, 1),
+            action: MenuAction::AdjustMultiClick(-(MULTI_CLICK_STEP_MS as i64)),
+        });
+    }
+
+    let slider_x = minus_x.saturating_add(to_u16(char_count("< [")));
+    for index in 0..bar_width {
+        let cell_x = slider_x.saturating_add(to_u16(index));
+        if cell_x >= rect.right() {
+            break;
+        }
+        menu.hits.push(MenuHit {
+            rect: Rect::new(cell_x, rect.y, 1, 1),
+            action: MenuAction::SetMultiClick(multi_click_value_for_slider_index(index, bar_width)),
+        });
+    }
+
+    let plus_x = slider_x
+        .saturating_add(to_u16(bar_width))
+        .saturating_add(to_u16(char_count("] ")));
+    if plus_x < rect.right() {
+        menu.hits.push(MenuHit {
+            rect: Rect::new(plus_x, rect.y, 1, 1),
+            action: MenuAction::AdjustMultiClick(MULTI_CLICK_STEP_MS as i64),
+        });
+    }
 }
 
 fn render_menu_leaders(
@@ -4217,7 +4446,7 @@ fn menu_item_count(menu: &MenuState, configure_only: bool) -> usize {
         MenuTab::Help => 0,
         MenuTab::Tasks if menu.task_detail.is_some() => task_detail_fields().len(),
         MenuTab::Tasks => menu.draft.tasks.len() + 1,
-        MenuTab::Settings => 1,
+        MenuTab::Settings => 2,
         MenuTab::Exit => exit_actions(configure_only).len(),
     }
 }
@@ -4294,6 +4523,40 @@ fn scroll_start(selected: usize, count: usize, visible: usize) -> usize {
         .saturating_add(1)
         .saturating_sub(visible)
         .min(count - visible)
+}
+
+fn slider_bar(value: u64, min: u64, max: u64, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 || max <= min {
+        return "|".to_owned();
+    }
+    let clamped = value.clamp(min, max);
+    let position = ((clamped - min) as usize * (width - 1)) / (max - min) as usize;
+    (0..width)
+        .map(|index| if index == position { '|' } else { '-' })
+        .collect()
+}
+
+fn multi_click_slider_width() -> usize {
+    ((MAX_MULTI_CLICK_MS - MIN_MULTI_CLICK_MS) / MULTI_CLICK_STEP_MS) as usize + 1
+}
+
+fn multi_click_value_for_slider_index(index: usize, width: usize) -> u64 {
+    if width <= 1 {
+        return MIN_MULTI_CLICK_MS;
+    }
+    let steps = ((MAX_MULTI_CLICK_MS - MIN_MULTI_CLICK_MS) / MULTI_CLICK_STEP_MS) as usize;
+    let step_index = (index.min(width - 1) * steps + (width - 1) / 2) / (width - 1);
+    MIN_MULTI_CLICK_MS + step_index as u64 * MULTI_CLICK_STEP_MS
+}
+
+fn rounded_multi_click_ms(value: u64) -> u64 {
+    let clamped = value.clamp(MIN_MULTI_CLICK_MS, MAX_MULTI_CLICK_MS);
+    let offset = clamped - MIN_MULTI_CLICK_MS;
+    let rounded_steps = (offset + MULTI_CLICK_STEP_MS / 2) / MULTI_CLICK_STEP_MS;
+    (MIN_MULTI_CLICK_MS + rounded_steps * MULTI_CLICK_STEP_MS).min(MAX_MULTI_CLICK_MS)
 }
 
 fn exit_actions(configure_only: bool) -> &'static [MenuExitAction] {
@@ -4812,8 +5075,34 @@ fn selection_scroll_step(rect: Rect, y: u16) -> usize {
     usize::from(1 + distance / 3)
 }
 
+fn word_columns_at(text: &str, column: u16) -> Option<(u16, u16)> {
+    let chars = text.chars().collect::<Vec<_>>();
+    let index = usize::from(column);
+    if index >= chars.len() || chars[index].is_whitespace() {
+        return None;
+    }
+
+    let mut start = index;
+    while start > 0 && !chars[start - 1].is_whitespace() {
+        start -= 1;
+    }
+    let mut end = index;
+    while end + 1 < chars.len() && !chars[end + 1].is_whitespace() {
+        end += 1;
+    }
+
+    Some((
+        start.min(usize::from(u16::MAX)) as u16,
+        end.min(usize::from(u16::MAX)) as u16,
+    ))
+}
+
 fn char_count(value: &str) -> usize {
     value.chars().count()
+}
+
+fn to_u16(value: usize) -> u16 {
+    value.min(usize::from(u16::MAX)) as u16
 }
 
 fn replace_char(value: &mut String, index: usize, character: char) {
@@ -5384,13 +5673,22 @@ fn mouse_button_code(button: MouseButton) -> u32 {
 mod tests {
     use std::{collections::BTreeMap, path::PathBuf};
 
-    use crate::config::{CONFIG_FILE, Config, Settings};
+    use crate::config::{CONFIG_FILE, Config, DEFAULT_MULTI_CLICK_MS, Settings};
     use tempfile::tempdir;
 
     use super::*;
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
     }
 
     #[test]
@@ -6070,6 +6368,68 @@ mod tests {
 
         assert_eq!(app.selection.as_ref().unwrap().pane, 0);
         assert!(app.tasks[0].scroll_offset > 0);
+    }
+
+    #[test]
+    fn double_click_selects_word_and_triple_click_selects_line() {
+        let mut app = test_app();
+        app.update_layout(Rect::new(0, 0, 100, 20));
+        app.mode = AppMode::Command;
+        app.tasks[0].process_output(b"alpha beta/gamma\nsecond line\n");
+
+        let first = app.content_rects[0];
+        let column = first.x + 8;
+        let row = first.y;
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), column, row))
+            .unwrap();
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), column, row))
+            .unwrap();
+        assert!(app.selection.is_none());
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), column, row))
+            .unwrap();
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), column, row))
+            .unwrap();
+
+        let selection = app.selection.as_ref().unwrap();
+        assert!(!selection.dragging);
+        assert_eq!(app.selected_text().unwrap(), "beta/gamma");
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), column, row))
+            .unwrap();
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), column, row))
+            .unwrap();
+
+        assert_eq!(app.selected_text().unwrap(), "alpha beta/gamma");
+    }
+
+    #[test]
+    fn stale_click_does_not_count_as_double_click() {
+        let mut app = test_app();
+        app.update_layout(Rect::new(0, 0, 100, 20));
+        app.mode = AppMode::Command;
+        app.loaded.config.settings.multi_click_ms = 150;
+        app.tasks[0].process_output(b"alpha beta\n");
+
+        let first = app.content_rects[0];
+        let column = first.x + 8;
+        let row = first.y;
+        app.last_click = Some(ClickState {
+            pane: 0,
+            x: column,
+            y: row,
+            at: Instant::now() - Duration::from_millis(151),
+            count: 1,
+        });
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), column, row))
+            .unwrap();
+
+        let selection = app.selection.as_ref().unwrap();
+        assert!(selection.dragging);
+        assert!(!selection.dragged);
+        assert!(app.selected_text().is_none());
     }
 
     #[test]
@@ -6853,6 +7213,82 @@ mod tests {
             .unwrap();
         assert_eq!(app.loaded.config.settings.leader, Leader::AltJ);
         assert!(app.menu.is_none());
+    }
+
+    #[test]
+    fn settings_multi_click_adjusts_with_keyboard_and_discard_reverts() {
+        let mut app = test_app();
+        app.open_menu(MenuTab::Settings);
+        app.move_menu_cursor(1);
+
+        app.handle_key(key(KeyCode::Right, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.menu.as_ref().unwrap().tab, MenuTab::Settings);
+        assert_eq!(
+            app.menu.as_ref().unwrap().draft.settings.multi_click_ms,
+            DEFAULT_MULTI_CLICK_MS + MULTI_CLICK_STEP_MS
+        );
+        assert_eq!(
+            app.loaded.config.settings.multi_click_ms,
+            DEFAULT_MULTI_CLICK_MS + MULTI_CLICK_STEP_MS
+        );
+
+        app.apply_menu_action(MenuAction::SetMultiClick(MAX_MULTI_CLICK_MS + 37))
+            .unwrap();
+        assert_eq!(
+            app.menu.as_ref().unwrap().draft.settings.multi_click_ms,
+            MAX_MULTI_CLICK_MS
+        );
+
+        app.handle_menu_exit_action(MenuExitAction::Discard)
+            .unwrap();
+        assert_eq!(
+            app.loaded.config.settings.multi_click_ms,
+            DEFAULT_MULTI_CLICK_MS
+        );
+        assert!(app.menu.is_none());
+    }
+
+    #[test]
+    fn settings_multi_click_slider_accepts_mouse_drag() {
+        let mut app = test_app();
+        app.open_menu(MenuTab::Settings);
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 120, 40));
+        render_menu(
+            Rect::new(0, 0, 120, 40),
+            &mut buffer,
+            app.menu.as_mut().unwrap(),
+            "Alt+J",
+            false,
+            true,
+            None,
+        );
+        let target = app
+            .menu
+            .as_ref()
+            .unwrap()
+            .hits
+            .iter()
+            .find(|hit| matches!(hit.action, MenuAction::SetMultiClick(MAX_MULTI_CLICK_MS)))
+            .unwrap()
+            .rect;
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            target.x,
+            target.y,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            app.menu.as_ref().unwrap().draft.settings.multi_click_ms,
+            MAX_MULTI_CLICK_MS
+        );
+        assert_eq!(
+            app.loaded.config.settings.multi_click_ms,
+            MAX_MULTI_CLICK_MS
+        );
     }
 
     #[test]

@@ -112,14 +112,15 @@ paired commands like `y` / `Y` and `r` / `R` are shown as separate buttons.
 The `? menu` button opens a tabbed menu with Help, Tasks, Settings, and Exit
 sections.
 
-Drag inside a pane to select text. If the child application has enabled mouse
-reporting, use `Shift`-drag to select instead of sending the drag to the child.
-Dragging above or below the pane scrolls that pane's history while keeping the
-selection inside the original pane. Right-click or press `Ctrl+Shift+C` to copy
-the selection; terminals that support OSC 52 receive it on the system
-clipboard. `Ctrl+Shift+V`, middle-click, or right-click with no active
-selection pastes the last copied Demons selection back to the focused pane in
-input mode.
+Drag inside a pane to select text. Double-click selects the word under the
+mouse, and triple-click selects the visible line. If the child application has
+enabled mouse reporting, use `Shift`-drag to select instead of sending the drag
+to the child. Dragging above or below the pane scrolls that pane's history
+while keeping the selection inside the original pane. Right-click or press
+`Ctrl+Shift+C` to copy the selection; terminals that support OSC 52 receive it
+on the system clipboard. `Ctrl+Shift+V`, middle-click, or right-click with no
+active selection pastes the last copied Demons selection back to the focused
+pane in input mode.
 
 In command mode, `y` copies the focused pane's visible text and `Y` copies its
 full scrollback. `S` saves the focused pane's full scrollback to a temp log file
@@ -144,6 +145,7 @@ but some desktops use it for window switching, so it is not the default.
 ```toml
 [settings]
 leader = "alt-backtick" # also: "tab", "ctrl-b", "ctrl-q", "ctrl-\\"
+multi_click_ms = 500    # double/triple-click timing, 150-1000
 ```
 
 ## Testing The Configurator
