@@ -2023,7 +2023,8 @@ impl App {
         match granularity {
             SelectionGranularity::Character => Some(SelectionSpan::single(point)),
             SelectionGranularity::Word => {
-                let (start, end) = word_columns_at(text, point.column)?;
+                let (start, end) =
+                    word_columns_at(text, point.column).unwrap_or((point.column, point.column));
                 Some(SelectionSpan {
                     start: SelectionPoint {
                         line: point.line,
@@ -6886,6 +6887,36 @@ mod tests {
             .unwrap();
         assert!(!app.selection.as_ref().unwrap().dragging);
         assert_eq!(app.selected_text().unwrap(), "beta gamma");
+    }
+
+    #[test]
+    fn double_click_blank_space_still_enters_word_selection_mode() {
+        let mut app = test_app();
+        app.update_layout(Rect::new(0, 0, 100, 20));
+        app.mode = AppMode::Command;
+        app.tasks[0].process_output(b"alpha   beta gamma\n");
+
+        let first = app.content_rects[0];
+        let blank = first.x + 6;
+        let beta = first.x + 10;
+        let row = first.y;
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), blank, row))
+            .unwrap();
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), blank, row))
+            .unwrap();
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), blank, row))
+            .unwrap();
+
+        assert_eq!(
+            app.selection.as_ref().unwrap().granularity,
+            SelectionGranularity::Word
+        );
+        assert!(app.selection.as_ref().unwrap().dragging);
+
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), beta, row))
+            .unwrap();
+        assert_eq!(app.selected_text().unwrap(), "  beta");
     }
 
     #[test]
