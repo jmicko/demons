@@ -23,6 +23,8 @@ All notable user-facing changes should be recorded here before a release.
   parser, preserving colors and terminal layout while scrolling.
 - Fixed drag-selection highlighting so it stays attached to parser-rendered
   scrollback while the pane auto-scrolls.
+- Changed triple-click line selection to highlight the full pane row,
+  including blank cells after the text.
 - Changed `demons init` to open the configurator without starting tasks.
 - Added task dependencies and `start_delay`, including dependent restarts.
 - Added centered pane countdowns for delayed starts.

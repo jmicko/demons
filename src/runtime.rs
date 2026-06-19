@@ -2041,8 +2041,7 @@ impl App {
                     .get(index)
                     .map(|rect| rect.width)
                     .unwrap_or_default();
-                let len = char_count(text.trim_end()).min(usize::from(width));
-                let end = len.saturating_sub(1).min(usize::from(u16::MAX)) as u16;
+                let end = width.saturating_sub(1);
                 Some(SelectionSpan {
                     start: SelectionPoint {
                         line: point.line,
@@ -6847,6 +6846,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(app.selected_text().unwrap(), "alpha beta/gamma");
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 20));
+        render_screen(&app.tasks[0].parser, first, &mut buffer);
+        render_selection(app.selection.as_ref(), &app.tasks[0], first, &mut buffer);
+        assert_eq!(buffer[(first.right() - 1, row)].bg, Color::White);
     }
 
     #[test]
