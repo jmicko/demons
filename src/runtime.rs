@@ -2933,7 +2933,7 @@ impl TaskRuntime {
             kill_deadline: None,
             pty_size,
             scroll_offset: 0,
-            history: TextHistory::new(pty_size.cols, SCROLLBACK_LINES),
+            history: TextHistory::new(pty_size.cols, pty_size.rows, SCROLLBACK_LINES),
         }
     }
 
@@ -3066,7 +3066,7 @@ impl TaskRuntime {
             return;
         }
         self.pty_size = size;
-        self.history.set_width(size.cols);
+        self.history.set_size(size.cols, size.rows);
         self.scroll_offset = self.scroll_offset.min(self.max_scroll_offset());
         self.parser.set_size(size.rows, size.cols);
         if let Some(master) = &self.master {
@@ -3148,11 +3148,11 @@ impl TaskRuntime {
     fn process_output(&mut self, bytes: &[u8]) {
         let added_rows = self.history.process(bytes);
         self.parser.process(bytes);
-        if self.scroll_offset > 0 && added_rows > 0 {
-            self.scroll_offset = self
-                .scroll_offset
-                .saturating_add(added_rows)
-                .min(self.max_scroll_offset());
+        if self.scroll_offset > 0 {
+            if added_rows > 0 {
+                self.scroll_offset = self.scroll_offset.saturating_add(added_rows);
+            }
+            self.scroll_offset = self.scroll_offset.min(self.max_scroll_offset());
         }
     }
 
@@ -3328,22 +3328,26 @@ struct TextHistory {
     first_index: u64,
     current: HistoryLine,
     column: usize,
+    cursor_home: bool,
     pending_wrap: bool,
     width: u16,
+    height: u16,
     max_lines: usize,
     state: TextParserState,
     csi: String,
 }
 
 impl TextHistory {
-    fn new(width: u16, max_lines: usize) -> Self {
+    fn new(width: u16, height: u16, max_lines: usize) -> Self {
         Self {
             lines: VecDeque::new(),
             first_index: 0,
             current: HistoryLine::default(),
             column: 0,
+            cursor_home: false,
             pending_wrap: false,
             width: width.max(1),
+            height: height.max(1),
             max_lines,
             state: TextParserState::Ground,
             csi: String::new(),
@@ -3355,13 +3359,26 @@ impl TextHistory {
         self.first_index = 0;
         self.current = HistoryLine::default();
         self.column = 0;
+        self.cursor_home = false;
         self.pending_wrap = false;
         self.state = TextParserState::Ground;
         self.csi.clear();
     }
 
-    fn set_width(&mut self, width: u16) {
+    fn clear_visible_screen(&mut self) {
+        let finalized_rows_to_remove = usize::from(self.height.saturating_sub(1));
+        for _ in 0..finalized_rows_to_remove.min(self.lines.len()) {
+            self.lines.pop_back();
+        }
+        self.current = HistoryLine::default();
+        self.column = 0;
+        self.cursor_home = false;
+        self.pending_wrap = false;
+    }
+
+    fn set_size(&mut self, width: u16, height: u16) {
         self.width = width.max(1);
+        self.height = height.max(1);
         if self.column >= usize::from(self.width) {
             self.column = usize::from(self.width.saturating_sub(1));
             self.pending_wrap = false;
@@ -3393,8 +3410,12 @@ impl TextHistory {
             match self.state {
                 TextParserState::Ground => match character {
                     '\x1b' => self.state = TextParserState::Escape,
-                    '\n' => added_rows += self.push_current(false),
+                    '\n' => {
+                        self.cursor_home = false;
+                        added_rows += self.push_current(false);
+                    }
                     '\r' => {
+                        self.cursor_home = false;
                         self.column = 0;
                         self.pending_wrap = false;
                     }
@@ -3405,13 +3426,17 @@ impl TextHistory {
                         self.column = self.column.saturating_sub(1);
                     }
                     '\t' => {
+                        self.cursor_home = false;
                         let spaces = 8 - (self.column % 8);
                         for _ in 0..spaces {
                             added_rows += self.put_char(' ');
                         }
                     }
                     character if character.is_control() => {}
-                    character => added_rows += self.put_char(character),
+                    character => {
+                        self.cursor_home = false;
+                        added_rows += self.put_char(character);
+                    }
                 },
                 TextParserState::Escape => match character {
                     '[' => {
@@ -3493,9 +3518,41 @@ impl TextHistory {
     }
 
     fn apply_csi(&mut self, final_byte: char) {
-        if final_byte != 'K' {
+        match final_byte {
+            'H' | 'f' => self.apply_cursor_position(),
+            'J' => self.apply_erase_display(),
+            'K' => self.apply_erase_line(),
+            _ => self.cursor_home = false,
+        }
+    }
+
+    fn apply_cursor_position(&mut self) {
+        let row = csi_param(&self.csi, 0, 1).max(1);
+        let column = csi_param(&self.csi, 1, 1).max(1);
+        self.column = column
+            .saturating_sub(1)
+            .min(usize::from(self.width.saturating_sub(1)));
+        self.pending_wrap = false;
+        self.cursor_home = row == 1 && column == 1;
+    }
+
+    fn apply_erase_display(&mut self) {
+        let mode = first_csi_param(&self.csi).unwrap_or(0);
+        if mode == 3 {
+            self.clear();
             return;
         }
+        if mode == 2 || (mode == 0 && self.cursor_home) {
+            self.clear_visible_screen();
+            return;
+        }
+        if mode == 0 {
+            self.apply_erase_line();
+        }
+        self.cursor_home = false;
+    }
+
+    fn apply_erase_line(&mut self) {
         match first_csi_param(&self.csi).unwrap_or(0) {
             0 => truncate_chars(&mut self.current.text, self.column),
             1 => {
@@ -3509,6 +3566,7 @@ impl TextHistory {
             }
             _ => {}
         }
+        self.cursor_home = false;
     }
 
     fn text_between(&self, anchor: SelectionPoint, cursor: SelectionPoint) -> String {
@@ -5226,6 +5284,20 @@ fn first_csi_param(value: &str) -> Option<usize> {
         .and_then(|param| param.parse().ok())
 }
 
+fn csi_param(value: &str, index: usize, default: usize) -> usize {
+    value
+        .split(';')
+        .nth(index)
+        .and_then(|param| {
+            if param.is_empty() {
+                Some(default)
+            } else {
+                param.parse().ok()
+            }
+        })
+        .unwrap_or(default)
+}
+
 fn search_needle(query: &str) -> Option<String> {
     let needle = query.trim().to_ascii_lowercase();
     (!needle.is_empty()).then_some(needle)
@@ -6120,7 +6192,7 @@ mod tests {
 
     #[test]
     fn text_history_copies_wrapped_rows_without_extra_newlines() {
-        let mut history = TextHistory::new(5, 100);
+        let mut history = TextHistory::new(5, 24, 100);
         history.process(b"alpha\nbravocharlie\nz");
 
         let text = history.text_between(
@@ -6133,7 +6205,7 @@ mod tests {
 
     #[test]
     fn text_history_honors_erase_line_for_progress_output() {
-        let mut history = TextHistory::new(80, 100);
+        let mut history = TextHistory::new(80, 24, 100);
         history.process(b"old progress text\r\x1b[Kdone\n");
 
         let text = history.text_between(
@@ -6148,8 +6220,68 @@ mod tests {
     }
 
     #[test]
+    fn text_history_honors_home_clear_redraws() {
+        let mut history = TextHistory::new(80, 24, 100);
+        history.process(
+            b"\r\n> vashti-web@0.1.0 dev\r\n> vite --host 127.0.0.1\r\n\r\n\r\n\
+              \x1b[1;1H\x1b[0J\r\n  VITE v6.4.2  ready in 103 ms\r\n\r\n  -> Local: http://localhost:5173/\r\n",
+        );
+
+        let text = history.all_text();
+        assert!(!text.contains("vashti-web"));
+        assert!(!text.contains("vite --host"));
+        assert!(text.contains("VITE v6.4.2"));
+        assert!(text.contains("Local: http://localhost:5173/"));
+    }
+
+    #[test]
+    fn vite_home_clear_output_does_not_create_fake_scrollback() {
+        let mut task = TaskRuntime::new(test_task("web"), PathBuf::from("."));
+        task.resize(80, 20);
+
+        task.process_output(
+            b"\r\n> vashti-web@0.1.0 dev\r\n> vite --host 127.0.0.1\r\n\r\n\r\n\
+              \x1b[1;1H\x1b[0J\r\n  VITE v6.4.2  ready in 103 ms\r\n\r\n  -> Local: http://localhost:5173/\r\n",
+        );
+
+        assert_eq!(task.max_scroll_offset(), 0);
+        assert!(!task.scroll_up(3));
+    }
+
+    #[test]
+    fn home_clear_redraw_clamps_existing_scroll_offset() {
+        let mut task = TaskRuntime::new(test_task("web"), PathBuf::from("."));
+        task.resize(80, 10);
+        for line in 0..15 {
+            task.process_output(format!("line {line}\r\n").as_bytes());
+        }
+        task.scroll_to_top();
+        assert!(task.scroll_offset > 0);
+
+        task.process_output(b"\x1b[1;1H\x1b[0Jnew screen\r\n");
+
+        assert_eq!(task.scroll_offset, task.max_scroll_offset());
+    }
+
+    #[test]
+    fn text_history_home_clear_preserves_scrolled_off_history() {
+        let mut history = TextHistory::new(80, 3, 100);
+        history.process(b"old one\r\nold two\r\nvisible one\r\nvisible two\r\nvisible three");
+
+        history.process(b"\x1b[1;1H\x1b[0Jnew screen\r\n");
+
+        let text = history.all_text();
+        assert!(text.contains("old one"));
+        assert!(text.contains("old two"));
+        assert!(!text.contains("visible one"));
+        assert!(!text.contains("visible two"));
+        assert!(!text.contains("visible three"));
+        assert!(text.contains("new screen"));
+    }
+
+    #[test]
     fn text_history_all_text_preserves_scrollback_text() {
-        let mut history = TextHistory::new(80, 100);
+        let mut history = TextHistory::new(80, 24, 100);
         history.process(b"alpha\nbravo");
 
         assert_eq!(history.all_text(), "alpha\nbravo");
@@ -6160,7 +6292,7 @@ mod tests {
 
     #[test]
     fn text_history_finds_matching_lines_case_insensitively() {
-        let mut history = TextHistory::new(80, 100);
+        let mut history = TextHistory::new(80, 24, 100);
         history.process(b"alpha\nerror one\nERROR two\n");
 
         assert_eq!(history.matching_lines("error"), vec![1, 2]);
