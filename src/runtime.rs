@@ -1465,7 +1465,7 @@ impl App {
             return;
         }
 
-        self.select_search_match(pane, &matches, 0);
+        self.select_search_match(pane, &matches, matches.len() - 1);
     }
 
     fn move_search_result(&mut self, direction: SearchDirection) {
@@ -6304,18 +6304,18 @@ mod tests {
         }
 
         let search = app.search.as_ref().unwrap();
-        assert_eq!(search.current_index, Some(0));
+        assert_eq!(search.current_index, Some(1));
         assert_eq!(search.match_count, 2);
-        assert_eq!(search_result_status(search).as_deref(), Some("1/2 matches"));
-        assert_eq!(app.selected_text().unwrap(), "beta one");
+        assert_eq!(search_result_status(search).as_deref(), Some("2/2 matches"));
+        assert_eq!(app.selected_text().unwrap(), "beta two");
 
-        app.handle_key(key(KeyCode::Enter, KeyModifiers::SHIFT))
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
 
         let search = app.search.as_ref().unwrap();
-        assert_eq!(search.current_index, Some(1));
-        assert_eq!(search_result_status(search).as_deref(), Some("2/2 matches"));
-        assert_eq!(app.selected_text().unwrap(), "beta two");
+        assert_eq!(search.current_index, Some(0));
+        assert_eq!(search_result_status(search).as_deref(), Some("1/2 matches"));
+        assert_eq!(app.selected_text().unwrap(), "beta one");
     }
 
     #[test]
@@ -6492,8 +6492,6 @@ mod tests {
             app.handle_key(key(KeyCode::Char(character), KeyModifiers::NONE))
                 .unwrap();
         }
-        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
-            .unwrap();
         assert_eq!(app.selected_text().unwrap(), "error 25");
 
         app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
