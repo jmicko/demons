@@ -32,7 +32,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget, Wrap},
 };
 use vt100::{MouseProtocolEncoding, MouseProtocolMode, Parser};
 
@@ -69,6 +69,7 @@ const THEME_BACKGROUND: Color = Color::Rgb(8, 17, 15);
 const THEME_PANEL: Color = Color::Rgb(22, 33, 29);
 const THEME_MENU: Color = Color::Rgb(34, 48, 43);
 const THEME_FOOTER: Color = Color::Rgb(36, 45, 42);
+const THEME_ACCENT_MARK: &str = "❄";
 
 type ProcessRegistry = Arc<Mutex<HashSet<u32>>>;
 
@@ -437,7 +438,14 @@ impl App {
                         })
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(" "),
+                Span::styled(
+                    if focused { " ✦ " } else { " " },
+                    pane_style().fg(if focused {
+                        THEME_GOLD_HOVER
+                    } else {
+                        THEME_HOLLY
+                    }),
+                ),
             ]);
             let restart = Line::from(Span::styled(
                 " [↻] ",
@@ -3098,12 +3106,12 @@ impl App {
             .as_ref()
             .filter(|_| self.mode == AppMode::Search)
         {
-            return ("SEARCH", THEME_GOLD, search_footer_items(search));
+            return ("❄ SEARCH ❄", THEME_GOLD, search_footer_items(search));
         }
 
         match self.mode {
             AppMode::Input => (
-                "INPUT MODE",
+                "❄ INPUT ❄",
                 THEME_GREEN,
                 vec![
                     footer_status(
@@ -3116,8 +3124,8 @@ impl App {
                     footer_status("right-click copy"),
                 ],
             ),
-            AppMode::Command => ("COMMAND MODE", THEME_COMMAND, command_footer_items()),
-            AppMode::Search => ("SEARCH", THEME_GOLD, search_placeholder_footer_items()),
+            AppMode::Command => ("❄ COMMAND ❄", THEME_COMMAND, command_footer_items()),
+            AppMode::Search => ("❄ SEARCH ❄", THEME_GOLD, search_placeholder_footer_items()),
         }
     }
 
@@ -4773,10 +4781,11 @@ fn render_menu(
     Clear.render(popup, buffer);
     Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(menu_style().fg(THEME_GOLD))
         .style(menu_style())
         .title(Line::styled(
-            " Demons Menu ",
+            format!(" {THEME_ACCENT_MARK} Demons Menu {THEME_ACCENT_MARK} "),
             menu_style()
                 .fg(THEME_GOLD_HOVER)
                 .add_modifier(Modifier::BOLD),
@@ -4844,6 +4853,12 @@ fn render_menu(
             rect,
             text,
             Style::default().fg(THEME_BLACK).bg(THEME_GOLD),
+        );
+    }
+    if inner.height > 1 {
+        render_ribbon(
+            buffer,
+            Rect::new(inner.x, inner.y.saturating_add(1), inner.width, 1),
         );
     }
 
@@ -5705,6 +5720,24 @@ fn clear_rect(buffer: &mut Buffer, rect: Rect, style: Style) {
                 .set_symbol(" ")
                 .set_style(style);
         }
+    }
+}
+
+fn render_ribbon(buffer: &mut Buffer, rect: Rect) {
+    for column in 0..rect.width {
+        let color = match column % 8 {
+            0 | 1 | 2 => THEME_RED,
+            3 | 4 | 5 => THEME_SNOW,
+            _ => THEME_GOLD,
+        };
+        let fg = if color == THEME_RED {
+            THEME_WHITE
+        } else {
+            THEME_BLACK
+        };
+        buffer[(rect.x + column, rect.y)]
+            .set_symbol(" ")
+            .set_style(Style::default().fg(fg).bg(color));
     }
 }
 
@@ -6608,6 +6641,7 @@ fn render_quit_confirm(area: Rect, buffer: &mut Buffer) {
     .block(
         Block::default()
             .borders(Borders::ALL)
+            .border_type(BorderType::Double)
             .border_style(Style::default().fg(THEME_RED))
             .style(menu_style()),
     )
@@ -6645,7 +6679,10 @@ fn render_problem_intro(area: Rect, buffer: &mut Buffer) {
     }
     Clear.render(popup, buffer);
     Paragraph::new(vec![
-        Line::styled("Config Problems", menu_heading_style()),
+        Line::styled(
+            format!("{THEME_ACCENT_MARK} Config Problems {THEME_ACCENT_MARK}"),
+            menu_heading_style(),
+        ),
         Line::raw(""),
         Line::from(vec![
             Span::styled(
@@ -6675,6 +6712,7 @@ fn render_problem_intro(area: Rect, buffer: &mut Buffer) {
     .block(
         Block::default()
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(THEME_GOLD))
             .style(menu_style()),
     )
@@ -6689,7 +6727,10 @@ fn render_welcome_intro(area: Rect, buffer: &mut Buffer) {
     }
     Clear.render(popup, buffer);
     Paragraph::new(vec![
-        Line::styled("Welcome to Demons", menu_heading_style()),
+        Line::styled(
+            format!("{THEME_ACCENT_MARK} Welcome to Demons {THEME_ACCENT_MARK}"),
+            menu_heading_style(),
+        ),
         Line::raw(""),
         Line::raw("This project does not have a demons.toml yet."),
         Line::raw("Use Tasks to add the commands you run for this project."),
@@ -6704,6 +6745,7 @@ fn render_welcome_intro(area: Rect, buffer: &mut Buffer) {
     .block(
         Block::default()
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(THEME_GOLD))
             .style(menu_style()),
     )
@@ -7026,10 +7068,11 @@ fn footer_command_button(
 }
 
 fn footer_palette_for_index(index: usize) -> FooterItemStyle {
-    match index % 4 {
+    match index % 5 {
         0 => footer_style(THEME_BLACK, THEME_SNOW, THEME_BLACK, THEME_GOLD_HOVER),
         1 => footer_style(THEME_WHITE, THEME_RED, THEME_WHITE, THEME_RED_HOVER),
-        2 => footer_style(THEME_WHITE, THEME_GREEN, THEME_WHITE, THEME_GREEN_HOVER),
+        2 => footer_style(THEME_BLACK, THEME_SNOW, THEME_BLACK, THEME_GOLD_HOVER),
+        3 => footer_style(THEME_WHITE, THEME_RED, THEME_WHITE, THEME_RED_HOVER),
         _ => footer_style(THEME_BLACK, THEME_GOLD, THEME_BLACK, THEME_GOLD_HOVER),
     }
 }
@@ -7797,12 +7840,13 @@ mod tests {
 
         assert_eq!(items[0].style.fg, THEME_BLACK);
         assert_eq!(items[1].style.fg, THEME_WHITE);
-        assert_eq!(items[2].style.fg, THEME_WHITE);
-        assert_eq!(items[3].style.fg, THEME_BLACK);
+        assert_eq!(items[2].style.fg, THEME_BLACK);
+        assert_eq!(items[3].style.fg, THEME_WHITE);
         assert_eq!(items[0].style.bg, THEME_SNOW);
         assert_eq!(items[1].style.bg, THEME_RED);
-        assert_eq!(items[2].style.bg, THEME_GREEN);
-        assert_eq!(items[3].style.bg, THEME_GOLD);
+        assert_eq!(items[2].style.bg, THEME_SNOW);
+        assert_eq!(items[3].style.bg, THEME_RED);
+        assert_eq!(items[4].style.bg, THEME_GOLD);
     }
 
     #[test]
@@ -7811,7 +7855,7 @@ mod tests {
         app.mode = AppMode::Command;
 
         let (label, color, _) = app.footer_parts(Instant::now());
-        assert_eq!((label, color), ("COMMAND MODE", THEME_COMMAND));
+        assert_eq!((label, color), ("❄ COMMAND ❄", THEME_COMMAND));
     }
 
     #[test]
@@ -7995,9 +8039,9 @@ mod tests {
         assert_eq!(items[1].text, " Enter previous ");
         assert_eq!(items[2].text, " Shift+Enter next ");
         assert_eq!(items[1].style.bg, THEME_RED);
-        assert_eq!(items[2].style.bg, THEME_GREEN);
-        assert_eq!(items[3].style.bg, THEME_GOLD);
-        assert_eq!(items[4].style.bg, THEME_SNOW);
+        assert_eq!(items[2].style.bg, THEME_SNOW);
+        assert_eq!(items[3].style.bg, THEME_RED);
+        assert_eq!(items[4].style.bg, THEME_GOLD);
     }
 
     #[test]
