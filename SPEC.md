@@ -28,7 +28,8 @@ Demons is intentionally minimal: it is **not** a session manager, a process supe
 - Plugin or extension system.
 - File-watcher-based auto-restart (planned for v2; v1 has manual `r` restart only).
 - Themeable colors (planned for v2).
-- Pane output logging to file (planned for v2).
+- Automatic pane output logging to file (planned for v2). Manual scrollback
+  export is available with `S`.
 
 ## 4. Configuration
 
@@ -46,6 +47,11 @@ Demons is intentionally minimal: it is **not** a session manager, a process supe
 ### 4.2 Schema
 
 ```toml
+# Config schema version, separate from the Demons app/crate version.
+# Current unversioned configs are treated as schema_version = 1 and are
+# normalized after they successfully validate.
+schema_version = 1
+
 # Optional. Demons-level settings.
 [settings]
 # Layout strategy. "grid" (default) picks the closest-to-square arrangement
@@ -86,6 +92,8 @@ start_delay = "3s"
 
 Validation rules (enforced at startup, fail loudly):
 
+- `schema_version` must be `1` for this release. Missing `schema_version` is
+  treated as `1` for compatibility with existing configs.
 - At least one `[[task]]` is required.
 - `name` is required and unique per file.
 - `command` is required and non-empty.
@@ -109,19 +117,40 @@ directory or its parents; if none exists, it creates `./demons.toml` when the
 user saves. If stdin or stdout is not a TTY, `demons init` errors out:
 `demons init requires an interactive terminal`.
 
+If an existing config is parseable TOML but schema-invalid or contains
+validation errors, the configurator recovers the understood fields into an
+editable draft. Red `!` markers show problems that block saving. Gold `!`
+markers show fields Demons repaired or ignored for review. Markers bubble from
+field to task to tab, and the Exit tab lists all problems with jump targets. The
+original file is not rewritten while red problems remain; after all red
+problems are fixed, writing happens only when the user saves. Bare missing
+assignment values such as `command =` recover as empty strings and then surface
+as field-level problems. If TOML is too malformed to recover structurally, the
+configurator opens a fresh draft that overwrites the broken file only if the
+user saves. Unsupported future `schema_version` values remain hard errors.
+
+When regular `demons` startup finds recoverable config problems in an
+interactive terminal, it opens the configurator without starting tasks. Saving a
+valid config starts the task set in the same session. Saving task-list changes
+while tasks are already running applies them live; added, removed, or renamed
+tasks rebuild and restart the task set without restarting Demons.
+
 The runtime menu is opened with `?` in command mode or by clicking the footer's
 `? menu` button. The menu has top tabs:
 
 - **Help** — command reference.
 - **Tasks** — task list. Enter or click a task to edit name, command, cwd, env,
-  dependencies, and start delay. Dependencies are selected from a checkbox list
-  of other tasks. Working-directory edits validate immediately and support Tab
-  completion for directories relative to the config file.
+  dependencies, and start delay. Environment variables use a nested key/value
+  list with add, key edit, value edit, and delete actions. Dependencies are
+  selected from a checkbox list of other tasks. Working-directory edits validate
+  immediately and support Tab completion for directories relative to the config
+  file.
 - **Settings** — app-level settings that can apply immediately, such as the
   leader key and double/triple-click timing.
-- **Exit** — discard, save without restarting, save and restart affected, or
-  save and restart all. In `demons init`, save/discard closes the configurator
-  without starting tasks.
+- **Exit** — discard, save without restarting, save and restart affected, save
+  and restart all, and a Problems section when the draft has config problems.
+  In `demons init`, save/discard closes the configurator without starting
+  tasks.
 
 Keyboard behavior follows common TUI menu conventions: arrows move, Enter
 activates, Space toggles dependency checkboxes, Left/Right adjust sliders, Esc
@@ -182,8 +211,8 @@ Each pane has:
   word-granularity dragging, and triple-click visible-line selection with
   line-granularity dragging within one pane at a time.
 - A PTY-backed child process.
-- Visible focus state: the selected pane's border is green in input mode, red
-  in command mode, and yellow in search mode.
+- Visible focus state: the selected pane's border is green in input mode and
+  gold in command/search modes.
 - A footer shows the current mode and available controls, wrapping command
   buttons to additional lines when the terminal is narrow.
 - A fixed-width button at the left of the footer displays and toggles the
@@ -292,7 +321,8 @@ For each task:
 - File-watch-based auto-restart (v2).
 - `run_on_change` (v2).
 - `repeat`-interval tasks (v2).
-- Pane output logging to file (v2).
+- Automatic pane output logging to file (v2). Manual scrollback export is
+  available in v1.
 - Themes / colors (v2).
 - Distributed execution.
 - Windows.
@@ -302,25 +332,38 @@ For each task:
 ## 9. Example `demons.toml`
 
 ```toml
+schema_version = 1
+
 [settings]
 layout = "grid"
 leader = "alt-j"
+multi_click_ms = 500
+logging = false
 
 [[task]]
 name = "server"
 command = "cargo run"
 cwd = "."
+depends_on = []
+
+[task.env]
 
 [[task]]
 name = "web"
 command = "npm run dev -- --host 0.0.0.0"
 cwd = "./web"
-env = { BROWSER = "none" }
+depends_on = []
+
+[task.env]
+BROWSER = "none"
 
 [[task]]
 name = "tail-logs"
 command = "tail -f /tmp/app.log"
 cwd = "."
+depends_on = []
+
+[task.env]
 ```
 
 ## 10. Open questions (low priority)
