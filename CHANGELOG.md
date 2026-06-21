@@ -54,7 +54,7 @@ All notable user-facing changes should be recorded here before a release.
 - Changed `demons init` to open the configurator without starting tasks.
 - Added task dependencies and `start_delay`, including dependent restarts.
 - Added centered pane countdowns for delayed starts.
-- Added clickable, wrapping footer command buttons and the Christmas color
-  theme.
+- Added clickable, wrapping footer command buttons and refreshed terminal
+  colors.
 - Added close confirmation that works consistently from command mode and from
   input mode once the focused pane can no longer accept input.

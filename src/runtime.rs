@@ -54,16 +54,45 @@ const MODE_BUTTON_WIDTH: u16 = 13;
 const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(45);
 const NOTICE_DURATION: Duration = Duration::from_secs(6);
 const MAX_FULL_HISTORY_OSC52_BYTES: usize = 512 * 1024;
-const THEME_RED: Color = Color::Red;
-const THEME_GREEN: Color = Color::Green;
-const THEME_SNOW: Color = Color::Gray;
-const THEME_GOLD: Color = Color::Yellow;
+const THEME_RED: Color = Color::Rgb(132, 22, 36);
+const THEME_RED_HOVER: Color = Color::Rgb(168, 44, 55);
+const THEME_GREEN: Color = Color::Rgb(44, 107, 78);
+const THEME_GREEN_HOVER: Color = Color::Rgb(61, 132, 96);
+const THEME_SNOW: Color = Color::Rgb(229, 224, 204);
+const THEME_GOLD: Color = Color::Rgb(188, 146, 54);
+const THEME_GOLD_HOVER: Color = Color::Rgb(224, 185, 82);
 const THEME_COMMAND: Color = THEME_GOLD;
-const THEME_HOLLY: Color = Color::DarkGray;
-const THEME_BLACK: Color = Color::Black;
-const THEME_WHITE: Color = Color::White;
+const THEME_HOLLY: Color = Color::Rgb(91, 111, 100);
+const THEME_BLACK: Color = Color::Rgb(11, 20, 17);
+const THEME_WHITE: Color = Color::Rgb(246, 241, 220);
+const THEME_BACKGROUND: Color = Color::Rgb(8, 17, 15);
+const THEME_PANEL: Color = Color::Rgb(22, 33, 29);
+const THEME_MENU: Color = Color::Rgb(34, 48, 43);
+const THEME_FOOTER: Color = Color::Rgb(36, 45, 42);
 
 type ProcessRegistry = Arc<Mutex<HashSet<u32>>>;
+
+fn app_style() -> Style {
+    Style::default().fg(THEME_WHITE).bg(THEME_BACKGROUND)
+}
+
+fn pane_style() -> Style {
+    Style::default().fg(THEME_WHITE).bg(THEME_PANEL)
+}
+
+fn menu_style() -> Style {
+    Style::default().fg(THEME_SNOW).bg(THEME_MENU)
+}
+
+fn menu_heading_style() -> Style {
+    menu_style()
+        .fg(THEME_GOLD_HOVER)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn footer_base_style() -> Style {
+    Style::default().fg(THEME_SNOW).bg(THEME_FOOTER)
+}
 
 pub fn run(loaded: LoadedConfig) -> Result<()> {
     run_with_options(
@@ -378,6 +407,7 @@ impl App {
         self.update_layout(frame_area);
         let buffer = frame.buffer_mut();
         self.footer_hits.clear();
+        clear_rect(buffer, frame_area, app_style());
 
         for index in 0..self.tasks.len() {
             let area = self.pane_rects[index];
@@ -395,22 +425,33 @@ impl App {
             let (status, status_color) = self.tasks[index].status_label();
             let title = Line::from(vec![
                 Span::raw(" "),
-                Span::styled(status, Style::default().fg(status_color)),
+                Span::styled(status, pane_style().fg(status_color)),
                 Span::raw(" "),
                 Span::styled(
                     self.tasks[index].task.name.as_str(),
-                    Style::default().add_modifier(Modifier::BOLD),
+                    pane_style()
+                        .fg(if focused {
+                            THEME_GOLD_HOVER
+                        } else {
+                            THEME_HOLLY
+                        })
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
             ]);
             let restart = Line::from(Span::styled(
                 " [↻] ",
-                Style::default().fg(if focused { THEME_GOLD } else { THEME_SNOW }),
+                pane_style().fg(if focused {
+                    THEME_GOLD_HOVER
+                } else {
+                    THEME_HOLLY
+                }),
             ))
             .right_aligned();
             let block = Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(border_color))
+                .border_style(pane_style().fg(border_color))
+                .style(pane_style())
                 .title(title)
                 .title(restart);
             block.render(area, buffer);
@@ -4732,12 +4773,12 @@ fn render_menu(
     Clear.render(popup, buffer);
     Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(THEME_RED))
-        .style(Style::default().fg(THEME_SNOW).bg(THEME_BLACK))
+        .border_style(menu_style().fg(THEME_GOLD))
+        .style(menu_style())
         .title(Line::styled(
             " Demons Menu ",
-            Style::default()
-                .fg(THEME_GREEN)
+            menu_style()
+                .fg(THEME_GOLD_HOVER)
                 .add_modifier(Modifier::BOLD),
         ))
         .render(popup, buffer);
@@ -4749,9 +4790,11 @@ fn render_menu(
             buffer,
             close,
             " x ",
-            Style::default()
-                .fg(THEME_BLACK)
-                .bg(if close_hovered { THEME_RED } else { THEME_SNOW }),
+            Style::default().fg(THEME_BLACK).bg(if close_hovered {
+                THEME_RED_HOVER
+            } else {
+                THEME_SNOW
+            }),
         );
         menu.hits.push(MenuHit {
             rect: close,
@@ -4777,12 +4820,12 @@ fn render_menu(
         let style = if selected {
             Style::default()
                 .fg(THEME_BLACK)
-                .bg(THEME_GREEN)
+                .bg(THEME_SNOW)
                 .add_modifier(Modifier::BOLD)
         } else if hovered {
-            Style::default().fg(THEME_BLACK).bg(THEME_GOLD)
+            Style::default().fg(THEME_BLACK).bg(THEME_GOLD_HOVER)
         } else {
-            Style::default().fg(THEME_SNOW).bg(THEME_BLACK)
+            menu_style()
         };
         render_text(buffer, rect, &label, style);
         render_tab_problem_badges(buffer, rect, tab.label(), badges, selected, hovered);
@@ -4810,11 +4853,7 @@ fn render_menu(
         inner.width,
         inner.height.saturating_sub(2),
     );
-    clear_rect(
-        buffer,
-        body,
-        Style::default().fg(THEME_SNOW).bg(THEME_BLACK),
-    );
+    clear_rect(buffer, body, menu_style());
     if let Some(edit) = menu.edit.as_ref() {
         render_menu_edit(body, buffer, edit);
         return;
@@ -4876,12 +4915,9 @@ fn render_menu_help(area: Rect, buffer: &mut Buffer, leader: &str) {
             break;
         }
         let style = if line == "Command mode" || line == "Menu" {
-            Style::default()
-                .fg(THEME_GREEN)
-                .bg(THEME_BLACK)
-                .add_modifier(Modifier::BOLD)
+            menu_heading_style()
         } else {
-            Style::default().fg(THEME_SNOW).bg(THEME_BLACK)
+            menu_style()
         };
         render_text(
             buffer,
@@ -4906,10 +4942,7 @@ fn render_menu_tasks(
         buffer,
         Rect::new(area.x, area.y, area.width, 1),
         "Tasks",
-        Style::default()
-            .fg(THEME_GREEN)
-            .bg(THEME_BLACK)
-            .add_modifier(Modifier::BOLD),
+        menu_heading_style(),
     );
     let rows = area.height.saturating_sub(1);
     let count = menu.draft.tasks.len() + 1;
@@ -4966,10 +4999,7 @@ fn render_menu_task_detail(
         buffer,
         Rect::new(area.x, area.y, area.width, 1),
         &format!("Task: {}", task.name),
-        Style::default()
-            .fg(THEME_GREEN)
-            .bg(THEME_BLACK)
-            .add_modifier(Modifier::BOLD),
+        menu_heading_style(),
     );
     let fields = task_detail_fields();
     let problems = menu_problems(menu);
@@ -5009,10 +5039,7 @@ fn render_menu_dependencies(
         buffer,
         Rect::new(area.x, area.y, area.width, 1),
         &format!("Dependencies for {task_name}"),
-        Style::default()
-            .fg(THEME_GREEN)
-            .bg(THEME_BLACK)
-            .add_modifier(Modifier::BOLD),
+        menu_heading_style(),
     );
     let candidates = dependency_candidates(menu, task);
     if candidates.is_empty() {
@@ -5020,7 +5047,7 @@ fn render_menu_dependencies(
             buffer,
             Rect::new(area.x, area.y.saturating_add(2), area.width, 1),
             "No other tasks are configured.",
-            Style::default().fg(THEME_SNOW).bg(THEME_BLACK),
+            menu_style(),
         );
         return;
     }
@@ -5080,10 +5107,7 @@ fn render_menu_env_list(
         buffer,
         Rect::new(area.x, area.y, area.width, 1),
         &format!("Environment for {}", task.name),
-        Style::default()
-            .fg(THEME_GREEN)
-            .bg(THEME_BLACK)
-            .add_modifier(Modifier::BOLD),
+        menu_heading_style(),
     );
 
     let rows = area.height.saturating_sub(1);
@@ -5139,10 +5163,7 @@ fn render_menu_env_detail(
         buffer,
         Rect::new(area.x, area.y, area.width, 1),
         &format!("Environment variable: {key}"),
-        Style::default()
-            .fg(THEME_GREEN)
-            .bg(THEME_BLACK)
-            .add_modifier(Modifier::BOLD),
+        menu_heading_style(),
     );
 
     let rows = [
@@ -5180,10 +5201,7 @@ fn render_menu_settings(
         buffer,
         Rect::new(area.x, area.y, area.width, 1),
         "Settings",
-        Style::default()
-            .fg(THEME_GREEN)
-            .bg(THEME_BLACK)
-            .add_modifier(Modifier::BOLD),
+        menu_heading_style(),
     );
     let problems = menu_problems(menu);
     render_menu_static_setting_row(
@@ -5282,9 +5300,9 @@ fn render_menu_multi_click_row(
     let style = if menu.cursor == 2 {
         Style::default().fg(THEME_BLACK).bg(THEME_SNOW)
     } else if hovered {
-        Style::default().fg(THEME_BLACK).bg(THEME_GOLD)
+        Style::default().fg(THEME_BLACK).bg(THEME_GOLD_HOVER)
     } else {
-        Style::default().fg(THEME_SNOW).bg(THEME_BLACK)
+        menu_style()
     };
     render_text(buffer, rect, &text, style);
     render_problem_badges(
@@ -5343,10 +5361,7 @@ fn render_menu_leaders(
         buffer,
         Rect::new(area.x, area.y, area.width, 1),
         "Leader key",
-        Style::default()
-            .fg(THEME_GREEN)
-            .bg(THEME_BLACK)
-            .add_modifier(Modifier::BOLD),
+        menu_heading_style(),
     );
     let leaders = all_leaders();
     let rows = area.height.saturating_sub(1);
@@ -5385,10 +5400,7 @@ fn render_menu_exit(
         } else {
             "Exit"
         },
-        Style::default()
-            .fg(THEME_GREEN)
-            .bg(THEME_BLACK)
-            .add_modifier(Modifier::BOLD),
+        menu_heading_style(),
     );
     let actions = exit_actions(exit_mode);
     let problems = menu_problems(menu);
@@ -5419,10 +5431,7 @@ fn render_menu_exit(
         buffer,
         Rect::new(area.x, y, area.width, 1),
         "Problems",
-        Style::default()
-            .fg(THEME_GREEN)
-            .bg(THEME_BLACK)
-            .add_modifier(Modifier::BOLD),
+        menu_heading_style(),
     );
     y = y.saturating_add(1);
     if problems.is_empty() {
@@ -5431,7 +5440,7 @@ fn render_menu_exit(
                 buffer,
                 Rect::new(area.x, y, area.width, 1),
                 "No config problems.",
-                Style::default().fg(THEME_SNOW).bg(THEME_BLACK),
+                menu_style(),
             );
         }
         return;
@@ -5473,10 +5482,7 @@ fn render_menu_edit(area: Rect, buffer: &mut Buffer, edit: &MenuEdit) {
         buffer,
         Rect::new(area.x, area.y, area.width, 1),
         &format!("Editing {}", menu_edit_title(edit)),
-        Style::default()
-            .fg(THEME_GREEN)
-            .bg(THEME_BLACK)
-            .add_modifier(Modifier::BOLD),
+        menu_heading_style(),
     );
     let mut value = edit.value.clone();
     let cursor = byte_index_for_char(&value, edit.cursor);
@@ -5491,7 +5497,7 @@ fn render_menu_edit(area: Rect, buffer: &mut Buffer, edit: &MenuEdit) {
         buffer,
         Rect::new(area.x, area.y.saturating_add(4), area.width, 1),
         "Enter saves this field. Esc cancels.",
-        Style::default().fg(THEME_SNOW).bg(THEME_BLACK),
+        menu_style(),
     );
 }
 
@@ -5508,9 +5514,9 @@ fn render_menu_row(
     let style = if selected {
         Style::default().fg(THEME_BLACK).bg(THEME_SNOW)
     } else if hovered {
-        Style::default().fg(THEME_BLACK).bg(THEME_GOLD)
+        Style::default().fg(THEME_BLACK).bg(THEME_GOLD_HOVER)
     } else {
-        Style::default().fg(THEME_SNOW).bg(THEME_BLACK)
+        menu_style()
     };
     render_text(buffer, rect, text, style);
     if let Some(action) = action {
@@ -5522,19 +5528,19 @@ fn row_bg_color(selected: bool, hovered: bool) -> Color {
     if selected {
         THEME_SNOW
     } else if hovered {
-        THEME_GOLD
+        THEME_GOLD_HOVER
     } else {
-        THEME_BLACK
+        THEME_MENU
     }
 }
 
 fn tab_bg_color(selected: bool, hovered: bool) -> Color {
     if selected {
-        THEME_GREEN
+        THEME_SNOW
     } else if hovered {
-        THEME_GOLD
+        THEME_GOLD_HOVER
     } else {
-        THEME_BLACK
+        THEME_MENU
     }
 }
 
@@ -5627,8 +5633,13 @@ fn render_text(buffer: &mut Buffer, rect: Rect, text: &str, style: Style) {
     }
     for (column, character) in text.chars().take(usize::from(rect.width)).enumerate() {
         let mut encoded = [0_u8; 4];
+        let symbol = if character.is_control() {
+            " "
+        } else {
+            character.encode_utf8(&mut encoded)
+        };
         buffer[(rect.x + column as u16, rect.y)]
-            .set_symbol(character.encode_utf8(&mut encoded))
+            .set_symbol(symbol)
             .set_style(style);
     }
 }
@@ -5860,8 +5871,8 @@ fn problem_badge_width(badges: ProblemBadges) -> usize {
 
 fn problem_color(severity: ConfigProblemSeverity) -> Color {
     match severity {
-        ConfigProblemSeverity::Error => THEME_RED,
-        ConfigProblemSeverity::Warning => THEME_GOLD,
+        ConfigProblemSeverity::Error => THEME_RED_HOVER,
+        ConfigProblemSeverity::Warning => THEME_GOLD_HOVER,
     }
 }
 
@@ -6328,24 +6339,27 @@ fn common_prefix(values: &[String]) -> String {
 
 fn render_history(task: &TaskRuntime, area: Rect, buffer: &mut Buffer) {
     let start = task.history.visible_start(area.height, task.scroll_offset);
+    clear_rect(buffer, area, pane_style());
     for row in 0..area.height {
-        for column in 0..area.width {
-            buffer[(area.x + column, area.y + row)].reset();
-        }
-
         let Some(line) = task.history.line(start.saturating_add(u64::from(row))) else {
             continue;
         };
         for (column, character) in line.text.chars().take(usize::from(area.width)).enumerate() {
             let mut encoded = [0_u8; 4];
+            let symbol = if character.is_control() {
+                " "
+            } else {
+                character.encode_utf8(&mut encoded)
+            };
             buffer[(area.x + column as u16, area.y + row)]
-                .set_symbol(character.encode_utf8(&mut encoded))
-                .set_style(Style::default().fg(Color::White));
+                .set_symbol(symbol)
+                .set_style(pane_style());
         }
     }
 }
 
 fn render_screen(parser: &Parser, area: Rect, buffer: &mut Buffer) {
+    clear_rect(buffer, area, pane_style());
     let screen = parser.screen();
     for row in 0..area.height {
         for column in 0..area.width {
@@ -6356,7 +6370,11 @@ fn render_screen(parser: &Parser, area: Rect, buffer: &mut Buffer) {
                 continue;
             }
             let symbol = source.contents();
-            let symbol = if symbol.is_empty() { " " } else { &symbol };
+            let symbol = if symbol.is_empty() || symbol.chars().any(char::is_control) {
+                " "
+            } else {
+                &symbol
+            };
             buffer[(area.x + column, area.y + row)]
                 .set_symbol(symbol)
                 .set_style(cell_style(source));
@@ -6514,7 +6532,7 @@ fn render_footer_items(
         for column in 0..area.width {
             buffer[(area.x + column, area.y + row)]
                 .set_symbol(" ")
-                .set_style(Style::default().fg(THEME_SNOW).bg(THEME_BLACK));
+                .set_style(footer_base_style());
         }
     }
 
@@ -6553,8 +6571,13 @@ fn render_footer_items(
                 }
             }
             let mut encoded = [0_u8; 4];
+            let symbol = if character.is_control() {
+                " "
+            } else {
+                character.encode_utf8(&mut encoded)
+            };
             buffer[(area.x + column, area.y + row)]
-                .set_symbol(character.encode_utf8(&mut encoded))
+                .set_symbol(symbol)
                 .set_style(style);
             column += 1;
         }
@@ -6574,7 +6597,9 @@ fn render_quit_confirm(area: Rect, buffer: &mut Buffer) {
     Paragraph::new(vec![
         Line::styled(
             "Close Demons?",
-            Style::default().fg(THEME_RED).add_modifier(Modifier::BOLD),
+            menu_style()
+                .fg(THEME_RED_HOVER)
+                .add_modifier(Modifier::BOLD),
         ),
         Line::raw(""),
         Line::raw("Press Ctrl-C or q again to close Demons."),
@@ -6584,7 +6609,7 @@ fn render_quit_confirm(area: Rect, buffer: &mut Buffer) {
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(THEME_RED))
-            .style(Style::default().fg(THEME_SNOW).bg(THEME_BLACK)),
+            .style(menu_style()),
     )
     .wrap(Wrap { trim: false })
     .render(popup, buffer);
@@ -6606,10 +6631,10 @@ fn render_notice(area: Rect, footer_rect: Option<Rect>, notice: &str, buffer: &m
         Span::styled(" notice ", Style::default().fg(THEME_BLACK).bg(THEME_GOLD)),
         Span::styled(
             format!(" {notice} "),
-            Style::default().fg(THEME_BLACK).bg(THEME_SNOW),
+            Style::default().fg(THEME_WHITE).bg(THEME_FOOTER),
         ),
     ]))
-    .style(Style::default().fg(THEME_BLACK).bg(THEME_SNOW))
+    .style(footer_base_style())
     .render(notice_area, buffer);
 }
 
@@ -6620,22 +6645,23 @@ fn render_problem_intro(area: Rect, buffer: &mut Buffer) {
     }
     Clear.render(popup, buffer);
     Paragraph::new(vec![
-        Line::styled(
-            "Config Problems",
-            Style::default().fg(THEME_GOLD).add_modifier(Modifier::BOLD),
-        ),
+        Line::styled("Config Problems", menu_heading_style()),
         Line::raw(""),
         Line::from(vec![
             Span::styled(
                 "Red !",
-                Style::default().fg(THEME_RED).add_modifier(Modifier::BOLD),
+                menu_style()
+                    .fg(THEME_RED_HOVER)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" marks settings that must be fixed before saving or running."),
         ]),
         Line::from(vec![
             Span::styled(
                 "Gold !",
-                Style::default().fg(THEME_GOLD).add_modifier(Modifier::BOLD),
+                menu_style()
+                    .fg(THEME_GOLD_HOVER)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" marks settings Demons recovered; review them before saving."),
         ]),
@@ -6650,7 +6676,7 @@ fn render_problem_intro(area: Rect, buffer: &mut Buffer) {
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(THEME_GOLD))
-            .style(Style::default().fg(THEME_SNOW).bg(THEME_BLACK)),
+            .style(menu_style()),
     )
     .wrap(Wrap { trim: false })
     .render(popup, buffer);
@@ -6663,10 +6689,7 @@ fn render_welcome_intro(area: Rect, buffer: &mut Buffer) {
     }
     Clear.render(popup, buffer);
     Paragraph::new(vec![
-        Line::styled(
-            "Welcome to Demons",
-            Style::default().fg(THEME_GOLD).add_modifier(Modifier::BOLD),
-        ),
+        Line::styled("Welcome to Demons", menu_heading_style()),
         Line::raw(""),
         Line::raw("This project does not have a demons.toml yet."),
         Line::raw("Use Tasks to add the commands you run for this project."),
@@ -6682,7 +6705,7 @@ fn render_welcome_intro(area: Rect, buffer: &mut Buffer) {
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(THEME_GOLD))
-            .style(Style::default().fg(THEME_SNOW).bg(THEME_BLACK)),
+            .style(menu_style()),
     )
     .wrap(Wrap { trim: false })
     .render(popup, buffer);
@@ -6703,7 +6726,7 @@ fn centered_rect(area: Rect, preferred_width: u16, preferred_height: u16) -> Rec
 }
 
 fn cell_style(cell: &vt100::Cell) -> Style {
-    let mut style = Style::default();
+    let mut style = pane_style();
     if let Some(color) = terminal_color(cell.fgcolor()) {
         style = style.fg(color);
     }
@@ -6940,7 +6963,7 @@ fn footer_status(label: impl Into<String>) -> FooterItem {
             fg: THEME_BLACK,
             bg: THEME_SNOW,
             hover_fg: THEME_BLACK,
-            hover_bg: THEME_WHITE,
+            hover_bg: THEME_GOLD_HOVER,
         },
     )
 }
@@ -6998,15 +7021,16 @@ fn footer_command_button(
     action: FooterAction,
     index: usize,
 ) -> FooterItem {
-    let style = christmas_style_for_index(index);
+    let style = footer_palette_for_index(index);
     FooterItem::new(format!(" {} ", label.into()), Some(action), style)
 }
 
-fn christmas_style_for_index(index: usize) -> FooterItemStyle {
-    if index.is_multiple_of(2) {
-        footer_style(THEME_BLACK, THEME_SNOW, THEME_BLACK, THEME_WHITE)
-    } else {
-        footer_style(THEME_BLACK, THEME_RED, THEME_BLACK, Color::LightRed)
+fn footer_palette_for_index(index: usize) -> FooterItemStyle {
+    match index % 4 {
+        0 => footer_style(THEME_BLACK, THEME_SNOW, THEME_BLACK, THEME_GOLD_HOVER),
+        1 => footer_style(THEME_WHITE, THEME_RED, THEME_WHITE, THEME_RED_HOVER),
+        2 => footer_style(THEME_WHITE, THEME_GREEN, THEME_WHITE, THEME_GREEN_HOVER),
+        _ => footer_style(THEME_BLACK, THEME_GOLD, THEME_BLACK, THEME_GOLD_HOVER),
     }
 }
 
@@ -7020,11 +7044,14 @@ fn footer_style(fg: Color, bg: Color, hover_fg: Color, hover_bg: Color) -> Foote
 }
 
 fn mode_hover_color(color: Color) -> Color {
-    match color {
-        THEME_GREEN => Color::LightGreen,
-        THEME_RED => Color::LightRed,
-        THEME_GOLD => Color::LightYellow,
-        _ => THEME_WHITE,
+    if color == THEME_GREEN {
+        THEME_GREEN_HOVER
+    } else if color == THEME_RED {
+        THEME_RED_HOVER
+    } else if color == THEME_GOLD {
+        THEME_GOLD_HOVER
+    } else {
+        THEME_WHITE
     }
 }
 
@@ -7724,6 +7751,22 @@ mod tests {
     }
 
     #[test]
+    fn render_text_replaces_control_characters() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 1));
+
+        render_text(
+            &mut buffer,
+            Rect::new(0, 0, 8, 1),
+            "a\u{1b}b",
+            Style::default(),
+        );
+
+        assert_eq!(buffer[(0, 0)].symbol(), "a");
+        assert_eq!(buffer[(1, 0)].symbol(), " ");
+        assert_eq!(buffer[(2, 0)].symbol(), "b");
+    }
+
+    #[test]
     fn command_footer_splits_paired_actions_into_buttons() {
         let items = command_footer_items();
 
@@ -7749,16 +7792,17 @@ mod tests {
     }
 
     #[test]
-    fn command_footer_uses_candy_cane_button_contrast() {
+    fn command_footer_uses_alternating_button_contrast() {
         let items = command_footer_items();
 
-        for item in &items {
-            assert_eq!(item.style.fg, THEME_BLACK);
-        }
+        assert_eq!(items[0].style.fg, THEME_BLACK);
+        assert_eq!(items[1].style.fg, THEME_WHITE);
+        assert_eq!(items[2].style.fg, THEME_WHITE);
+        assert_eq!(items[3].style.fg, THEME_BLACK);
         assert_eq!(items[0].style.bg, THEME_SNOW);
         assert_eq!(items[1].style.bg, THEME_RED);
-        assert_eq!(items[2].style.bg, THEME_SNOW);
-        assert_eq!(items[3].style.bg, THEME_RED);
+        assert_eq!(items[2].style.bg, THEME_GREEN);
+        assert_eq!(items[3].style.bg, THEME_GOLD);
     }
 
     #[test]
@@ -7951,8 +7995,8 @@ mod tests {
         assert_eq!(items[1].text, " Enter previous ");
         assert_eq!(items[2].text, " Shift+Enter next ");
         assert_eq!(items[1].style.bg, THEME_RED);
-        assert_eq!(items[2].style.bg, THEME_SNOW);
-        assert_eq!(items[3].style.bg, THEME_RED);
+        assert_eq!(items[2].style.bg, THEME_GREEN);
+        assert_eq!(items[3].style.bg, THEME_GOLD);
         assert_eq!(items[4].style.bg, THEME_SNOW);
     }
 
