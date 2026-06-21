@@ -90,6 +90,14 @@ struct SceneState {
     seed: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FireGeometry {
+    log_x: u16,
+    log_y: u16,
+    log_width: u16,
+    flame_height: u16,
+}
+
 fn app_style() -> Style {
     Style::default().fg(THEME_WHITE).bg(THEME_BACKGROUND)
 }
@@ -6608,39 +6616,20 @@ fn render_fireplace(area: Rect, seed: u64, frame: u64, buffer: &mut Buffer) {
         .clamp(10, 30)
         .min(u32::from(area.width.saturating_sub(4))) as u16;
     let log_height = if area.height >= 6 { 2 } else { 1 };
-    let log_x = area.x + area.width.saturating_sub(log_width) / 2;
-    let log_y = area.bottom().saturating_sub(log_height);
-    let flame_height = log_y.saturating_sub(area.y).clamp(1, 4);
-    let flame_width = (log_width / 2).clamp(7, 13);
-    let flame_x = area.x + area.width.saturating_sub(flame_width) / 2;
-    let flame_top = log_y.saturating_sub(flame_height);
-    let flame_frame = ((frame ^ seed) % 4) as usize;
-    let flames = [
-        ["     ▲     ", "    ▲█▲    ", "   ▲███▲   ", " ▄███████▄ "],
-        ["    ▲ ▲    ", "   ▲██▲    ", "  ▲█████▲  ", " ▄███████▄ "],
-        ["     ▲     ", "   ▲███▲   ", "  ▲█████▲  ", "  ▄█████▄  "],
-        ["    ▲█▲    ", "     █     ", "  ▲█████▲  ", " ▄███████▄ "],
-    ];
+    let fire = FireGeometry {
+        log_x: area.x + area.width.saturating_sub(log_width) / 2,
+        log_y: area.bottom().saturating_sub(log_height),
+        log_width,
+        flame_height: area
+            .bottom()
+            .saturating_sub(log_height)
+            .saturating_sub(area.y)
+            .clamp(1, 4),
+    };
 
-    for row in 0..flame_height {
-        let pattern_index = flames[flame_frame]
-            .len()
-            .saturating_sub(flame_height as usize)
-            + usize::from(row);
-        let text = flames[flame_frame][pattern_index];
-        let y = flame_top.saturating_add(row);
-        if y >= area.y && y < area.bottom() {
-            let style = match row {
-                0 => pane_style().fg(THEME_EMBER).add_modifier(Modifier::BOLD),
-                row if row + 1 == flame_height => pane_style().fg(THEME_EMBER),
-                _ => pane_style().fg(THEME_FLAME).add_modifier(Modifier::BOLD),
-            };
-            let text = centered_slice(text, usize::from(flame_width));
-            render_scene_text(buffer, flame_x, y, text, style);
-        }
-    }
-
-    render_log(buffer, log_x, log_y, log_width, log_height);
+    render_log(buffer, fire.log_x, fire.log_y, fire.log_width, log_height);
+    render_fire(buffer, area, seed, frame, fire);
+    render_log_nub(buffer, fire.log_x, fire.log_y, fire.log_width);
 }
 
 fn render_snow_scene(area: Rect, seed: u64, frame: u64, buffer: &mut Buffer) {
@@ -6649,7 +6638,8 @@ fn render_snow_scene(area: Rect, seed: u64, frame: u64, buffer: &mut Buffer) {
     }
     let ground_y = area.bottom().saturating_sub(1);
     let sky_height = ground_y.saturating_sub(area.y).max(1);
-    let flakes = usize::from((area.width / 7).clamp(2, 14));
+    let snowman = snowman_rect(area, ground_y);
+    let flakes = usize::from((area.width / 4).clamp(4, 24));
     for index in 0..flakes {
         let value = mix_scene_seed(seed, index as u64, 0x5107_u64);
         let fall = (value / 17).wrapping_add(frame) % u64::from(sky_height);
@@ -6658,6 +6648,9 @@ fn render_snow_scene(area: Rect, seed: u64, frame: u64, buffer: &mut Buffer) {
         let x =
             area.x + ((base_x + drift).rem_euclid(i16::try_from(area.width).unwrap_or(1))) as u16;
         let y = area.y + fall as u16;
+        if snowman.is_some_and(|snowman| contains(snowman, x, y)) {
+            continue;
+        }
         let symbol = if value & 1 == 0 { "·" } else { "❄" };
         buffer[(x, y)]
             .set_symbol(symbol)
@@ -6678,6 +6671,116 @@ fn render_snow_scene(area: Rect, seed: u64, frame: u64, buffer: &mut Buffer) {
     if area.width >= 18 && area.height >= 5 {
         render_snowman(area, ground_y, buffer);
     }
+}
+
+fn render_fire(buffer: &mut Buffer, area: Rect, seed: u64, frame: u64, fire: FireGeometry) {
+    if fire.flame_height == 0 || fire.log_y <= area.y {
+        return;
+    }
+
+    let ember_y = fire.log_y.saturating_sub(1);
+    for column in 1..fire.log_width.saturating_sub(1) {
+        let value = mix_scene_seed(seed, u64::from(column), frame);
+        if !value.is_multiple_of(5) {
+            let symbol = if value & 1 == 0 { "▄" } else { "▆" };
+            let color = if value & 2 == 0 {
+                THEME_EMBER
+            } else {
+                THEME_FLAME
+            };
+            paint_scene_cell(
+                buffer,
+                i32::from(fire.log_x + column),
+                ember_y,
+                symbol,
+                pane_style().fg(color),
+            );
+        }
+    }
+
+    let flame_count = (fire.log_width / 5).clamp(3, 6);
+    let span = fire.log_width.saturating_sub(4).max(1);
+    for index in 0..flame_count {
+        let value = mix_scene_seed(seed, u64::from(index), 0xf1a6_u64);
+        let phase = frame.wrapping_add(value % 11);
+        let wave = triangular_wave(phase, u64::from(fire.flame_height));
+        let height = if fire.flame_height >= 2 {
+            2 + (wave as u16 % fire.flame_height.saturating_sub(1))
+        } else {
+            1
+        }
+        .min(fire.flame_height);
+        let center = if flame_count == 1 {
+            fire.log_x + fire.log_width / 2
+        } else {
+            fire.log_x + 2 + (index * span) / flame_count.saturating_sub(1)
+        };
+        let wobble = (phase % 3) as i32 - 1;
+        let center = i32::from(center) + wobble;
+        render_flame_tongue(buffer, area, center, ember_y, height, phase);
+    }
+
+    if fire.flame_height >= 3 {
+        for index in 0..2 {
+            let value = mix_scene_seed(seed, frame.wrapping_add(index), 0x5aa7_u64);
+            let x = fire.log_x + 2 + (value % u64::from(span)) as u16;
+            let y_offset =
+                1 + ((value / 13) % u64::from(fire.flame_height.saturating_sub(1))) as u16;
+            let y = ember_y.saturating_sub(y_offset);
+            paint_scene_cell(buffer, i32::from(x), y, "·", pane_style().fg(THEME_EMBER));
+        }
+    }
+}
+
+fn render_flame_tongue(
+    buffer: &mut Buffer,
+    area: Rect,
+    center: i32,
+    base_y: u16,
+    height: u16,
+    phase: u64,
+) {
+    for level in 0..height {
+        let y = base_y.saturating_sub(level);
+        if y < area.y || y >= area.bottom() {
+            continue;
+        }
+        let rows_above = height.saturating_sub(level + 1);
+        let half_width = rows_above.min(2);
+        for offset in -(i32::from(half_width))..=i32::from(half_width) {
+            let edge = offset.unsigned_abs() as u16 == half_width;
+            let symbol = if rows_above == 0 {
+                "▲"
+            } else if level == 0 {
+                "▄"
+            } else if phase & 1 == 0 || !edge {
+                "█"
+            } else {
+                "▌"
+            };
+            let color = if rows_above == 0 || offset == 0 {
+                THEME_EMBER
+            } else {
+                THEME_FLAME
+            };
+            paint_scene_cell(
+                buffer,
+                center + offset,
+                y,
+                symbol,
+                pane_style().fg(color).add_modifier(Modifier::BOLD),
+            );
+        }
+    }
+}
+
+fn triangular_wave(value: u64, max: u64) -> u64 {
+    if max <= 1 {
+        return 0;
+    }
+    let period = max * 2 - 2;
+    let value = value % period;
+    if value < max { value } else { period - value }
 }
 
 fn render_log(buffer: &mut Buffer, x: u16, y: u16, width: u16, height: u16) {
@@ -6721,14 +6824,28 @@ fn render_log(buffer: &mut Buffer, x: u16, y: u16, width: u16, height: u16) {
     }
 }
 
-fn render_snowman(area: Rect, ground_y: u16, buffer: &mut Buffer) {
-    let rows = if area.height >= 8 { 4 } else { 3 };
-    let width = 7_u16;
-    let x = area.x + area.width.saturating_sub(width + 2);
-    let y = ground_y.saturating_sub(rows);
-    if y < area.y {
+fn render_log_nub(buffer: &mut Buffer, x: u16, y: u16, width: u16) {
+    if width < 10 || y == 0 {
         return;
     }
+    let nub_x = x + width.saturating_sub(1);
+    render_scene_text(buffer, nub_x, y, "━━◉", pane_style().fg(THEME_LOG));
+    paint_scene_cell(
+        buffer,
+        i32::from(nub_x + 2),
+        y,
+        "◉",
+        pane_style().fg(THEME_LOG_DARK),
+    );
+}
+
+fn render_snowman(area: Rect, ground_y: u16, buffer: &mut Buffer) {
+    let Some(rect) = snowman_rect(area, ground_y) else {
+        return;
+    };
+    let x = rect.x;
+    let y = rect.y;
+    let rows = rect.height;
 
     render_scene_text(buffer, x, y, "  _Π_  ", pane_style().fg(THEME_SNOW));
     render_scene_text(buffer, x + 2, y + 1, "(•)", pane_style().fg(THEME_SNOW));
@@ -6742,16 +6859,29 @@ fn render_snowman(area: Rect, ground_y: u16, buffer: &mut Buffer) {
     }
 }
 
-fn centered_slice(text: &str, width: usize) -> &str {
-    let chars = char_count(text);
-    if chars <= width {
-        return text;
+fn snowman_rect(area: Rect, ground_y: u16) -> Option<Rect> {
+    if area.width < 18 || area.height < 5 {
+        return None;
     }
-    let start = (chars - width) / 2;
-    let end = start + width;
-    let start = byte_index_for_char(text, start);
-    let end = byte_index_for_char(text, end);
-    &text[start..end]
+    let rows = if area.height >= 8 { 4 } else { 3 };
+    let width = 7_u16;
+    let x = area.x + area.width.saturating_sub(width + 2);
+    let y = ground_y.saturating_sub(rows);
+    if y < area.y {
+        return None;
+    }
+    Some(Rect::new(x, y, width, rows))
+}
+
+fn paint_scene_cell(buffer: &mut Buffer, x: i32, y: u16, symbol: &str, style: Style) {
+    if x < 0 {
+        return;
+    }
+    let x = x as u16;
+    if !contains(buffer.area, x, y) {
+        return;
+    }
+    buffer[(x, y)].set_symbol(symbol).set_style(style);
 }
 
 fn render_scene_text(buffer: &mut Buffer, x: u16, y: u16, text: &str, style: Style) {
