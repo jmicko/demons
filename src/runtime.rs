@@ -6806,7 +6806,16 @@ fn render_tree_scene(area: Rect, seed: u64, frame: u64, buffer: &mut Buffer) {
             if should_draw_tree_light(row, offset, leaf_seed) {
                 let lit = ((frame + leaf_seed % 4) % 4) < 2;
                 let (symbol, color) = tree_light(leaf_seed, lit);
-                paint_scene_cell(buffer, x, y, symbol, pane_style().fg(color));
+                paint_scene_cell(
+                    buffer,
+                    x,
+                    y,
+                    symbol,
+                    Style::default()
+                        .fg(color)
+                        .bg(green)
+                        .add_modifier(Modifier::BOLD),
+                );
             }
         }
     }
@@ -6821,7 +6830,7 @@ fn render_tree_scene(area: Rect, seed: u64, frame: u64, buffer: &mut Buffer) {
         );
     }
 
-    render_tree_presents(area, center, ground_y, seed, frame, buffer);
+    render_tree_presents(area, center, ground_y, buffer);
 }
 
 fn render_snow_ground(area: Rect, ground_y: u16, buffer: &mut Buffer) {
@@ -6852,46 +6861,24 @@ fn tree_light(seed: u64, lit: bool) -> (&'static str, Color) {
     }
 }
 
-fn render_tree_presents(
-    area: Rect,
-    center: u16,
-    ground_y: u16,
-    seed: u64,
-    frame: u64,
-    buffer: &mut Buffer,
-) {
+fn render_tree_presents(area: Rect, center: u16, ground_y: u16, buffer: &mut Buffer) {
     if area.width < 24 || area.height < 8 || ground_y <= area.y {
         return;
     }
     let y = ground_y.saturating_sub(1);
     let left_x = center.saturating_sub(8);
     let right_x = center.saturating_add(5);
-    let flicker = (frame + seed) & 1 == 0;
-    render_present(
-        buffer,
-        left_x,
-        y,
-        if flicker { THEME_RED } else { THEME_RED_HOVER },
-    );
-    render_present(
-        buffer,
-        right_x,
-        y,
-        if flicker {
-            THEME_GOLD
-        } else {
-            THEME_GOLD_HOVER
-        },
-    );
+    render_present(buffer, left_x, y, THEME_RED_HOVER);
+    render_present(buffer, right_x, y, THEME_GOLD_HOVER);
 }
 
 fn render_present(buffer: &mut Buffer, x: u16, y: u16, color: Color) {
     let ribbon = Style::default().fg(THEME_SNOW).bg(color);
     let wrap = Style::default().fg(color).bg(color);
     for offset in 0..3 {
-        buffer[(x + offset, y)].set_symbol(" ").set_style(wrap);
+        paint_scene_cell(buffer, i32::from(x + offset), y, " ", wrap);
     }
-    buffer[(x + 1, y)].set_symbol("│").set_style(ribbon);
+    paint_scene_cell(buffer, i32::from(x + 1), y, "╋", ribbon);
 }
 
 fn render_fire(buffer: &mut Buffer, area: Rect, seed: u64, frame: u64, fire: FireGeometry) {
