@@ -38,17 +38,21 @@ pub fn choose_grid(task_count: usize, terminal: Rect) -> Grid {
 }
 
 pub fn pane_rects(area: Rect, grid: Grid, task_count: usize) -> Vec<Rect> {
+    grid_rects(area, grid)
+        .into_iter()
+        .take(task_count)
+        .collect()
+}
+
+pub fn grid_rects(area: Rect, grid: Grid) -> Vec<Rect> {
     let widths = segments(area.width, grid.columns);
     let heights = segments(area.height, grid.rows);
-    let mut rects = Vec::with_capacity(task_count);
+    let mut rects = Vec::with_capacity(grid.columns.saturating_mul(grid.rows));
     let mut y = area.y;
 
     for height in heights {
         let mut x = area.x;
         for &width in &widths {
-            if rects.len() == task_count {
-                return rects;
-            }
             rects.push(Rect::new(x, y, width, height));
             x = x.saturating_add(width);
         }
@@ -106,17 +110,32 @@ mod tests {
     #[test]
     fn pane_rects_fill_the_grid_without_overlap() {
         let area = Rect::new(0, 0, 11, 7);
+        let rects = grid_rects(
+            area,
+            Grid {
+                columns: 2,
+                rows: 2,
+            },
+        );
+        assert_eq!(rects[0], Rect::new(0, 0, 6, 4));
+        assert_eq!(rects[1], Rect::new(6, 0, 5, 4));
+        assert_eq!(rects[2], Rect::new(0, 4, 6, 3));
+        assert_eq!(rects[3], Rect::new(6, 4, 5, 3));
+    }
+
+    #[test]
+    fn pane_rects_return_only_task_slots() {
+        let area = Rect::new(0, 0, 11, 7);
         let rects = pane_rects(
             area,
             Grid {
                 columns: 2,
                 rows: 2,
             },
-            4,
+            3,
         );
-        assert_eq!(rects[0], Rect::new(0, 0, 6, 4));
-        assert_eq!(rects[1], Rect::new(6, 0, 5, 4));
+
+        assert_eq!(rects.len(), 3);
         assert_eq!(rects[2], Rect::new(0, 4, 6, 3));
-        assert_eq!(rects[3], Rect::new(6, 4, 5, 3));
     }
 }

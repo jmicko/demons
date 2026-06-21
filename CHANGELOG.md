@@ -25,6 +25,8 @@ All notable user-facing changes should be recorded here before a release.
   rejecting symlinked or incorrectly owned log directories.
 - Raised the minimum supported Rust version to 1.88 and updated the terminal UI
   stack to `ratatui` 0.30 / `crossterm` 0.29.
+- Added lightweight animated scene rendering for completed panes and unused
+  grid slots without adding the scene text to scrollback or copy output.
 
 ## 0.2.0 - 2026-06-19
 

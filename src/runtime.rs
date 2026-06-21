@@ -42,7 +42,7 @@ use crate::{
         ConfigTaskField, Leader, LoadedConfig, MAX_MULTI_CLICK_MS, MIN_MULTI_CLICK_MS,
         MULTI_CLICK_STEP_MS, Task, TaskCommand, config_blocking_problems, parse_start_delay,
     },
-    layout::{Grid, choose_grid, pane_rects},
+    layout::{Grid, choose_grid, grid_rects, pane_rects},
 };
 
 const SCROLLBACK_LINES: usize = 10_000;
@@ -52,6 +52,7 @@ const EVENT_INTERVAL: Duration = Duration::from_millis(25);
 const ALT_ESCAPE_TIMEOUT: Duration = Duration::from_millis(50);
 const MODE_BUTTON_WIDTH: u16 = 13;
 const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(45);
+const SCENE_FRAME_INTERVAL: Duration = Duration::from_millis(700);
 const NOTICE_DURATION: Duration = Duration::from_secs(6);
 const MAX_FULL_HISTORY_OSC52_BYTES: usize = 512 * 1024;
 const THEME_RED: Color = Color::Rgb(132, 22, 36);
@@ -69,9 +70,24 @@ const THEME_BACKGROUND: Color = Color::Rgb(8, 17, 15);
 const THEME_PANEL: Color = Color::Rgb(22, 33, 29);
 const THEME_MENU: Color = Color::Rgb(34, 48, 43);
 const THEME_FOOTER: Color = Color::Rgb(36, 45, 42);
+const THEME_FLAME: Color = Color::Rgb(221, 92, 38);
+const THEME_EMBER: Color = Color::Rgb(249, 177, 72);
+const THEME_LOG: Color = Color::Rgb(112, 68, 39);
 const THEME_ACCENT_MARK: &str = "❄";
 
 type ProcessRegistry = Arc<Mutex<HashSet<u32>>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum SceneKind {
+    Fireplace,
+    Snow,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SceneState {
+    kind: SceneKind,
+    seed: u64,
+}
 
 fn app_style() -> Style {
     Style::default().fg(THEME_WHITE).bg(THEME_BACKGROUND)
@@ -93,6 +109,43 @@ fn menu_heading_style() -> Style {
 
 fn footer_base_style() -> Style {
     Style::default().fg(THEME_SNOW).bg(THEME_FOOTER)
+}
+
+fn app_scene_seed(loaded: &LoadedConfig) -> u64 {
+    let clock = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or_default();
+    mix_scene_seed(
+        clock,
+        hash_text(&loaded.path.display().to_string()),
+        0x00a1_1ce5_u64,
+    )
+}
+
+fn hash_text(value: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash
+}
+
+fn mix_scene_seed(seed: u64, value: u64, salt: u64) -> u64 {
+    let mut mixed = seed ^ value.rotate_left(17) ^ salt.rotate_right(7);
+    mixed = mixed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    mixed ^ (mixed >> 31)
+}
+
+fn scene_kind_for_seed(seed: u64) -> SceneKind {
+    if seed & 1 == 0 {
+        SceneKind::Fireplace
+    } else {
+        SceneKind::Snow
+    }
 }
 
 pub fn run(loaded: LoadedConfig) -> Result<()> {
@@ -218,6 +271,7 @@ struct App {
     focus: usize,
     mode: AppMode,
     grid: Grid,
+    slot_rects: Vec<Rect>,
     pane_rects: Vec<Rect>,
     content_rects: Vec<Rect>,
     footer_rect: Option<Rect>,
@@ -247,6 +301,9 @@ struct App {
     problem_intro_seen: bool,
     tasks_started: bool,
     countdown_snapshot: Vec<Option<u64>>,
+    scene_seed: u64,
+    scene_frame: u64,
+    last_scene_frame: Instant,
 }
 
 impl App {
@@ -269,6 +326,7 @@ impl App {
             })
             .collect();
         let (dependency_indexes, dependent_indexes) = dependency_graph(&loaded.config.tasks);
+        let scene_seed = app_scene_seed(&loaded);
         Self {
             loaded,
             tasks,
@@ -278,6 +336,7 @@ impl App {
                 columns: 1,
                 rows: 1,
             },
+            slot_rects: Vec::new(),
             pane_rects: Vec::new(),
             content_rects: Vec::new(),
             footer_rect: None,
@@ -307,6 +366,9 @@ impl App {
             problem_intro_seen: false,
             tasks_started: false,
             countdown_snapshot: Vec::new(),
+            scene_seed,
+            scene_frame: 0,
+            last_scene_frame: Instant::now(),
         }
     }
 
@@ -366,10 +428,12 @@ impl App {
                 columns: 1,
                 rows: 1,
             };
+            self.slot_rects = vec![Rect::default(); self.tasks.len()];
             self.pane_rects = vec![Rect::default(); self.tasks.len()];
             self.content_rects = vec![Rect::default(); self.tasks.len()];
             if !self.tasks.is_empty() {
                 let focus = self.focus.min(self.tasks.len() - 1);
+                self.slot_rects[focus] = pane_area;
                 self.pane_rects[focus] = pane_area;
                 self.content_rects[focus] = Rect::new(
                     pane_area.x.saturating_add(1),
@@ -382,6 +446,7 @@ impl App {
             }
         } else {
             self.grid = choose_grid(self.tasks.len(), pane_area);
+            self.slot_rects = grid_rects(pane_area, self.grid);
             self.pane_rects = pane_rects(pane_area, self.grid, self.tasks.len());
             self.content_rects = self
                 .pane_rects
@@ -402,6 +467,70 @@ impl App {
         }
     }
 
+    fn task_output_rect(&self, index: usize) -> Option<Rect> {
+        let content = *self.content_rects.get(index)?;
+        let Some(scene) = self.exited_scene_rect(index) else {
+            return Some(content);
+        };
+        Some(Rect::new(
+            content.x,
+            content.y,
+            content.width,
+            content.height.saturating_sub(scene.height),
+        ))
+    }
+
+    fn task_parser_row_offset(&self, index: usize) -> u16 {
+        let Some(content) = self.content_rects.get(index) else {
+            return 0;
+        };
+        let Some(output) = self.task_output_rect(index) else {
+            return 0;
+        };
+        let Some(task) = self.tasks.get(index) else {
+            return 0;
+        };
+        let available_shift = content.height.saturating_sub(output.height);
+        let needed_shift = task
+            .history
+            .visible_line_count()
+            .saturating_sub(u64::from(output.height));
+        needed_shift.min(u64::from(available_shift)) as u16
+    }
+
+    fn exited_scene_rect(&self, index: usize) -> Option<Rect> {
+        if self.mode == AppMode::Search {
+            return None;
+        }
+        let task = self.tasks.get(index)?;
+        if !matches!(task.status, TaskStatus::Exited { .. }) || task.scroll_offset != 0 {
+            return None;
+        }
+        reserved_scene_rect(*self.content_rects.get(index)?)
+    }
+
+    fn task_scene_state(&self, index: usize) -> SceneState {
+        SceneState {
+            kind: SceneKind::Fireplace,
+            seed: mix_scene_seed(self.scene_seed, index as u64, 0x007e_17ed_u64),
+        }
+    }
+
+    fn empty_slot_scene_state(&self, slot: usize) -> SceneState {
+        let seed = mix_scene_seed(self.scene_seed, slot as u64, 0xe4d7_5107_u64);
+        SceneState {
+            kind: scene_kind_for_seed(seed),
+            seed,
+        }
+    }
+
+    fn scenes_visible(&self) -> bool {
+        if !self.fullscreen && self.slot_rects.len() > self.tasks.len() {
+            return true;
+        }
+        (0..self.tasks.len()).any(|index| self.exited_scene_rect(index).is_some())
+    }
+
     fn draw(&mut self, frame: &mut Frame<'_>) {
         let now = Instant::now();
         let frame_area = frame.area();
@@ -410,9 +539,26 @@ impl App {
         self.footer_hits.clear();
         clear_rect(buffer, frame_area, app_style());
 
+        if !self.fullscreen && self.slot_rects.len() > self.tasks.len() {
+            for slot in self.tasks.len()..self.slot_rects.len() {
+                let area = self.slot_rects[slot];
+                if area.width == 0 || area.height == 0 {
+                    continue;
+                }
+                render_scene_slot(
+                    area,
+                    self.empty_slot_scene_state(slot),
+                    self.scene_frame,
+                    buffer,
+                );
+            }
+        }
+
         for index in 0..self.tasks.len() {
             let area = self.pane_rects[index];
-            let content = self.content_rects[index];
+            let Some(content) = self.task_output_rect(index) else {
+                continue;
+            };
             if area.width == 0 || area.height == 0 {
                 continue;
             }
@@ -464,8 +610,14 @@ impl App {
                 .title(restart);
             block.render(area, buffer);
 
+            let parser_row_offset = self.task_parser_row_offset(index);
             if self.tasks[index].renders_with_terminal_parser(content.height) {
-                render_screen(&self.tasks[index].parser, content, buffer);
+                render_screen(
+                    &self.tasks[index].parser,
+                    content,
+                    parser_row_offset,
+                    buffer,
+                );
             } else {
                 render_history(&self.tasks[index], content, buffer);
             }
@@ -476,8 +628,17 @@ impl App {
                     .filter(|selection| selection.pane == index && selection.dragged),
                 &self.tasks[index],
                 content,
+                parser_row_offset,
                 buffer,
             );
+            if let Some(scene) = self.exited_scene_rect(index) {
+                render_scene(
+                    scene,
+                    self.task_scene_state(index),
+                    self.scene_frame,
+                    buffer,
+                );
+            }
         }
 
         if let (Some(footer_area), Some(button_area)) = (self.footer_rect, self.mode_button_rect) {
@@ -536,7 +697,7 @@ impl App {
 
         if self.mode == AppMode::Input && self.menu.is_none() && !self.tasks.is_empty() {
             let task = &self.tasks[self.focus];
-            let area = self.content_rects[self.focus];
+            let area = self.task_output_rect(self.focus).unwrap_or_default();
             if task.scroll_offset == 0 && !task.parser.screen().hide_cursor() {
                 let (row, column) = task.parser.screen().cursor_position();
                 if row < area.height && column < area.width {
@@ -735,9 +896,7 @@ impl App {
             self.problem_intro = true;
             self.problem_intro_seen = true;
         }
-        if visible_problems.is_empty() {
-            self.notice = None;
-        } else if first_run_empty_config {
+        if visible_problems.is_empty() || first_run_empty_config {
             self.notice = None;
         } else {
             self.set_notice("Config problems found; use Exit > Problems before saving.".to_owned());
@@ -2074,8 +2233,7 @@ impl App {
     fn jump_to_search_line(&mut self, pane: usize, line: u64) {
         self.focus = pane;
         let height = self
-            .content_rects
-            .get(pane)
+            .task_output_rect(pane)
             .map(|rect| rect.height)
             .unwrap_or(self.tasks[pane].pty_size.rows);
         self.tasks[pane].scroll_to_history_line(line, height);
@@ -2220,7 +2378,9 @@ impl App {
             self.focus = index;
         }
 
-        let content = self.content_rects[index];
+        let Some(content) = self.task_output_rect(index) else {
+            return Ok(Action::Continue);
+        };
         if !contains(content, mouse.column, mouse.row) {
             if matches!(mouse.kind, MouseEventKind::Down(_)) {
                 self.selection = None;
@@ -2561,8 +2721,7 @@ impl App {
             }
             SelectionGranularity::Line => {
                 let width = self
-                    .content_rects
-                    .get(index)
+                    .task_output_rect(index)
                     .map(|rect| rect.width)
                     .unwrap_or_default();
                 let end = width.saturating_sub(1);
@@ -2582,7 +2741,7 @@ impl App {
 
     fn selection_text_for_mouse(&self, index: usize, x: u16, y: u16) -> Option<String> {
         let point = self.selection_point_for_mouse(index, x, y)?;
-        let content = *self.content_rects.get(index)?;
+        let content = self.task_output_rect(index)?;
         let row = y
             .saturating_sub(content.y)
             .min(content.height.saturating_sub(1));
@@ -2705,7 +2864,7 @@ impl App {
             return None;
         }
         Some(SelectionPoint {
-            line: task.parser_index_for_visible_row(row),
+            line: task.parser_index_for_visible_row(self.task_parser_row_offset(pane) + row),
             column,
         })
     }
@@ -2727,7 +2886,7 @@ impl App {
     }
 
     fn selection_mouse_cell(&self, pane: usize, x: u16, y: u16) -> Option<(Rect, u16, u16)> {
-        let content = *self.content_rects.get(pane)?;
+        let content = self.task_output_rect(pane)?;
         if content.width == 0 || content.height == 0 {
             return None;
         }
@@ -2759,7 +2918,9 @@ impl App {
         if !force && now.duration_since(last_scroll) < SELECTION_AUTOSCROLL_INTERVAL {
             return false;
         }
-        let content = self.content_rects[pane];
+        let Some(content) = self.task_output_rect(pane) else {
+            return false;
+        };
         let step = selection_scroll_step(content, y);
         let changed = if y < content.y {
             self.tasks[pane].scroll_up(step)
@@ -2798,16 +2959,17 @@ impl App {
 
     fn visible_selection_text(&self, selection: &Selection) -> Option<String> {
         let task = self.tasks.get(selection.pane)?;
-        let area = *self.content_rects.get(selection.pane)?;
+        let area = self.task_output_rect(selection.pane)?;
         if area.width == 0 || area.height == 0 {
             return None;
         }
         if !task.renders_with_terminal_parser(area.height) {
             return None;
         }
+        let row_offset = self.task_parser_row_offset(selection.pane);
         let (start, end, visible_start) =
             if let Some((start, end)) = selection.parser_ordered_points() {
-                (start, end, task.parser_index_for_visible_row(0))
+                (start, end, task.parser_index_for_visible_row(row_offset))
             } else {
                 let (start, end) = selection.ordered_points();
                 (
@@ -2825,9 +2987,9 @@ impl App {
         let end_row = (end.line - visible_start) as u16;
         let end_column = end.column.saturating_add(1).min(area.width);
         Some(task.parser.screen().contents_between(
-            start_row,
+            row_offset + start_row,
             start.column.min(area.width),
-            end_row,
+            row_offset + end_row,
             end_column,
         ))
     }
@@ -2939,12 +3101,21 @@ impl App {
 
     fn visible_pane_text(&self, index: usize) -> Option<String> {
         let task = self.tasks.get(index)?;
-        let area = *self.content_rects.get(index)?;
+        let area = self.task_output_rect(index)?;
         if area.width == 0 || area.height == 0 {
             return None;
         }
         if task.renders_with_terminal_parser(area.height) {
-            return Some(task.parser.screen().contents());
+            let row_offset = self.task_parser_row_offset(index);
+            if row_offset == 0 {
+                return Some(task.parser.screen().contents());
+            }
+            return Some(task.parser.screen().contents_between(
+                row_offset,
+                0,
+                row_offset + area.height.saturating_sub(1),
+                area.width,
+            ));
         }
 
         let start = task.history.visible_start(area.height, task.scroll_offset);
@@ -3080,8 +3251,7 @@ impl App {
     }
 
     fn focused_page_rows(&self) -> usize {
-        self.content_rects
-            .get(self.focus)
+        self.task_output_rect(self.focus)
             .map(|rect| usize::from(rect.height.saturating_sub(1).max(1)))
             .unwrap_or(1)
     }
@@ -3372,6 +3542,13 @@ impl App {
             changed = true;
         }
         if self.tick_dependency_starts(now) {
+            changed = true;
+        }
+        if self.scenes_visible()
+            && now.duration_since(self.last_scene_frame) >= SCENE_FRAME_INTERVAL
+        {
+            self.scene_frame = self.scene_frame.wrapping_add(1);
+            self.last_scene_frame = now;
             changed = true;
         }
         let countdown_snapshot = self.waiting_countdown_snapshot(now);
@@ -4079,6 +4256,13 @@ impl TextHistory {
         self.first_index
             .saturating_add(self.lines.len() as u64)
             .saturating_add(1)
+    }
+
+    fn visible_line_count(&self) -> u64 {
+        let has_trailing_empty_line =
+            self.current.text.is_empty() && self.column == 0 && !self.pending_wrap;
+        self.line_count()
+            .saturating_sub(u64::from(has_trailing_empty_line))
     }
 
     fn visible_start(&self, height: u16, scroll_offset: usize) -> u64 {
@@ -5726,8 +5910,8 @@ fn clear_rect(buffer: &mut Buffer, rect: Rect, style: Style) {
 fn render_ribbon(buffer: &mut Buffer, rect: Rect) {
     for column in 0..rect.width {
         let color = match column % 8 {
-            0 | 1 | 2 => THEME_RED,
-            3 | 4 | 5 => THEME_SNOW,
+            0..=2 => THEME_RED,
+            3..=5 => THEME_SNOW,
             _ => THEME_GOLD,
         };
         let fg = if color == THEME_RED {
@@ -6370,6 +6554,180 @@ fn common_prefix(values: &[String]) -> String {
     common
 }
 
+fn reserved_scene_rect(content: Rect) -> Option<Rect> {
+    if content.width < 18 || content.height < 8 {
+        return None;
+    }
+    let height = if content.height >= 14 {
+        7
+    } else if content.height >= 10 {
+        5
+    } else {
+        4
+    };
+    Some(Rect::new(
+        content.x,
+        content.bottom().saturating_sub(height),
+        content.width,
+        height,
+    ))
+}
+
+fn render_scene_slot(area: Rect, scene: SceneState, frame: u64, buffer: &mut Buffer) {
+    clear_rect(buffer, area, app_style());
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(pane_style().fg(THEME_HOLLY))
+        .style(pane_style())
+        .title(Line::styled(
+            format!(" {THEME_ACCENT_MARK} "),
+            pane_style().fg(THEME_GOLD_HOVER),
+        ))
+        .render(area, buffer);
+    render_scene(inset_rect(area, 1, 1), scene, frame, buffer);
+}
+
+fn render_scene(area: Rect, scene: SceneState, frame: u64, buffer: &mut Buffer) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    clear_rect(buffer, area, pane_style());
+    match scene.kind {
+        SceneKind::Fireplace => render_fireplace(area, scene.seed, frame, buffer),
+        SceneKind::Snow => render_snow_scene(area, scene.seed, frame, buffer),
+    }
+}
+
+fn render_fireplace(area: Rect, seed: u64, frame: u64, buffer: &mut Buffer) {
+    if area.width < 18 || area.height < 4 {
+        return;
+    }
+    let width = area.width.min(34);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let base_y = area.bottom().saturating_sub(1);
+    let flame_frame = ((frame ^ seed) % 4) as usize;
+    let flames = [
+        ["   ▲   ", "  ▲█▲  ", " ▄███▄ "],
+        ["  ▲ ▲  ", "  █▲█  ", " ▄███▄ "],
+        ["   ▲   ", " ▲███▲ ", "  ▄█▄  "],
+        ["  ▲█▲  ", "   █   ", " ▄███▄ "],
+    ];
+    let fire_width = 7_u16;
+    let fire_x = x + width.saturating_sub(fire_width) / 2;
+    let top = base_y.saturating_sub(3);
+
+    if area.height >= 5 {
+        let mantle = "╭──────────────╮";
+        let mantle_x = x + width.saturating_sub(char_count(mantle) as u16) / 2;
+        render_scene_text(
+            buffer,
+            mantle_x,
+            top.saturating_sub(1).max(area.y),
+            mantle,
+            pane_style().fg(THEME_GOLD),
+        );
+    }
+
+    for (row, text) in flames[flame_frame].iter().enumerate() {
+        let y = top.saturating_add(row as u16);
+        if y >= area.y && y < area.bottom() {
+            let style = match row {
+                0 => pane_style().fg(THEME_EMBER).add_modifier(Modifier::BOLD),
+                1 => pane_style().fg(THEME_FLAME).add_modifier(Modifier::BOLD),
+                _ => pane_style().fg(THEME_EMBER),
+            };
+            render_scene_text(buffer, fire_x, y, text, style);
+        }
+    }
+
+    let logs = "╱═══════╲";
+    let logs_x = x + width.saturating_sub(char_count(logs) as u16) / 2;
+    render_scene_text(buffer, logs_x, base_y, logs, pane_style().fg(THEME_LOG));
+
+    if area.height >= 6 {
+        let hearth = "▔▔▔▔▔▔▔▔▔▔▔";
+        let hearth_x = x + width.saturating_sub(char_count(hearth) as u16) / 2;
+        render_scene_text(
+            buffer,
+            hearth_x,
+            base_y.saturating_sub(1),
+            hearth,
+            pane_style().fg(THEME_RED),
+        );
+    }
+}
+
+fn render_snow_scene(area: Rect, seed: u64, frame: u64, buffer: &mut Buffer) {
+    if area.width < 10 || area.height < 4 {
+        return;
+    }
+    let flakes = usize::from((area.width / 8).clamp(2, 10));
+    for index in 0..flakes {
+        let value = mix_scene_seed(seed, frame.wrapping_add(index as u64), 0x5107_u64);
+        let x = area.x + (value % u64::from(area.width)) as u16;
+        let y = area.y + ((value / 17) % u64::from(area.height.saturating_sub(1))) as u16;
+        let symbol = if value & 1 == 0 { "·" } else { "❄" };
+        buffer[(x, y)]
+            .set_symbol(symbol)
+            .set_style(pane_style().fg(THEME_SNOW));
+    }
+
+    let horizon_y = area.bottom().saturating_sub(2);
+    for column in 0..area.width {
+        buffer[(area.x + column, horizon_y)]
+            .set_symbol("▄")
+            .set_style(pane_style().fg(THEME_SNOW));
+    }
+    for column in 0..area.width {
+        buffer[(area.x + column, area.bottom().saturating_sub(1))]
+            .set_symbol(" ")
+            .set_style(Style::default().fg(THEME_BLACK).bg(THEME_SNOW));
+    }
+
+    if area.width >= 24 && area.height >= 6 {
+        let snowman_x = area.x + area.width.saturating_sub(9);
+        let snowman_y = area.bottom().saturating_sub(4);
+        render_scene_text(
+            buffer,
+            snowman_x,
+            snowman_y,
+            " _Π_ ",
+            pane_style().fg(THEME_SNOW),
+        );
+        render_scene_text(
+            buffer,
+            snowman_x,
+            snowman_y + 1,
+            " (•) ",
+            pane_style().fg(THEME_SNOW),
+        );
+        render_scene_text(
+            buffer,
+            snowman_x,
+            snowman_y + 2,
+            " (:) ",
+            pane_style().fg(THEME_SNOW),
+        );
+    }
+}
+
+fn render_scene_text(buffer: &mut Buffer, x: u16, y: u16, text: &str, style: Style) {
+    for (offset, character) in text.chars().enumerate() {
+        let cell_x = x.saturating_add(offset as u16);
+        if !contains(buffer.area, cell_x, y) {
+            continue;
+        }
+        let mut encoded = [0_u8; 4];
+        let symbol = if character.is_control() {
+            " "
+        } else {
+            character.encode_utf8(&mut encoded)
+        };
+        buffer[(cell_x, y)].set_symbol(symbol).set_style(style);
+    }
+}
+
 fn render_history(task: &TaskRuntime, area: Rect, buffer: &mut Buffer) {
     let start = task.history.visible_start(area.height, task.scroll_offset);
     clear_rect(buffer, area, pane_style());
@@ -6391,12 +6749,12 @@ fn render_history(task: &TaskRuntime, area: Rect, buffer: &mut Buffer) {
     }
 }
 
-fn render_screen(parser: &Parser, area: Rect, buffer: &mut Buffer) {
+fn render_screen(parser: &Parser, area: Rect, row_offset: u16, buffer: &mut Buffer) {
     clear_rect(buffer, area, pane_style());
     let screen = parser.screen();
     for row in 0..area.height {
         for column in 0..area.width {
-            let Some(source) = screen.cell(row, column) else {
+            let Some(source) = screen.cell(row_offset.saturating_add(row), column) else {
                 continue;
             };
             if source.is_wide_continuation() {
@@ -6444,6 +6802,7 @@ fn render_selection(
     selection: Option<&Selection>,
     task: &TaskRuntime,
     area: Rect,
+    parser_row_offset: u16,
     buffer: &mut Buffer,
 ) {
     let Some(selection) = selection else {
@@ -6451,13 +6810,13 @@ fn render_selection(
     };
     if selection.history_backed
         && task.renders_with_terminal_parser(area.height)
-        && render_live_history_selection(selection, task, area, buffer)
+        && render_live_history_selection(selection, task, area, parser_row_offset, buffer)
     {
         return;
     }
     if selection.parser_ordered_points().is_some() && task.renders_with_terminal_parser(area.height)
     {
-        render_parser_selection(selection, task, area, buffer);
+        render_parser_selection(selection, task, area, parser_row_offset, buffer);
         return;
     }
     render_history_selection(selection, task, area, buffer);
@@ -6467,10 +6826,11 @@ fn render_parser_selection(
     selection: &Selection,
     task: &TaskRuntime,
     area: Rect,
+    parser_row_offset: u16,
     buffer: &mut Buffer,
 ) {
     for row in 0..area.height {
-        let line = task.parser_index_for_visible_row(row);
+        let line = task.parser_index_for_visible_row(parser_row_offset.saturating_add(row));
         let Some((start, end)) = selection.columns_for_parser_line(line, area.width) else {
             continue;
         };
@@ -6497,6 +6857,7 @@ fn render_live_history_selection(
     selection: &Selection,
     task: &TaskRuntime,
     area: Rect,
+    parser_row_offset: u16,
     buffer: &mut Buffer,
 ) -> bool {
     let (start, end) = selection.ordered_points();
@@ -6514,7 +6875,8 @@ fn render_live_history_selection(
     }
 
     for row in 0..area.height {
-        if screen_row_text(&task.parser, row, area.width).trim_end() == expected {
+        let screen_row = parser_row_offset.saturating_add(row);
+        if screen_row_text(&task.parser, screen_row, area.width).trim_end() == expected {
             let start_column = start.column.min(area.width);
             let end_column = end.column.saturating_add(1).min(area.width);
             if start_column < end_column {
@@ -8316,8 +8678,8 @@ mod tests {
 
         app.tasks[0].history.clear();
         let mut buffer = Buffer::empty(Rect::new(0, 0, 60, 8));
-        render_screen(&app.tasks[0].parser, area, &mut buffer);
-        render_selection(app.selection.as_ref(), &app.tasks[0], area, &mut buffer);
+        render_screen(&app.tasks[0].parser, area, 0, &mut buffer);
+        render_selection(app.selection.as_ref(), &app.tasks[0], area, 0, &mut buffer);
 
         assert_eq!(buffer[(area.x + 5, area.y)].bg, Color::White);
     }
@@ -8390,8 +8752,8 @@ mod tests {
 
         assert_eq!(app.selected_text().unwrap(), "alpha beta/gamma");
         let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 20));
-        render_screen(&app.tasks[0].parser, first, &mut buffer);
-        render_selection(app.selection.as_ref(), &app.tasks[0], first, &mut buffer);
+        render_screen(&app.tasks[0].parser, first, 0, &mut buffer);
+        render_selection(app.selection.as_ref(), &app.tasks[0], first, 0, &mut buffer);
         assert_eq!(buffer[(first.right() - 1, row)].bg, Color::White);
     }
 
@@ -8653,7 +9015,7 @@ mod tests {
 
         let area = Rect::new(0, 0, 20, 4);
         let mut buffer = Buffer::empty(area);
-        render_screen(&task.parser, area, &mut buffer);
+        render_screen(&task.parser, area, 0, &mut buffer);
 
         assert_eq!(buffer_line(&buffer, 0, 20).trim_end(), "green row");
         assert_eq!(buffer[(0, 0)].fg, Color::Indexed(2));
@@ -8973,8 +9335,8 @@ mod tests {
 
         let area = app.content_rects[1];
         let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 20));
-        render_screen(&app.tasks[1].parser, area, &mut buffer);
-        render_selection(app.selection.as_ref(), &app.tasks[1], area, &mut buffer);
+        render_screen(&app.tasks[1].parser, area, 0, &mut buffer);
+        render_selection(app.selection.as_ref(), &app.tasks[1], area, 0, &mut buffer);
 
         let screen_row = (0..area.height)
             .find(|row| screen_row_text(&app.tasks[1].parser, *row, area.width).contains("Network"))
@@ -9133,6 +9495,113 @@ mod tests {
         assert!(task.scroll_offset <= task.max_scroll_offset());
         assert!(task.renders_with_terminal_parser(40));
         assert_eq!(task.parser.screen().scrollback(), task.scroll_offset);
+    }
+
+    #[test]
+    fn exited_pane_reserves_scene_only_at_bottom() {
+        let mut app = test_app();
+        app.update_layout(Rect::new(0, 0, 80, 24));
+        app.tasks[0].status = TaskStatus::Exited {
+            code: 0,
+            success: true,
+            signal: None,
+        };
+
+        let full = app.content_rects[0];
+        let scene = app.exited_scene_rect(0).unwrap();
+        let output = app.task_output_rect(0).unwrap();
+
+        assert!(scene.height > 0);
+        assert_eq!(output.height + scene.height, full.height);
+
+        app.tasks[0].scroll_offset = 1;
+        assert!(app.exited_scene_rect(0).is_none());
+        assert_eq!(app.task_output_rect(0), Some(full));
+
+        app.tasks[0].scroll_offset = 0;
+        app.mode = AppMode::Search;
+        assert!(app.exited_scene_rect(0).is_none());
+        assert_eq!(app.task_output_rect(0), Some(full));
+    }
+
+    #[test]
+    fn scene_rendering_does_not_enter_visible_text() {
+        let mut app = test_app();
+        app.update_layout(Rect::new(0, 0, 80, 24));
+        app.tasks[0].process_output(b"alpha output\n");
+        app.tasks[0].status = TaskStatus::Exited {
+            code: 0,
+            success: true,
+            signal: None,
+        };
+
+        let text = app.visible_pane_text(0).unwrap();
+
+        assert!(text.contains("alpha output"));
+        assert!(!text.contains('╱'));
+        assert!(!text.contains('☃'));
+        assert!(!text.contains(THEME_ACCENT_MARK));
+    }
+
+    #[test]
+    fn exited_scene_preserves_bottom_parser_view() {
+        let mut app = test_app_with_tasks(vec![test_task("long_done")]);
+        app.update_layout(Rect::new(0, 0, 80, 24));
+        for line in 1..=80 {
+            app.tasks[0].process_output(format!("long line {line:03}\n").as_bytes());
+        }
+        app.tasks[0].status = TaskStatus::Exited {
+            code: 0,
+            success: true,
+            signal: None,
+        };
+
+        assert!(app.exited_scene_rect(0).is_some());
+        assert!(app.task_parser_row_offset(0) > 0);
+
+        let text = app.visible_pane_text(0).unwrap();
+
+        assert!(text.contains("long line 080"));
+        assert!(!text.contains("long line 064"));
+        assert!(!text.contains(THEME_ACCENT_MARK));
+    }
+
+    #[test]
+    fn empty_grid_slots_get_seeded_scene_choices() {
+        let mut app =
+            test_app_with_tasks(vec![test_task("one"), test_task("two"), test_task("three")]);
+        app.scene_seed = 0;
+        app.update_layout(Rect::new(0, 0, 80, 40));
+
+        assert_eq!(app.pane_rects.len(), 3);
+        assert!(app.slot_rects.len() > app.pane_rects.len());
+
+        let choices = (0..64)
+            .map(|slot| app.empty_slot_scene_state(slot).kind)
+            .collect::<HashSet<_>>();
+        assert!(choices.contains(&SceneKind::Fireplace));
+        assert!(choices.contains(&SceneKind::Snow));
+    }
+
+    #[test]
+    fn scene_animation_ticks_only_when_visible() {
+        let mut app =
+            test_app_with_tasks(vec![test_task("one"), test_task("two"), test_task("three")]);
+        let now = Instant::now();
+        app.update_layout(Rect::new(0, 0, 80, 40));
+        app.countdown_snapshot = app.waiting_countdown_snapshot(now);
+        app.last_scene_frame = now - SCENE_FRAME_INTERVAL;
+
+        assert!(app.tick().unwrap());
+        assert_eq!(app.scene_frame, 1);
+
+        let mut app = test_app();
+        app.update_layout(Rect::new(0, 0, 80, 40));
+        app.countdown_snapshot = app.waiting_countdown_snapshot(now);
+        app.last_scene_frame = now - SCENE_FRAME_INTERVAL;
+
+        assert!(!app.tick().unwrap());
+        assert_eq!(app.scene_frame, 0);
     }
 
     #[test]
