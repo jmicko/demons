@@ -55,6 +55,9 @@ const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(45);
 const SCENE_FRAME_INTERVAL: Duration = Duration::from_millis(700);
 const NOTICE_DURATION: Duration = Duration::from_secs(6);
 const MAX_FULL_HISTORY_OSC52_BYTES: usize = 512 * 1024;
+const DEV_SCENE_ENV: &str = "DEMONS_DEV_SCENE";
+const DEV_SCENE_SEED_ENV: &str = "DEMONS_DEV_SCENE_SEED";
+const DEV_SCENE_FRAME_ENV: &str = "DEMONS_DEV_SCENE_FRAME";
 const THEME_RED: Color = Color::Rgb(132, 22, 36);
 const THEME_RED_HOVER: Color = Color::Rgb(168, 44, 55);
 const THEME_GREEN: Color = Color::Rgb(44, 107, 78);
@@ -121,6 +124,9 @@ fn footer_base_style() -> Style {
 }
 
 fn app_scene_seed(loaded: &LoadedConfig) -> u64 {
+    if let Some(seed) = dev_scene_seed_override() {
+        return seed;
+    }
     let clock = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos().min(u128::from(u64::MAX)) as u64)
@@ -154,6 +160,47 @@ fn scene_kind_for_seed(seed: u64) -> SceneKind {
         SceneKind::Fireplace
     } else {
         SceneKind::Snow
+    }
+}
+
+fn dev_scene_kind_override() -> Option<SceneKind> {
+    env::var(DEV_SCENE_ENV)
+        .ok()
+        .and_then(|value| parse_dev_scene_kind(&value))
+}
+
+fn dev_scene_seed_override() -> Option<u64> {
+    env::var(DEV_SCENE_SEED_ENV)
+        .ok()
+        .and_then(|value| parse_dev_u64(&value))
+}
+
+fn dev_scene_frame_override() -> Option<u64> {
+    env::var(DEV_SCENE_FRAME_ENV)
+        .ok()
+        .and_then(|value| parse_dev_u64(&value))
+}
+
+fn parse_dev_scene_kind(value: &str) -> Option<SceneKind> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "fire" | "fireplace" => Some(SceneKind::Fireplace),
+        "snow" | "snowman" => Some(SceneKind::Snow),
+        _ => None,
+    }
+}
+
+fn parse_dev_u64(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        value.parse().ok()
     }
 }
 
@@ -311,7 +358,9 @@ struct App {
     tasks_started: bool,
     countdown_snapshot: Vec<Option<u64>>,
     scene_seed: u64,
+    scene_override: Option<SceneKind>,
     scene_frame: u64,
+    scene_frame_override: Option<u64>,
     last_scene_frame: Instant,
 }
 
@@ -336,6 +385,8 @@ impl App {
             .collect();
         let (dependency_indexes, dependent_indexes) = dependency_graph(&loaded.config.tasks);
         let scene_seed = app_scene_seed(&loaded);
+        let scene_override = dev_scene_kind_override();
+        let scene_frame_override = dev_scene_frame_override();
         Self {
             loaded,
             tasks,
@@ -376,7 +427,9 @@ impl App {
             tasks_started: false,
             countdown_snapshot: Vec::new(),
             scene_seed,
+            scene_override,
             scene_frame: 0,
+            scene_frame_override,
             last_scene_frame: Instant::now(),
         }
     }
@@ -520,7 +573,7 @@ impl App {
 
     fn task_scene_state(&self, index: usize) -> SceneState {
         SceneState {
-            kind: SceneKind::Fireplace,
+            kind: self.scene_override.unwrap_or(SceneKind::Fireplace),
             seed: mix_scene_seed(self.scene_seed, index as u64, 0x007e_17ed_u64),
         }
     }
@@ -528,9 +581,15 @@ impl App {
     fn empty_slot_scene_state(&self, slot: usize) -> SceneState {
         let seed = mix_scene_seed(self.scene_seed, slot as u64, 0xe4d7_5107_u64);
         SceneState {
-            kind: scene_kind_for_seed(seed),
+            kind: self
+                .scene_override
+                .unwrap_or_else(|| scene_kind_for_seed(seed)),
             seed,
         }
+    }
+
+    fn active_scene_frame(&self) -> u64 {
+        self.scene_frame_override.unwrap_or(self.scene_frame)
     }
 
     fn scenes_visible(&self) -> bool {
@@ -549,17 +608,13 @@ impl App {
         clear_rect(buffer, frame_area, app_style());
 
         if !self.fullscreen && self.slot_rects.len() > self.tasks.len() {
+            let scene_frame = self.active_scene_frame();
             for slot in self.tasks.len()..self.slot_rects.len() {
                 let area = self.slot_rects[slot];
                 if area.width == 0 || area.height == 0 {
                     continue;
                 }
-                render_scene_slot(
-                    area,
-                    self.empty_slot_scene_state(slot),
-                    self.scene_frame,
-                    buffer,
-                );
+                render_scene_slot(area, self.empty_slot_scene_state(slot), scene_frame, buffer);
             }
         }
 
@@ -644,7 +699,7 @@ impl App {
                 render_scene(
                     scene,
                     self.task_scene_state(index),
-                    self.scene_frame,
+                    self.active_scene_frame(),
                     buffer,
                 );
             }
@@ -3553,7 +3608,8 @@ impl App {
         if self.tick_dependency_starts(now) {
             changed = true;
         }
-        if self.scenes_visible()
+        if self.scene_frame_override.is_none()
+            && self.scenes_visible()
             && now.duration_since(self.last_scene_frame) >= SCENE_FRAME_INTERVAL
         {
             self.scene_frame = self.scene_frame.wrapping_add(1);
@@ -6682,24 +6738,7 @@ fn render_fire(buffer: &mut Buffer, area: Rect, seed: u64, frame: u64, fire: Fir
     }
 
     let ember_y = fire.log_y.saturating_sub(1);
-    for column in 1..fire.log_width.saturating_sub(1) {
-        let value = mix_scene_seed(seed, u64::from(column), frame);
-        if value.is_multiple_of(4) {
-            let symbol = if value & 1 == 0 { "▂" } else { "▄" };
-            let color = if value & 2 == 0 {
-                THEME_EMBER
-            } else {
-                THEME_FLAME
-            };
-            paint_scene_cell(
-                buffer,
-                i32::from(fire.log_x + column),
-                ember_y,
-                symbol,
-                pane_style().fg(color),
-            );
-        }
-    }
+    render_flame_bed(buffer, seed, frame, fire, ember_y);
 
     let flame_count = (fire.log_width / 5).clamp(3, 6);
     let span = fire.log_width.saturating_sub(4).max(1);
@@ -6732,6 +6771,29 @@ fn render_fire(buffer: &mut Buffer, area: Rect, seed: u64, frame: u64, fire: Fir
             let y = ember_y.saturating_sub(y_offset);
             paint_scene_cell(buffer, i32::from(x), y, "·", pane_style().fg(THEME_EMBER));
         }
+    }
+}
+
+fn render_flame_bed(buffer: &mut Buffer, seed: u64, frame: u64, fire: FireGeometry, y: u16) {
+    for column in 1..fire.log_width.saturating_sub(1) {
+        let value = mix_scene_seed(seed, u64::from(column), frame);
+        let symbol = match value % 5 {
+            0 => "▆",
+            1 => "▄",
+            _ => "█",
+        };
+        let color = if value & 1 == 0 {
+            THEME_FLAME
+        } else {
+            THEME_EMBER
+        };
+        paint_scene_cell(
+            buffer,
+            i32::from(fire.log_x + column),
+            y,
+            symbol,
+            pane_style().fg(color).add_modifier(Modifier::BOLD),
+        );
     }
 }
 
@@ -9765,6 +9827,37 @@ mod tests {
     }
 
     #[test]
+    fn dev_scene_override_parses_private_scene_names() {
+        assert_eq!(
+            parse_dev_scene_kind("fireplace"),
+            Some(SceneKind::Fireplace)
+        );
+        assert_eq!(parse_dev_scene_kind("fire"), Some(SceneKind::Fireplace));
+        assert_eq!(parse_dev_scene_kind("snow"), Some(SceneKind::Snow));
+        assert_eq!(parse_dev_scene_kind("snowman"), Some(SceneKind::Snow));
+        assert_eq!(parse_dev_scene_kind("tree"), None);
+    }
+
+    #[test]
+    fn dev_scene_numeric_overrides_parse_decimal_and_hex() {
+        assert_eq!(parse_dev_u64("42"), Some(42));
+        assert_eq!(parse_dev_u64("0x2a"), Some(42));
+        assert_eq!(parse_dev_u64(""), None);
+        assert_eq!(parse_dev_u64("nope"), None);
+    }
+
+    #[test]
+    fn scene_override_forces_empty_and_exited_scene_kinds() {
+        let mut app =
+            test_app_with_tasks(vec![test_task("one"), test_task("two"), test_task("three")]);
+        app.scene_override = Some(SceneKind::Snow);
+        app.update_layout(Rect::new(0, 0, 80, 40));
+
+        assert_eq!(app.task_scene_state(0).kind, SceneKind::Snow);
+        assert_eq!(app.empty_slot_scene_state(3).kind, SceneKind::Snow);
+    }
+
+    #[test]
     fn scene_animation_ticks_only_when_visible() {
         let mut app =
             test_app_with_tasks(vec![test_task("one"), test_task("two"), test_task("three")]);
@@ -9782,6 +9875,21 @@ mod tests {
         app.last_scene_frame = now - SCENE_FRAME_INTERVAL;
 
         assert!(!app.tick().unwrap());
+        assert_eq!(app.scene_frame, 0);
+    }
+
+    #[test]
+    fn scene_frame_override_freezes_animation_tick() {
+        let mut app =
+            test_app_with_tasks(vec![test_task("one"), test_task("two"), test_task("three")]);
+        let now = Instant::now();
+        app.update_layout(Rect::new(0, 0, 80, 40));
+        app.countdown_snapshot = app.waiting_countdown_snapshot(now);
+        app.scene_frame_override = Some(7);
+        app.last_scene_frame = now - SCENE_FRAME_INTERVAL;
+
+        assert!(!app.tick().unwrap());
+        assert_eq!(app.active_scene_frame(), 7);
         assert_eq!(app.scene_frame, 0);
     }
 
