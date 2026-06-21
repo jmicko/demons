@@ -155,11 +155,38 @@ fn mix_scene_seed(seed: u64, value: u64, salt: u64) -> u64 {
     mixed ^ (mixed >> 31)
 }
 
-fn scene_kind_for_seed(seed: u64) -> SceneKind {
-    if seed & 1 == 0 {
-        SceneKind::Fireplace
-    } else {
-        SceneKind::Snow
+fn scene_state_for_area(
+    seed: u64,
+    area: Rect,
+    override_kind: Option<SceneKind>,
+) -> Option<SceneState> {
+    if let Some(kind) = override_kind.filter(|kind| scene_fits(*kind, area)) {
+        return Some(SceneState { kind, seed });
+    }
+    let kinds = fitting_scene_kinds(area);
+    if kinds.is_empty() {
+        return None;
+    }
+    let kind = *kinds.get((seed % kinds.len() as u64) as usize)?;
+    Some(SceneState { kind, seed })
+}
+
+fn fitting_scene_kinds(area: Rect) -> Vec<SceneKind> {
+    [SceneKind::Fireplace, SceneKind::Snow]
+        .into_iter()
+        .filter(|kind| scene_fits(*kind, area))
+        .collect()
+}
+
+fn scene_fits(kind: SceneKind, area: Rect) -> bool {
+    let (width, height) = scene_min_size(kind);
+    area.width >= width && area.height >= height
+}
+
+fn scene_min_size(kind: SceneKind) -> (u16, u16) {
+    match kind {
+        SceneKind::Fireplace => (18, 4),
+        SceneKind::Snow => (18, 7),
     }
 }
 
@@ -571,21 +598,14 @@ impl App {
         reserved_scene_rect(*self.content_rects.get(index)?)
     }
 
-    fn task_scene_state(&self, index: usize) -> SceneState {
-        SceneState {
-            kind: self.scene_override.unwrap_or(SceneKind::Fireplace),
-            seed: mix_scene_seed(self.scene_seed, index as u64, 0x007e_17ed_u64),
-        }
+    fn task_scene_state(&self, index: usize, area: Rect) -> Option<SceneState> {
+        let seed = mix_scene_seed(self.scene_seed, index as u64, 0x007e_17ed_u64);
+        scene_state_for_area(seed, area, self.scene_override)
     }
 
-    fn empty_slot_scene_state(&self, slot: usize) -> SceneState {
+    fn empty_slot_scene_state(&self, slot: usize, area: Rect) -> Option<SceneState> {
         let seed = mix_scene_seed(self.scene_seed, slot as u64, 0xe4d7_5107_u64);
-        SceneState {
-            kind: self
-                .scene_override
-                .unwrap_or_else(|| scene_kind_for_seed(seed)),
-            seed,
-        }
+        scene_state_for_area(seed, area, self.scene_override)
     }
 
     fn active_scene_frame(&self) -> u64 {
@@ -614,7 +634,10 @@ impl App {
                 if area.width == 0 || area.height == 0 {
                     continue;
                 }
-                render_scene_slot(area, self.empty_slot_scene_state(slot), scene_frame, buffer);
+                let scene_area = inset_rect(area, 1, 1);
+                if let Some(scene) = self.empty_slot_scene_state(slot, scene_area) {
+                    render_scene_slot(area, scene, scene_frame, buffer);
+                }
             }
         }
 
@@ -695,13 +718,10 @@ impl App {
                 parser_row_offset,
                 buffer,
             );
-            if let Some(scene) = self.exited_scene_rect(index) {
-                render_scene(
-                    scene,
-                    self.task_scene_state(index),
-                    self.active_scene_frame(),
-                    buffer,
-                );
+            if let Some(scene) = self.exited_scene_rect(index)
+                && let Some(state) = self.task_scene_state(index, scene)
+            {
+                render_scene(scene, state, self.active_scene_frame(), buffer);
             }
         }
 
@@ -6665,7 +6685,7 @@ fn render_scene(area: Rect, scene: SceneState, frame: u64, buffer: &mut Buffer) 
 }
 
 fn render_fireplace(area: Rect, seed: u64, frame: u64, buffer: &mut Buffer) {
-    if area.width < 18 || area.height < 4 {
+    if !scene_fits(SceneKind::Fireplace, area) {
         return;
     }
     let log_width = ((u32::from(area.width) * 2) / 5)
@@ -6689,7 +6709,7 @@ fn render_fireplace(area: Rect, seed: u64, frame: u64, buffer: &mut Buffer) {
 }
 
 fn render_snow_scene(area: Rect, seed: u64, frame: u64, buffer: &mut Buffer) {
-    if area.width < 10 || area.height < 4 {
+    if !scene_fits(SceneKind::Snow, area) {
         return;
     }
     let ground_y = area.bottom().saturating_sub(1);
@@ -9796,7 +9816,7 @@ mod tests {
 
     #[test]
     fn snow_scene_flakes_fall_between_frames() {
-        let area = Rect::new(0, 0, 16, 7);
+        let area = Rect::new(0, 0, 18, 7);
         let mut first = Buffer::empty(area);
         let mut second = Buffer::empty(area);
 
@@ -9837,7 +9857,32 @@ mod tests {
         assert!(app.slot_rects.len() > app.pane_rects.len());
 
         let choices = (0..64)
-            .map(|slot| app.empty_slot_scene_state(slot).kind)
+            .filter_map(|slot| app.empty_slot_scene_state(slot, Rect::new(0, 0, 80, 40)))
+            .map(|scene| scene.kind)
+            .collect::<HashSet<_>>();
+        assert!(choices.contains(&SceneKind::Fireplace));
+        assert!(choices.contains(&SceneKind::Snow));
+    }
+
+    #[test]
+    fn scene_selection_uses_current_area_size() {
+        let compact = Rect::new(0, 0, 24, 4);
+        let roomy = Rect::new(0, 0, 24, 7);
+        let too_small = Rect::new(0, 0, 17, 7);
+
+        assert!(scene_fits(SceneKind::Fireplace, compact));
+        assert!(!scene_fits(SceneKind::Snow, compact));
+        assert!(scene_state_for_area(0, too_small, None).is_none());
+        assert_eq!(
+            scene_state_for_area(0, compact, Some(SceneKind::Snow))
+                .unwrap()
+                .kind,
+            SceneKind::Fireplace
+        );
+
+        let choices = (0..64)
+            .filter_map(|seed| scene_state_for_area(seed, roomy, None))
+            .map(|scene| scene.kind)
             .collect::<HashSet<_>>();
         assert!(choices.contains(&SceneKind::Fireplace));
         assert!(choices.contains(&SceneKind::Snow));
@@ -9870,8 +9915,18 @@ mod tests {
         app.scene_override = Some(SceneKind::Snow);
         app.update_layout(Rect::new(0, 0, 80, 40));
 
-        assert_eq!(app.task_scene_state(0).kind, SceneKind::Snow);
-        assert_eq!(app.empty_slot_scene_state(3).kind, SceneKind::Snow);
+        assert_eq!(
+            app.task_scene_state(0, Rect::new(0, 0, 80, 7))
+                .unwrap()
+                .kind,
+            SceneKind::Snow
+        );
+        assert_eq!(
+            app.empty_slot_scene_state(3, Rect::new(0, 0, 80, 7))
+                .unwrap()
+                .kind,
+            SceneKind::Snow
+        );
     }
 
     #[test]
