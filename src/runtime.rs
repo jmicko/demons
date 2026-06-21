@@ -86,6 +86,8 @@ enum SceneKind {
     Fireplace,
     Snow,
     Tree,
+    Santa,
+    Jack,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -173,10 +175,16 @@ fn scene_state_for_area(
 }
 
 fn fitting_scene_kinds(area: Rect) -> Vec<SceneKind> {
-    [SceneKind::Fireplace, SceneKind::Snow, SceneKind::Tree]
-        .into_iter()
-        .filter(|kind| scene_fits(*kind, area))
-        .collect()
+    [
+        SceneKind::Fireplace,
+        SceneKind::Snow,
+        SceneKind::Tree,
+        SceneKind::Santa,
+        SceneKind::Jack,
+    ]
+    .into_iter()
+    .filter(|kind| scene_fits(*kind, area))
+    .collect()
 }
 
 fn scene_fits(kind: SceneKind, area: Rect) -> bool {
@@ -189,6 +197,8 @@ fn scene_min_size(kind: SceneKind) -> (u16, u16) {
         SceneKind::Fireplace => (18, 4),
         SceneKind::Snow => (18, 7),
         SceneKind::Tree => (18, 7),
+        SceneKind::Santa => (24, 8),
+        SceneKind::Jack => (20, 7),
     }
 }
 
@@ -215,6 +225,8 @@ fn parse_dev_scene_kind(value: &str) -> Option<SceneKind> {
         "fire" | "fireplace" => Some(SceneKind::Fireplace),
         "snow" | "snowman" => Some(SceneKind::Snow),
         "tree" => Some(SceneKind::Tree),
+        "santa" | "rooftop" => Some(SceneKind::Santa),
+        "jack" | "jack-in-the-box" | "jack_in_the_box" => Some(SceneKind::Jack),
         _ => None,
     }
 }
@@ -6685,6 +6697,8 @@ fn render_scene(area: Rect, scene: SceneState, frame: u64, buffer: &mut Buffer) 
         SceneKind::Fireplace => render_fireplace(area, scene.seed, frame, buffer),
         SceneKind::Snow => render_snow_scene(area, scene.seed, frame, buffer),
         SceneKind::Tree => render_tree_scene(area, scene.seed, frame, buffer),
+        SceneKind::Santa => render_santa_scene(area, frame, buffer),
+        SceneKind::Jack => render_jack_scene(area, frame, buffer),
     }
 }
 
@@ -6879,6 +6893,249 @@ fn render_present(buffer: &mut Buffer, x: u16, y: u16, color: Color) {
         paint_scene_cell(buffer, i32::from(x + offset), y, " ", wrap);
     }
     paint_scene_cell(buffer, i32::from(x + 1), y, "╋", ribbon);
+}
+
+fn render_santa_scene(area: Rect, frame: u64, buffer: &mut Buffer) {
+    if !scene_fits(SceneKind::Santa, area) {
+        return;
+    }
+
+    let roof_y = area.bottom().saturating_sub(2);
+    render_rooftop(area, roof_y, buffer);
+
+    let chimney_x = area.x + area.width.saturating_sub(7) / 2 + 3;
+    let chimney_top = roof_y.saturating_sub(3);
+    render_santa(buffer, i32::from(chimney_x), chimney_top, frame);
+    render_chimney(buffer, chimney_x, chimney_top, roof_y);
+}
+
+fn render_rooftop(area: Rect, roof_y: u16, buffer: &mut Buffer) {
+    for column in 1..area.width.saturating_sub(1) {
+        let x = area.x + column;
+        buffer[(x, roof_y)]
+            .set_symbol("▔")
+            .set_style(pane_style().fg(THEME_SNOW));
+        if roof_y + 1 < area.bottom() {
+            let color = if column % 2 == 0 {
+                THEME_RED
+            } else {
+                THEME_RED_HOVER
+            };
+            buffer[(x, roof_y + 1)]
+                .set_symbol("▄")
+                .set_style(pane_style().fg(color));
+        }
+    }
+}
+
+fn render_chimney(buffer: &mut Buffer, x: u16, top: u16, roof_y: u16) {
+    for y in top..roof_y {
+        for offset in 0..4 {
+            paint_scene_cell(
+                buffer,
+                i32::from(x + offset),
+                y,
+                " ",
+                Style::default().fg(THEME_RED).bg(THEME_RED),
+            );
+        }
+        paint_scene_cell(
+            buffer,
+            i32::from(x + 1),
+            y,
+            "▌",
+            Style::default().fg(THEME_RED_HOVER).bg(THEME_RED),
+        );
+    }
+    if top > 0 {
+        for offset in 0..4 {
+            paint_scene_cell(
+                buffer,
+                i32::from(x + offset),
+                top,
+                "▀",
+                Style::default().fg(THEME_SNOW).bg(THEME_RED),
+            );
+        }
+    }
+}
+
+fn render_santa(buffer: &mut Buffer, chimney_x: i32, chimney_top: u16, frame: u64) {
+    let phase = frame % 8;
+    let offset = match phase {
+        0 => 4,
+        1 => 3,
+        2 => 2,
+        6 => 2,
+        7 => 3,
+        _ => 0,
+    };
+    let top = i32::from(chimney_top).saturating_sub(4) + offset;
+    let left = chimney_x - 2;
+    let wave_right = matches!(phase, 3 | 5);
+    let arm_row = if wave_right {
+        "\\███/"
+    } else {
+        "/███\\"
+    };
+
+    render_scene_text_clipped(
+        buffer,
+        left,
+        top,
+        "  ▲  ",
+        pane_style()
+            .fg(THEME_RED_HOVER)
+            .add_modifier(Modifier::BOLD),
+    );
+    render_scene_text_clipped(
+        buffer,
+        left,
+        top + 1,
+        " ▔▔▔ ",
+        pane_style().fg(THEME_SNOW).add_modifier(Modifier::BOLD),
+    );
+    render_scene_text_clipped(
+        buffer,
+        left,
+        top + 2,
+        "(• •)",
+        pane_style().fg(THEME_SNOW).add_modifier(Modifier::BOLD),
+    );
+    render_scene_text_clipped(
+        buffer,
+        left,
+        top + 3,
+        arm_row,
+        pane_style()
+            .fg(THEME_RED_HOVER)
+            .add_modifier(Modifier::BOLD),
+    );
+}
+
+fn render_jack_scene(area: Rect, frame: u64, buffer: &mut Buffer) {
+    if !scene_fits(SceneKind::Jack, area) {
+        return;
+    }
+
+    let ground_y = area.bottom().saturating_sub(1);
+    render_snow_ground(area, ground_y, buffer);
+
+    let box_width = area.width.saturating_sub(8).clamp(9, 13);
+    let box_height = if area.height >= 9 { 3 } else { 2 };
+    let box_x = area.x + area.width.saturating_sub(box_width) / 2;
+    let box_y = ground_y.saturating_sub(box_height);
+    let center = box_x + box_width / 2;
+
+    render_jack(buffer, i32::from(center), box_y, frame);
+    render_jack_box(buffer, box_x, box_y, box_width, box_height, frame);
+}
+
+fn render_jack_box(buffer: &mut Buffer, x: u16, y: u16, width: u16, height: u16, frame: u64) {
+    let phase = frame % 8;
+    let box_style = Style::default().fg(THEME_RED_HOVER).bg(THEME_RED_HOVER);
+    let ribbon_style = Style::default().fg(THEME_GOLD_HOVER).bg(THEME_GOLD_HOVER);
+    let center = width / 2;
+
+    for row in 0..height {
+        for column in 0..width {
+            let style = if column == center || row == 0 {
+                ribbon_style
+            } else {
+                box_style
+            };
+            paint_scene_cell(buffer, i32::from(x + column), y + row, " ", style);
+        }
+    }
+
+    if phase == 0 || phase == 7 {
+        for column in 0..width {
+            let style = if column == center {
+                ribbon_style
+            } else {
+                Style::default().fg(THEME_RED).bg(THEME_RED)
+            };
+            paint_scene_cell(
+                buffer,
+                i32::from(x + column),
+                y.saturating_sub(1),
+                "▀",
+                style,
+            );
+        }
+    } else {
+        let lid_y = y.saturating_sub(1);
+        render_scene_text_clipped(
+            buffer,
+            i32::from(x) + i32::from(center).saturating_sub(5),
+            i32::from(lid_y),
+            "╲▄▄▄▄╱",
+            pane_style().fg(THEME_GOLD_HOVER),
+        );
+    }
+}
+
+fn render_jack(buffer: &mut Buffer, center: i32, box_y: u16, frame: u64) {
+    let phase = frame % 8;
+    if phase == 0 || phase == 7 {
+        return;
+    }
+
+    let rise = match phase {
+        1 | 6 => 1,
+        2 | 5 => 2,
+        _ => 3,
+    };
+    let top = i32::from(box_y).saturating_sub(rise + 3);
+    let arm_row = if phase.is_multiple_of(2) {
+        "\\ | /"
+    } else {
+        "/ | \\"
+    };
+    let spring = if phase.is_multiple_of(2) {
+        " ╱╲ "
+    } else {
+        " ╲╱ "
+    };
+
+    if rise >= 3 {
+        render_scene_text_clipped(
+            buffer,
+            center - 2,
+            top,
+            "  ▲  ",
+            pane_style()
+                .fg(THEME_GOLD_HOVER)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+    if rise >= 2 {
+        render_scene_text_clipped(
+            buffer,
+            center - 2,
+            top + 1,
+            " (☺) ",
+            pane_style().fg(THEME_SNOW).add_modifier(Modifier::BOLD),
+        );
+    }
+    if rise >= 3 {
+        render_scene_text_clipped(
+            buffer,
+            center - 2,
+            top + 2,
+            arm_row,
+            pane_style()
+                .fg(THEME_RED_HOVER)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+    render_scene_text_clipped(
+        buffer,
+        center - 2,
+        i32::from(box_y).saturating_sub(1),
+        spring,
+        pane_style().fg(THEME_GOLD_HOVER),
+    );
 }
 
 fn render_fire(buffer: &mut Buffer, area: Rect, seed: u64, frame: u64, fire: FireGeometry) {
@@ -7087,6 +7344,30 @@ fn paint_scene_cell(buffer: &mut Buffer, x: i32, y: u16, symbol: &str, style: St
         return;
     }
     buffer[(x, y)].set_symbol(symbol).set_style(style);
+}
+
+fn render_scene_text_clipped(buffer: &mut Buffer, x: i32, y: i32, text: &str, style: Style) {
+    if y < 0 {
+        return;
+    }
+    let y = y as u16;
+    for (offset, character) in text.chars().enumerate() {
+        let cell_x = x + offset as i32;
+        if cell_x < 0 {
+            continue;
+        }
+        let cell_x = cell_x as u16;
+        if !contains(buffer.area, cell_x, y) {
+            continue;
+        }
+        let mut encoded = [0_u8; 4];
+        let symbol = if character.is_control() {
+            " "
+        } else {
+            character.encode_utf8(&mut encoded)
+        };
+        buffer[(cell_x, y)].set_symbol(symbol).set_style(style);
+    }
 }
 
 fn render_scene_text(buffer: &mut Buffer, x: u16, y: u16, text: &str, style: Style) {
@@ -9991,6 +10272,34 @@ mod tests {
     }
 
     #[test]
+    fn santa_scene_pops_out_between_frames() {
+        let area = Rect::new(0, 0, 30, 9);
+        let mut hidden = Buffer::empty(area);
+        let mut visible = Buffer::empty(area);
+
+        render_santa_scene(area, 0, &mut hidden);
+        render_santa_scene(area, 3, &mut visible);
+
+        assert!(!buffer_text(&hidden, area).contains("(• •)"));
+        assert!(buffer_text(&visible, area).contains("(• •)"));
+        assert_ne!(buffer_text(&hidden, area), buffer_text(&visible, area));
+    }
+
+    #[test]
+    fn jack_scene_pops_out_between_frames() {
+        let area = Rect::new(0, 0, 24, 8);
+        let mut closed = Buffer::empty(area);
+        let mut open = Buffer::empty(area);
+
+        render_jack_scene(area, 0, &mut closed);
+        render_jack_scene(area, 3, &mut open);
+
+        assert!(!buffer_text(&closed, area).contains('☺'));
+        assert!(buffer_text(&open, area).contains('☺'));
+        assert_ne!(buffer_text(&closed, area), buffer_text(&open, area));
+    }
+
+    #[test]
     fn empty_grid_slots_get_seeded_scene_choices() {
         let mut app =
             test_app_with_tasks(vec![test_task("one"), test_task("two"), test_task("three")]);
@@ -10007,16 +10316,19 @@ mod tests {
         assert!(choices.contains(&SceneKind::Fireplace));
         assert!(choices.contains(&SceneKind::Snow));
         assert!(choices.contains(&SceneKind::Tree));
+        assert!(choices.contains(&SceneKind::Santa));
+        assert!(choices.contains(&SceneKind::Jack));
     }
 
     #[test]
     fn scene_selection_uses_current_area_size() {
         let compact = Rect::new(0, 0, 24, 4);
-        let roomy = Rect::new(0, 0, 24, 7);
+        let roomy = Rect::new(0, 0, 28, 8);
         let too_small = Rect::new(0, 0, 17, 7);
 
         assert!(scene_fits(SceneKind::Fireplace, compact));
         assert!(!scene_fits(SceneKind::Snow, compact));
+        assert!(!scene_fits(SceneKind::Santa, compact));
         assert!(scene_state_for_area(0, too_small, None).is_none());
         assert_eq!(
             scene_state_for_area(0, compact, Some(SceneKind::Snow))
@@ -10032,6 +10344,8 @@ mod tests {
         assert!(choices.contains(&SceneKind::Fireplace));
         assert!(choices.contains(&SceneKind::Snow));
         assert!(choices.contains(&SceneKind::Tree));
+        assert!(choices.contains(&SceneKind::Santa));
+        assert!(choices.contains(&SceneKind::Jack));
     }
 
     #[test]
@@ -10044,6 +10358,13 @@ mod tests {
         assert_eq!(parse_dev_scene_kind("snow"), Some(SceneKind::Snow));
         assert_eq!(parse_dev_scene_kind("snowman"), Some(SceneKind::Snow));
         assert_eq!(parse_dev_scene_kind("tree"), Some(SceneKind::Tree));
+        assert_eq!(parse_dev_scene_kind("santa"), Some(SceneKind::Santa));
+        assert_eq!(parse_dev_scene_kind("rooftop"), Some(SceneKind::Santa));
+        assert_eq!(parse_dev_scene_kind("jack"), Some(SceneKind::Jack));
+        assert_eq!(
+            parse_dev_scene_kind("jack-in-the-box"),
+            Some(SceneKind::Jack)
+        );
     }
 
     #[test]
@@ -11165,6 +11486,19 @@ mod tests {
             line.push_str(buffer[(column, row)].symbol());
         }
         line
+    }
+
+    fn buffer_text(buffer: &Buffer, area: Rect) -> String {
+        let mut text = String::new();
+        for row in area.y..area.bottom() {
+            if row > area.y {
+                text.push('\n');
+            }
+            for column in area.x..area.right() {
+                text.push_str(buffer[(column, row)].symbol());
+            }
+        }
+        text
     }
 
     fn snowflake_positions(buffer: &Buffer, area: Rect) -> Vec<(u16, u16, String)> {
