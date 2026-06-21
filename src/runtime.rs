@@ -6644,7 +6644,10 @@ fn render_snow_scene(area: Rect, seed: u64, frame: u64, buffer: &mut Buffer) {
         let value = mix_scene_seed(seed, index as u64, 0x5107_u64);
         let fall = (value / 17).wrapping_add(frame) % u64::from(sky_height);
         let drift = ((frame / 2 + index as u64) % 3) as i16 - 1;
-        let base_x = (value % u64::from(area.width)) as i16;
+        let slot_x = ((index as u64 * u64::from(area.width)) / flakes as u64) as i16;
+        let slot_width = (usize::from(area.width) / flakes).max(1) as i16;
+        let jitter = (value % slot_width as u64) as i16;
+        let base_x = slot_x + jitter;
         let x =
             area.x + ((base_x + drift).rem_euclid(i16::try_from(area.width).unwrap_or(1))) as u16;
         let y = area.y + fall as u16;
@@ -6681,8 +6684,8 @@ fn render_fire(buffer: &mut Buffer, area: Rect, seed: u64, frame: u64, fire: Fir
     let ember_y = fire.log_y.saturating_sub(1);
     for column in 1..fire.log_width.saturating_sub(1) {
         let value = mix_scene_seed(seed, u64::from(column), frame);
-        if !value.is_multiple_of(5) {
-            let symbol = if value & 1 == 0 { "▄" } else { "▆" };
+        if value.is_multiple_of(4) {
+            let symbol = if value & 1 == 0 { "▂" } else { "▄" };
             let color = if value & 2 == 0 {
                 THEME_EMBER
             } else {
@@ -6751,9 +6754,7 @@ fn render_flame_tongue(
             let edge = offset.unsigned_abs() as u16 == half_width;
             let symbol = if rows_above == 0 {
                 "▲"
-            } else if level == 0 {
-                "▄"
-            } else if phase & 1 == 0 || !edge {
+            } else if level == 0 || phase & 1 == 0 || !edge {
                 "█"
             } else {
                 "▌"
@@ -6828,15 +6829,8 @@ fn render_log_nub(buffer: &mut Buffer, x: u16, y: u16, width: u16) {
     if width < 10 || y == 0 {
         return;
     }
-    let nub_x = x + width.saturating_sub(1);
-    render_scene_text(buffer, nub_x, y, "━━◉", pane_style().fg(THEME_LOG));
-    paint_scene_cell(
-        buffer,
-        i32::from(nub_x + 2),
-        y,
-        "◉",
-        pane_style().fg(THEME_LOG_DARK),
-    );
+    let nub_x = x + width.saturating_sub(3);
+    render_scene_text(buffer, nub_x, y - 1, "▗●▖", pane_style().fg(THEME_LOG));
 }
 
 fn render_snowman(area: Rect, ground_y: u16, buffer: &mut Buffer) {
