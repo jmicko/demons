@@ -1,3 +1,11 @@
+schema_version = 1
+
+[settings]
+layout = "grid"
+leader = "alt-j"
+multi_click_ms = 500
+logging = false
+
 [[task]]
 name = "restartable"
 command = """
@@ -9,6 +17,10 @@ printf 'child %s\n' "$child" >> /tmp/demons-smoke.log
 trap 'exit 0' TERM INT
 wait "$child"
 """
+cwd = "."
+depends_on = []
+
+[task.env]
 
 [[task]]
 name = "ansi"
@@ -17,3 +29,7 @@ command = [
   "-c",
   "printf '\\033[31mred\\033[0m\\n'; trap 'exit 0' TERM INT; while :; do sleep 1; done",
 ]
+cwd = "."
+depends_on = []
+
+[task.env]

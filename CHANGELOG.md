@@ -4,6 +4,28 @@ All notable user-facing changes should be recorded here before a release.
 
 ## Unreleased
 
+- Added `schema_version = 1` to `demons.toml`; unversioned valid configs are
+  normalized automatically after validation.
+- Changed `demons init` and interactive startup to recover parseable broken
+  configs into an editable draft with red blocking problem markers, gold
+  recovery markers, and an Exit-tab problem list.
+- Added recovery for bare missing config assignment values such as `command =`;
+  they open in the menu as empty fields with blocking problem markers.
+- Changed unrecoverable malformed TOML in the configurator to open a fresh draft
+  that overwrites the broken file only when saved.
+- Fixed recovery warnings so generic root notices do not linger as menu
+  problems, while concrete ignored keys still appear with useful locations.
+- Changed runtime config saves so added, removed, or renamed tasks rebuild and
+  restart the task set in place instead of requiring a Demons restart.
+- Changed the task environment editor from a comma-separated text field to a
+  nested key/value row editor with add, rename, value edit, and delete actions.
+- Fixed no-op command edits so direct command arrays are not rewritten as shell
+  strings.
+- Hardened saved scrollback logs on Unix by using a per-user temp directory and
+  rejecting symlinked or incorrectly owned log directories.
+- Raised the minimum supported Rust version to 1.88 and updated the terminal UI
+  stack to `ratatui` 0.30 / `crossterm` 0.29.
+
 ## 0.2.0 - 2026-06-19
 
 - Added pane-local mouse text selection with scrollback autoscroll and

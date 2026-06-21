@@ -68,10 +68,20 @@ fn try_main() -> Result<()> {
         }
     };
 
-    let loaded = LoadedConfig::load(path)?;
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        LoadedConfig::load(path)?;
         bail!("demons requires an interactive terminal");
     }
+
+    let loaded = match LoadedConfig::load(path.clone()) {
+        Ok(loaded) => loaded,
+        Err(error) => match LoadedConfig::load_unvalidated_or_default(path) {
+            Ok(loaded) if !loaded.config_problems.is_empty() => {
+                return runtime::recover_then_run(loaded);
+            }
+            _ => return Err(error),
+        },
+    };
     runtime::run(loaded)
 }
 

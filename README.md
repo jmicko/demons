@@ -50,21 +50,52 @@ demons init
 tasks. Use the Tasks tab to add or edit tasks, Settings for app-level options,
 and Exit to save or discard changes. When an existing config is found in the
 current directory or a parent directory, `demons init` edits it in place.
-Working-directory fields validate before they are applied, and Tab completes
-directory names relative to the config file.
+Working-directory fields validate before they are applied, Tab completes
+directory names relative to the config file, and environment variables are
+edited as key/value rows.
+
+If an existing config is parseable TOML but does not match the current schema,
+`demons init` recovers the pieces it understands into an editable draft. Red
+problem markers show fields that must be fixed before saving, and gold markers
+show fields Demons repaired or ignored so you can review them. The Exit tab has
+a Problems section whose rows jump to the affected setting. The original file is
+not rewritten until you explicitly save. Bare missing assignment values such as
+`command =` are recovered as empty strings so the menu can mark the field red.
+If the TOML is too broken to recover, Demons opens a fresh draft that can
+overwrite the broken file only when you save. Configs from unsupported future
+schema versions still fail instead of being guessed at.
+
+Regular `demons` startup uses the same recovery path for recoverable config
+problems in an interactive terminal: it opens the menu without starting tasks,
+then starts them after you fix red problems and save.
 
 Or create `demons.toml` yourself:
 
 ```toml
+schema_version = 1
+
+[settings]
+layout = "grid"
+leader = "alt-j"
+multi_click_ms = 500
+logging = false
+
 [[task]]
 name = "server"
 command = "cargo run"
+cwd = "."
+depends_on = []
+
+[task.env]
 
 [[task]]
 name = "web"
 command = "npm run dev -- --host 0.0.0.0"
 cwd = "./web"
-env = { BROWSER = "none" }
+depends_on = []
+
+[task.env]
+BROWSER = "none"
 ```
 
 Then run:
@@ -125,10 +156,11 @@ last copied Demons selection back to the focused pane in input mode.
 
 In command mode, `y` copies the focused pane's visible text and `Y` copies its
 full scrollback. `S` saves the focused pane's full scrollback to a temp log file
-and copies the file path. `/` opens a focused-pane search prompt; typing jumps
-to the newest match and shows the current/total match count. Press Enter to go
-to the previous match, `Shift+Enter` to go to the next match, or `Esc` to leave
-search mode.
+and copies the file path. On Unix, these logs are written under a per-user temp
+directory with restricted permissions. `/` opens a focused-pane search prompt;
+typing jumps to the newest match and shows the current/total match count. Press
+Enter to go to the previous match, `Shift+Enter` to go to the next match, or
+`Esc` to leave search mode.
 Press `Tab`/`Shift+Tab` or click another pane while the prompt is open to
 search that pane instead.
 
@@ -144,6 +176,8 @@ can save or discard that change. `Alt+Backtick` is available for one-hand use,
 but some desktops use it for window switching, so it is not the default.
 
 ```toml
+schema_version = 1
+
 [settings]
 leader = "alt-backtick" # also: "tab", "ctrl-b", "ctrl-q", "ctrl-\\"
 multi_click_ms = 500    # double/triple-click timing, 150-1000
@@ -172,19 +206,30 @@ while true; do date; sleep 1; done
 String commands run through `$SHELL -c` (falling back to `/bin/sh`):
 
 ```toml
+schema_version = 1
+
 [[task]]
 name = "api"
 command = "RUST_LOG=debug cargo run"
+cwd = "."
+depends_on = []
+
+[task.env]
 ```
 
 Array commands execute directly, without shell parsing:
 
 ```toml
+schema_version = 1
+
 [[task]]
 name = "api"
 command = ["cargo", "run", "--bin", "api"]
 cwd = "."
-env = { RUST_LOG = "debug" }
+depends_on = []
+
+[task.env]
+RUST_LOG = "debug"
 ```
 
 Tasks can depend on other tasks. A dependent task starts only after all of its
@@ -193,20 +238,35 @@ a task also restarts its dependents. While a task is waiting for a delayed
 start, the pane body shows the countdown to launch.
 
 ```toml
+schema_version = 1
+
 [[task]]
 name = "server"
 command = "cargo run"
+cwd = "."
+depends_on = []
+
+[task.env]
 
 [[task]]
 name = "web"
 command = "npm run dev"
+cwd = "."
 depends_on = ["server"]
 start_delay = "3s"
+
+[task.env]
 ```
 
 Task names must be unique. Working directories are resolved relative to the
 directory containing the config file. Unknown keys and invalid directories are
-reported before any task starts.
+reported before any task starts. Saving task-list changes from the runtime menu
+applies them in the current app session; added, removed, or renamed tasks cause
+the task set to restart in place rather than requiring a Demons restart.
+
+`schema_version` is the Demons config schema version, not the Demons app or
+crate version. Existing unversioned configs are treated as schema version 1 and
+are normalized after they successfully validate.
 
 `logging`, `watch`, `run_on_change`, and `repeat` are reserved schema fields.
 Demons rejects reserved task fields when set, and rejects `logging = true`, so

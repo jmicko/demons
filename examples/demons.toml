@@ -1,18 +1,33 @@
+schema_version = 1
+
 [settings]
+layout = "grid"
 leader = "alt-j"
+multi_click_ms = 500
+logging = false
 
 [[task]]
 name = "server"
 command = "cargo run"
+cwd = "."
+depends_on = []
+
+[task.env]
 
 [[task]]
 name = "web"
 command = "npm run dev -- --host 0.0.0.0"
 cwd = "./web"
-env = { BROWSER = "none" }
 depends_on = ["server"]
 start_delay = "3s"
+
+[task.env]
+BROWSER = "none"
 
 [[task]]
 name = "logs"
 command = ["tail", "-f", "/tmp/app.log"]
+cwd = "."
+depends_on = []
+
+[task.env]

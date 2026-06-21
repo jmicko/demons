@@ -1,19 +1,39 @@
+schema_version = 1
+
 [settings]
 layout = "grid"
 leader = "alt-j"
+multi_click_ms = 500
+logging = false
 
 [[task]]
 name = "cpu"
 command = "./test_commands.sh cpu"
+cwd = "."
+depends_on = []
+
+[task.env]
 
 [[task]]
 name = "clock"
 command = "./test_commands.sh clock"
+cwd = "."
+depends_on = []
+
+[task.env]
 
 [[task]]
 name = "load"
 command = "./test_commands.sh load"
+cwd = "."
+depends_on = []
+
+[task.env]
 
 [[task]]
 name = "count"
 command = "./test_commands.sh count"
+cwd = "."
+depends_on = []
+
+[task.env]
