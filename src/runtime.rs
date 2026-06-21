@@ -73,6 +73,7 @@ const THEME_FOOTER: Color = Color::Rgb(36, 45, 42);
 const THEME_FLAME: Color = Color::Rgb(221, 92, 38);
 const THEME_EMBER: Color = Color::Rgb(249, 177, 72);
 const THEME_LOG: Color = Color::Rgb(112, 68, 39);
+const THEME_LOG_DARK: Color = Color::Rgb(68, 39, 24);
 const THEME_ACCENT_MARK: &str = "❄";
 
 type ProcessRegistry = Arc<Mutex<HashSet<u32>>>;
@@ -6603,113 +6604,154 @@ fn render_fireplace(area: Rect, seed: u64, frame: u64, buffer: &mut Buffer) {
     if area.width < 18 || area.height < 4 {
         return;
     }
-    let width = area.width.min(34);
-    let x = area.x + area.width.saturating_sub(width) / 2;
-    let base_y = area.bottom().saturating_sub(1);
+    let log_width = ((u32::from(area.width) * 2) / 5)
+        .clamp(10, 30)
+        .min(u32::from(area.width.saturating_sub(4))) as u16;
+    let log_height = if area.height >= 6 { 2 } else { 1 };
+    let log_x = area.x + area.width.saturating_sub(log_width) / 2;
+    let log_y = area.bottom().saturating_sub(log_height);
+    let flame_height = log_y.saturating_sub(area.y).clamp(1, 4);
+    let flame_width = (log_width / 2).clamp(7, 13);
+    let flame_x = area.x + area.width.saturating_sub(flame_width) / 2;
+    let flame_top = log_y.saturating_sub(flame_height);
     let flame_frame = ((frame ^ seed) % 4) as usize;
     let flames = [
-        ["   ▲   ", "  ▲█▲  ", " ▄███▄ "],
-        ["  ▲ ▲  ", "  █▲█  ", " ▄███▄ "],
-        ["   ▲   ", " ▲███▲ ", "  ▄█▄  "],
-        ["  ▲█▲  ", "   █   ", " ▄███▄ "],
+        ["     ▲     ", "    ▲█▲    ", "   ▲███▲   ", " ▄███████▄ "],
+        ["    ▲ ▲    ", "   ▲██▲    ", "  ▲█████▲  ", " ▄███████▄ "],
+        ["     ▲     ", "   ▲███▲   ", "  ▲█████▲  ", "  ▄█████▄  "],
+        ["    ▲█▲    ", "     █     ", "  ▲█████▲  ", " ▄███████▄ "],
     ];
-    let fire_width = 7_u16;
-    let fire_x = x + width.saturating_sub(fire_width) / 2;
-    let top = base_y.saturating_sub(3);
 
-    if area.height >= 5 {
-        let mantle = "╭──────────────╮";
-        let mantle_x = x + width.saturating_sub(char_count(mantle) as u16) / 2;
-        render_scene_text(
-            buffer,
-            mantle_x,
-            top.saturating_sub(1).max(area.y),
-            mantle,
-            pane_style().fg(THEME_GOLD),
-        );
-    }
-
-    for (row, text) in flames[flame_frame].iter().enumerate() {
-        let y = top.saturating_add(row as u16);
+    for row in 0..flame_height {
+        let pattern_index = flames[flame_frame]
+            .len()
+            .saturating_sub(flame_height as usize)
+            + usize::from(row);
+        let text = flames[flame_frame][pattern_index];
+        let y = flame_top.saturating_add(row);
         if y >= area.y && y < area.bottom() {
             let style = match row {
                 0 => pane_style().fg(THEME_EMBER).add_modifier(Modifier::BOLD),
-                1 => pane_style().fg(THEME_FLAME).add_modifier(Modifier::BOLD),
-                _ => pane_style().fg(THEME_EMBER),
+                row if row + 1 == flame_height => pane_style().fg(THEME_EMBER),
+                _ => pane_style().fg(THEME_FLAME).add_modifier(Modifier::BOLD),
             };
-            render_scene_text(buffer, fire_x, y, text, style);
+            let text = centered_slice(text, usize::from(flame_width));
+            render_scene_text(buffer, flame_x, y, text, style);
         }
     }
 
-    let logs = "╱═══════╲";
-    let logs_x = x + width.saturating_sub(char_count(logs) as u16) / 2;
-    render_scene_text(buffer, logs_x, base_y, logs, pane_style().fg(THEME_LOG));
-
-    if area.height >= 6 {
-        let hearth = "▔▔▔▔▔▔▔▔▔▔▔";
-        let hearth_x = x + width.saturating_sub(char_count(hearth) as u16) / 2;
-        render_scene_text(
-            buffer,
-            hearth_x,
-            base_y.saturating_sub(1),
-            hearth,
-            pane_style().fg(THEME_RED),
-        );
-    }
+    render_log(buffer, log_x, log_y, log_width, log_height);
 }
 
 fn render_snow_scene(area: Rect, seed: u64, frame: u64, buffer: &mut Buffer) {
     if area.width < 10 || area.height < 4 {
         return;
     }
-    let flakes = usize::from((area.width / 8).clamp(2, 10));
+    let ground_y = area.bottom().saturating_sub(1);
+    let sky_height = ground_y.saturating_sub(area.y).max(1);
+    let flakes = usize::from((area.width / 7).clamp(2, 14));
     for index in 0..flakes {
-        let value = mix_scene_seed(seed, frame.wrapping_add(index as u64), 0x5107_u64);
-        let x = area.x + (value % u64::from(area.width)) as u16;
-        let y = area.y + ((value / 17) % u64::from(area.height.saturating_sub(1))) as u16;
+        let value = mix_scene_seed(seed, index as u64, 0x5107_u64);
+        let fall = (value / 17).wrapping_add(frame) % u64::from(sky_height);
+        let drift = ((frame / 2 + index as u64) % 3) as i16 - 1;
+        let base_x = (value % u64::from(area.width)) as i16;
+        let x =
+            area.x + ((base_x + drift).rem_euclid(i16::try_from(area.width).unwrap_or(1))) as u16;
+        let y = area.y + fall as u16;
         let symbol = if value & 1 == 0 { "·" } else { "❄" };
         buffer[(x, y)]
             .set_symbol(symbol)
             .set_style(pane_style().fg(THEME_SNOW));
     }
 
-    let horizon_y = area.bottom().saturating_sub(2);
     for column in 0..area.width {
-        buffer[(area.x + column, horizon_y)]
-            .set_symbol("▄")
-            .set_style(pane_style().fg(THEME_SNOW));
-    }
-    for column in 0..area.width {
-        buffer[(area.x + column, area.bottom().saturating_sub(1))]
+        buffer[(area.x + column, ground_y)]
             .set_symbol(" ")
             .set_style(Style::default().fg(THEME_BLACK).bg(THEME_SNOW));
     }
+    for column in 0..area.width {
+        buffer[(area.x + column, ground_y.saturating_sub(1))]
+            .set_symbol("▁")
+            .set_style(pane_style().fg(THEME_SNOW));
+    }
 
-    if area.width >= 24 && area.height >= 6 {
-        let snowman_x = area.x + area.width.saturating_sub(9);
-        let snowman_y = area.bottom().saturating_sub(4);
+    if area.width >= 18 && area.height >= 5 {
+        render_snowman(area, ground_y, buffer);
+    }
+}
+
+fn render_log(buffer: &mut Buffer, x: u16, y: u16, width: u16, height: u16) {
+    let height = height.max(1);
+    for row in 0..height {
+        for column in 0..width {
+            let style = Style::default().fg(THEME_LOG_DARK).bg(THEME_LOG);
+            buffer[(x + column, y + row)]
+                .set_symbol(" ")
+                .set_style(style);
+        }
+    }
+
+    if width >= 8 {
+        let ring_y = y + height / 2;
         render_scene_text(
             buffer,
-            snowman_x,
-            snowman_y,
-            " _Π_ ",
-            pane_style().fg(THEME_SNOW),
+            x + 1,
+            ring_y,
+            "◉",
+            Style::default().fg(THEME_EMBER).bg(THEME_LOG),
         );
         render_scene_text(
             buffer,
-            snowman_x,
-            snowman_y + 1,
-            " (•) ",
-            pane_style().fg(THEME_SNOW),
-        );
-        render_scene_text(
-            buffer,
-            snowman_x,
-            snowman_y + 2,
-            " (:) ",
-            pane_style().fg(THEME_SNOW),
+            x + width.saturating_sub(3),
+            ring_y,
+            "◌",
+            Style::default().fg(THEME_LOG_DARK).bg(THEME_LOG),
         );
     }
+
+    if width >= 12 {
+        let stripe_y = y + height.saturating_sub(1);
+        for column in 4..width.saturating_sub(4) {
+            if column % 3 == 0 {
+                buffer[(x + column, stripe_y)]
+                    .set_symbol("╱")
+                    .set_style(Style::default().fg(THEME_LOG_DARK).bg(THEME_LOG));
+            }
+        }
+    }
+}
+
+fn render_snowman(area: Rect, ground_y: u16, buffer: &mut Buffer) {
+    let rows = if area.height >= 8 { 4 } else { 3 };
+    let width = 7_u16;
+    let x = area.x + area.width.saturating_sub(width + 2);
+    let y = ground_y.saturating_sub(rows);
+    if y < area.y {
+        return;
+    }
+
+    render_scene_text(buffer, x, y, "  _Π_  ", pane_style().fg(THEME_SNOW));
+    render_scene_text(buffer, x + 2, y + 1, "(•)", pane_style().fg(THEME_SNOW));
+    render_scene_text(buffer, x, y + 1, "\\ ", pane_style().fg(THEME_LOG));
+    render_scene_text(buffer, x + 5, y + 1, " /", pane_style().fg(THEME_LOG));
+    if rows == 4 {
+        render_scene_text(buffer, x, y + 2, " ( : ) ", pane_style().fg(THEME_SNOW));
+        render_scene_text(buffer, x, y + 3, " (___) ", pane_style().fg(THEME_SNOW));
+    } else {
+        render_scene_text(buffer, x, y + 2, " (___) ", pane_style().fg(THEME_SNOW));
+    }
+}
+
+fn centered_slice(text: &str, width: usize) -> &str {
+    let chars = char_count(text);
+    if chars <= width {
+        return text;
+    }
+    let start = (chars - width) / 2;
+    let end = start + width;
+    let start = byte_index_for_char(text, start);
+    let end = byte_index_for_char(text, end);
+    &text[start..end]
 }
 
 fn render_scene_text(buffer: &mut Buffer, x: u16, y: u16, text: &str, style: Style) {
@@ -9567,6 +9609,21 @@ mod tests {
     }
 
     #[test]
+    fn snow_scene_flakes_fall_between_frames() {
+        let area = Rect::new(0, 0, 16, 7);
+        let mut first = Buffer::empty(area);
+        let mut second = Buffer::empty(area);
+
+        render_snow_scene(area, 42, 0, &mut first);
+        render_snow_scene(area, 42, 1, &mut second);
+
+        assert_ne!(
+            snowflake_positions(&first, area),
+            snowflake_positions(&second, area)
+        );
+    }
+
+    #[test]
     fn empty_grid_slots_get_seeded_scene_choices() {
         let mut app =
             test_app_with_tasks(vec![test_task("one"), test_task("two"), test_task("three")]);
@@ -10658,5 +10715,18 @@ mod tests {
             line.push_str(buffer[(column, row)].symbol());
         }
         line
+    }
+
+    fn snowflake_positions(buffer: &Buffer, area: Rect) -> Vec<(u16, u16, String)> {
+        let mut positions = Vec::new();
+        for row in area.y..area.bottom() {
+            for column in area.x..area.right() {
+                let symbol = buffer[(column, row)].symbol();
+                if symbol == "·" || symbol == "❄" {
+                    positions.push((column, row, symbol.to_owned()));
+                }
+            }
+        }
+        positions
     }
 }
