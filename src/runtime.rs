@@ -85,6 +85,7 @@ type ProcessRegistry = Arc<Mutex<HashSet<u32>>>;
 enum SceneKind {
     Fireplace,
     Snow,
+    Tree,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -172,7 +173,7 @@ fn scene_state_for_area(
 }
 
 fn fitting_scene_kinds(area: Rect) -> Vec<SceneKind> {
-    [SceneKind::Fireplace, SceneKind::Snow]
+    [SceneKind::Fireplace, SceneKind::Snow, SceneKind::Tree]
         .into_iter()
         .filter(|kind| scene_fits(*kind, area))
         .collect()
@@ -187,6 +188,7 @@ fn scene_min_size(kind: SceneKind) -> (u16, u16) {
     match kind {
         SceneKind::Fireplace => (18, 4),
         SceneKind::Snow => (18, 7),
+        SceneKind::Tree => (18, 7),
     }
 }
 
@@ -212,6 +214,7 @@ fn parse_dev_scene_kind(value: &str) -> Option<SceneKind> {
     match value.trim().to_ascii_lowercase().as_str() {
         "fire" | "fireplace" => Some(SceneKind::Fireplace),
         "snow" | "snowman" => Some(SceneKind::Snow),
+        "tree" => Some(SceneKind::Tree),
         _ => None,
     }
 }
@@ -6681,6 +6684,7 @@ fn render_scene(area: Rect, scene: SceneState, frame: u64, buffer: &mut Buffer) 
     match scene.kind {
         SceneKind::Fireplace => render_fireplace(area, scene.seed, frame, buffer),
         SceneKind::Snow => render_snow_scene(area, scene.seed, frame, buffer),
+        SceneKind::Tree => render_tree_scene(area, scene.seed, frame, buffer),
     }
 }
 
@@ -6750,6 +6754,144 @@ fn render_snow_scene(area: Rect, seed: u64, frame: u64, buffer: &mut Buffer) {
     if area.width >= 18 && area.height >= 5 {
         render_snowman(area, ground_y, buffer);
     }
+}
+
+fn render_tree_scene(area: Rect, seed: u64, frame: u64, buffer: &mut Buffer) {
+    if !scene_fits(SceneKind::Tree, area) {
+        return;
+    }
+
+    let ground_y = area.bottom().saturating_sub(1);
+    render_snow_ground(area, ground_y, buffer);
+
+    let trunk_y = ground_y.saturating_sub(1);
+    let tree_rows = area.height.saturating_sub(3).clamp(4, 10);
+    let tree_top = trunk_y.saturating_sub(tree_rows);
+    let center = area.x + area.width / 2;
+    let max_half_width = ((area.width.saturating_sub(3)) / 2).min((tree_rows * 2).clamp(5, 12));
+
+    paint_scene_cell(
+        buffer,
+        i32::from(center),
+        tree_top.saturating_sub(1),
+        "✦",
+        pane_style()
+            .fg(THEME_GOLD_HOVER)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    for row in 0..tree_rows {
+        let y = tree_top + row;
+        if y < area.y || y >= trunk_y {
+            continue;
+        }
+        let half_width = (((u32::from(row) + 1) * u32::from(max_half_width)) / u32::from(tree_rows))
+            .max(1) as u16;
+        for offset in -(i32::from(half_width))..=i32::from(half_width) {
+            let x = i32::from(center) + offset;
+            let leaf_seed = mix_scene_seed(seed, row.into(), offset as u64);
+            let green = if leaf_seed & 1 == 0 {
+                THEME_GREEN_HOVER
+            } else {
+                THEME_GREEN
+            };
+            paint_scene_cell(
+                buffer,
+                x,
+                y,
+                "█",
+                pane_style().fg(green).add_modifier(Modifier::BOLD),
+            );
+
+            if should_draw_tree_light(row, offset, leaf_seed) {
+                let lit = ((frame + leaf_seed % 4) % 4) < 2;
+                let (symbol, color) = tree_light(leaf_seed, lit);
+                paint_scene_cell(buffer, x, y, symbol, pane_style().fg(color));
+            }
+        }
+    }
+
+    for offset in -1..=1 {
+        paint_scene_cell(
+            buffer,
+            i32::from(center) + offset,
+            trunk_y,
+            " ",
+            Style::default().fg(THEME_LOG_DARK).bg(THEME_LOG),
+        );
+    }
+
+    render_tree_presents(area, center, ground_y, seed, frame, buffer);
+}
+
+fn render_snow_ground(area: Rect, ground_y: u16, buffer: &mut Buffer) {
+    for column in 0..area.width {
+        buffer[(area.x + column, ground_y)]
+            .set_symbol(" ")
+            .set_style(Style::default().fg(THEME_BLACK).bg(THEME_SNOW));
+    }
+    for column in 0..area.width {
+        buffer[(area.x + column, ground_y.saturating_sub(1))]
+            .set_symbol("▁")
+            .set_style(pane_style().fg(THEME_SNOW));
+    }
+}
+
+fn should_draw_tree_light(row: u16, offset: i32, seed: u64) -> bool {
+    row > 0 && (offset + i32::from(row)).rem_euclid(3) == 0 && seed.is_multiple_of(2)
+}
+
+fn tree_light(seed: u64, lit: bool) -> (&'static str, Color) {
+    if !lit {
+        return ("•", THEME_SNOW);
+    }
+    match seed % 3 {
+        0 => ("●", THEME_RED_HOVER),
+        1 => ("◆", THEME_GOLD_HOVER),
+        _ => ("•", THEME_SNOW),
+    }
+}
+
+fn render_tree_presents(
+    area: Rect,
+    center: u16,
+    ground_y: u16,
+    seed: u64,
+    frame: u64,
+    buffer: &mut Buffer,
+) {
+    if area.width < 24 || area.height < 8 || ground_y <= area.y {
+        return;
+    }
+    let y = ground_y.saturating_sub(1);
+    let left_x = center.saturating_sub(8);
+    let right_x = center.saturating_add(5);
+    let flicker = (frame + seed) & 1 == 0;
+    render_present(
+        buffer,
+        left_x,
+        y,
+        if flicker { THEME_RED } else { THEME_RED_HOVER },
+    );
+    render_present(
+        buffer,
+        right_x,
+        y,
+        if flicker {
+            THEME_GOLD
+        } else {
+            THEME_GOLD_HOVER
+        },
+    );
+}
+
+fn render_present(buffer: &mut Buffer, x: u16, y: u16, color: Color) {
+    let ribbon = Style::default().fg(THEME_SNOW).bg(color);
+    let wrap = Style::default().fg(color).bg(color);
+    for offset in 0..3 {
+        buffer[(x + offset, y)].set_symbol(" ").set_style(wrap);
+    }
+    buffer[(x + 1, y)].set_symbol("│").set_style(ribbon);
 }
 
 fn render_fire(buffer: &mut Buffer, area: Rect, seed: u64, frame: u64, fire: FireGeometry) {
@@ -9847,6 +9989,21 @@ mod tests {
     }
 
     #[test]
+    fn tree_scene_lights_blink_between_frames() {
+        let area = Rect::new(0, 0, 28, 8);
+        let mut first = Buffer::empty(area);
+        let mut second = Buffer::empty(area);
+
+        render_tree_scene(area, 42, 0, &mut first);
+        render_tree_scene(area, 42, 2, &mut second);
+
+        assert_ne!(
+            tree_light_positions(&first, area),
+            tree_light_positions(&second, area)
+        );
+    }
+
+    #[test]
     fn empty_grid_slots_get_seeded_scene_choices() {
         let mut app =
             test_app_with_tasks(vec![test_task("one"), test_task("two"), test_task("three")]);
@@ -9862,6 +10019,7 @@ mod tests {
             .collect::<HashSet<_>>();
         assert!(choices.contains(&SceneKind::Fireplace));
         assert!(choices.contains(&SceneKind::Snow));
+        assert!(choices.contains(&SceneKind::Tree));
     }
 
     #[test]
@@ -9886,6 +10044,7 @@ mod tests {
             .collect::<HashSet<_>>();
         assert!(choices.contains(&SceneKind::Fireplace));
         assert!(choices.contains(&SceneKind::Snow));
+        assert!(choices.contains(&SceneKind::Tree));
     }
 
     #[test]
@@ -9897,7 +10056,7 @@ mod tests {
         assert_eq!(parse_dev_scene_kind("fire"), Some(SceneKind::Fireplace));
         assert_eq!(parse_dev_scene_kind("snow"), Some(SceneKind::Snow));
         assert_eq!(parse_dev_scene_kind("snowman"), Some(SceneKind::Snow));
-        assert_eq!(parse_dev_scene_kind("tree"), None);
+        assert_eq!(parse_dev_scene_kind("tree"), Some(SceneKind::Tree));
     }
 
     #[test]
@@ -11027,6 +11186,19 @@ mod tests {
             for column in area.x..area.right() {
                 let symbol = buffer[(column, row)].symbol();
                 if symbol == "·" || symbol == "❄" {
+                    positions.push((column, row, symbol.to_owned()));
+                }
+            }
+        }
+        positions
+    }
+
+    fn tree_light_positions(buffer: &Buffer, area: Rect) -> Vec<(u16, u16, String)> {
+        let mut positions = Vec::new();
+        for row in area.y..area.bottom() {
+            for column in area.x..area.right() {
+                let symbol = buffer[(column, row)].symbol();
+                if symbol == "●" || symbol == "◆" || symbol == "•" {
                     positions.push((column, row, symbol.to_owned()));
                 }
             }
