@@ -6919,7 +6919,7 @@ fn snowman_rect(area: Rect, ground_y: u16) -> Option<Rect> {
     if area.width < 18 || area.height < 5 {
         return None;
     }
-    let rows = if area.height >= 8 { 4 } else { 3 };
+    let rows = if area.height >= 7 { 4 } else { 3 };
     let width = 7_u16;
     let x = area.x + area.width.saturating_sub(width + 2);
     let y = ground_y.saturating_sub(rows);
@@ -9806,6 +9806,23 @@ mod tests {
         assert_ne!(
             snowflake_positions(&first, area),
             snowflake_positions(&second, area)
+        );
+    }
+
+    #[test]
+    fn snowman_uses_full_body_in_reserved_scene_height() {
+        let reserved = Rect::new(0, 0, 24, 7);
+        let compact = Rect::new(0, 0, 24, 5);
+
+        assert_eq!(
+            snowman_rect(reserved, reserved.bottom() - 1)
+                .unwrap()
+                .height,
+            4
+        );
+        assert_eq!(
+            snowman_rect(compact, compact.bottom() - 1).unwrap().height,
+            3
         );
     }
 
