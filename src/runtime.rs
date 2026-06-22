@@ -7076,11 +7076,15 @@ fn render_jack_box(buffer: &mut Buffer, x: u16, y: u16, width: u16, height: u16,
         }
     } else {
         let lid_y = y.saturating_sub(1);
-        let flap_width = (width / 4).clamp(3, 6);
-        let left_flap = format!("╲{}", "▄".repeat(usize::from(flap_width)));
-        let right_flap = format!("{}╱", "▄".repeat(usize::from(flap_width)));
-        let left = i32::from(x + center).saturating_sub(i32::from(flap_width) + 3);
-        let right = i32::from(x + center) + 3;
+        let left_width = center.saturating_sub(1).max(3);
+        let right_width = width.saturating_sub(center + 2).max(3);
+        let left_flap = format!("╲{}", "▄".repeat(usize::from(left_width.saturating_sub(1))));
+        let right_flap = format!(
+            "{}╱",
+            "▄".repeat(usize::from(right_width.saturating_sub(1)))
+        );
+        let left = i32::from(x);
+        let right = i32::from(x + width.saturating_sub(right_width));
         render_scene_text_clipped(
             buffer,
             left,
@@ -10465,6 +10469,10 @@ mod tests {
                 "jack should not float above the present at row {row}"
             );
         }
+
+        let lid_y = box_y.saturating_sub(1);
+        assert_eq!(buffer[(box_x, lid_y)].symbol(), "╲");
+        assert_eq!(buffer[(box_x + box_width - 1, lid_y)].symbol(), "╱");
 
         let rendered = buffer_text(&buffer, area);
         assert!(rendered.contains("╲▄▄▄"));
