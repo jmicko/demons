@@ -91,6 +91,7 @@ enum SceneKind {
     Santa,
     Jack,
     Skating,
+    Sleigh,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -185,6 +186,7 @@ fn fitting_scene_kinds(area: Rect) -> Vec<SceneKind> {
         SceneKind::Santa,
         SceneKind::Jack,
         SceneKind::Skating,
+        SceneKind::Sleigh,
     ]
     .into_iter()
     .filter(|kind| scene_fits(*kind, area))
@@ -204,6 +206,7 @@ fn scene_min_size(kind: SceneKind) -> (u16, u16) {
         SceneKind::Santa => (24, 8),
         SceneKind::Jack => (20, 7),
         SceneKind::Skating => (28, 8),
+        SceneKind::Sleigh => (34, 8),
     }
 }
 
@@ -233,6 +236,7 @@ fn parse_dev_scene_kind(value: &str) -> Option<SceneKind> {
         "santa" | "rooftop" => Some(SceneKind::Santa),
         "jack" | "jack-in-the-box" | "jack_in_the_box" => Some(SceneKind::Jack),
         "skate" | "skating" | "lake" | "pond" => Some(SceneKind::Skating),
+        "sleigh" | "reindeer" | "rudolph" => Some(SceneKind::Sleigh),
         _ => None,
     }
 }
@@ -6705,6 +6709,7 @@ fn render_scene(area: Rect, scene: SceneState, frame: u64, buffer: &mut Buffer) 
         SceneKind::Santa => render_santa_scene(area, frame / 2, buffer),
         SceneKind::Jack => render_jack_scene(area, scene.seed, frame, buffer),
         SceneKind::Skating => render_skating_scene(area, scene.seed, frame, buffer),
+        SceneKind::Sleigh => render_sleigh_scene(area, scene.seed, frame, buffer),
     }
 }
 
@@ -7273,6 +7278,119 @@ fn render_skater(buffer: &mut Buffer, x: i32, foot_y: u16, phase: u64, direction
         stride,
         Style::default().fg(THEME_SNOW).bg(THEME_ICE_DARK),
     );
+}
+
+fn render_sleigh_scene(area: Rect, seed: u64, frame: u64, buffer: &mut Buffer) {
+    if !scene_fits(SceneKind::Sleigh, area) {
+        return;
+    }
+
+    render_sleigh_sky(area, seed, frame, buffer);
+    render_sleigh_moon(area, buffer);
+    render_sleigh_team(area, seed, frame, buffer);
+}
+
+fn render_sleigh_sky(area: Rect, seed: u64, frame: u64, buffer: &mut Buffer) {
+    let stars = usize::from((area.width / 7).clamp(5, 18));
+    let width = i16::try_from(area.width).unwrap_or(1).max(1);
+    for index in 0..stars {
+        let value = mix_scene_seed(seed, index as u64, 0x51e1_6a00_u64);
+        let slot_x = ((index as u64 * u64::from(area.width)) / stars as u64) as i16;
+        let jitter = (value % 5) as i16 - 2;
+        let drift = ((frame / 4 + value / 17) % 3) as i16 - 1;
+        let x = area.x + (slot_x + jitter + drift).rem_euclid(width) as u16;
+        let y = area.y + ((value / 23 + frame / 5) % u64::from(area.height)) as u16;
+        let symbol = match value % 5 {
+            0 => "✦",
+            1 | 2 => "·",
+            _ => "*",
+        };
+        let color = if value.is_multiple_of(4) {
+            THEME_GOLD_HOVER
+        } else {
+            THEME_SNOW
+        };
+        paint_scene_cell(buffer, i32::from(x), y, symbol, pane_style().fg(color));
+    }
+}
+
+fn render_sleigh_moon(area: Rect, buffer: &mut Buffer) {
+    if area.width < 40 || area.height < 10 {
+        return;
+    }
+
+    let x = i32::from(area.right().saturating_sub(7));
+    let y = i32::from(area.y + 1);
+    let style = pane_style().fg(THEME_GOLD_HOVER);
+    render_scene_text_clipped(buffer, x, y, "◜◝", style);
+    render_scene_text_clipped(buffer, x, y + 1, "◟◞", style);
+}
+
+fn render_sleigh_team(area: Rect, seed: u64, frame: u64, buffer: &mut Buffer) {
+    const SLEIGH_SPRITE_WIDTH: i32 = 34;
+
+    let travel = u64::from(area.width) + SLEIGH_SPRITE_WIDTH as u64;
+    let local = ((frame.wrapping_mul(3) + seed % travel) % travel) as i32;
+    let wave_amplitude: u16 = if area.height >= 14 { 2 } else { 1 };
+    let wave_offset = triangular_wave((local as u64) / 6, u64::from(wave_amplitude * 2 + 1)) as i32
+        - i32::from(wave_amplitude);
+    let base_top = i32::from(area.y + area.height.saturating_sub(5) / 2);
+    let top = (base_top + wave_offset).clamp(
+        i32::from(area.y),
+        i32::from(area.bottom().saturating_sub(5)),
+    ) as u16;
+    let left = i32::from(area.right()) - local;
+
+    render_sleigh_sprite(buffer, left, top, frame);
+}
+
+fn render_sleigh_sprite(buffer: &mut Buffer, x: i32, top: u16, frame: u64) {
+    let y = i32::from(top);
+    let rein_style = pane_style().fg(THEME_SNOW);
+    let sleigh_style = pane_style()
+        .fg(THEME_RED_HOVER)
+        .add_modifier(Modifier::BOLD);
+    let runner_style = pane_style().fg(THEME_GOLD_HOVER);
+
+    render_scene_text_clipped(buffer, x + 9, y + 1, "───", rein_style);
+    render_scene_text_clipped(buffer, x + 20, y + 1, "──────", rein_style);
+
+    render_reindeer(buffer, x + 1, y, true, frame);
+    render_reindeer(buffer, x + 12, y, false, frame + 1);
+
+    render_scene_text_clipped(buffer, x + 25, y + 3, "__╱▔▔╲", runner_style);
+    render_scene_text_clipped(buffer, x + 25, y + 4, "╲____╱", sleigh_style);
+}
+
+fn render_reindeer(buffer: &mut Buffer, x: i32, top: i32, red_nose: bool, frame: u64) {
+    let antler_style = pane_style().fg(THEME_GOLD_HOVER);
+    let body_style = pane_style().fg(THEME_LOG).add_modifier(Modifier::BOLD);
+    let leg_style = pane_style().fg(THEME_LOG);
+    let nose_style = pane_style()
+        .fg(if red_nose {
+            THEME_RED_HOVER
+        } else {
+            THEME_SNOW
+        })
+        .add_modifier(Modifier::BOLD);
+
+    render_scene_text_clipped(buffer, x + 2, top, "Y Y", antler_style);
+    render_scene_text_clipped(
+        buffer,
+        x,
+        top + 1,
+        if red_nose { "●" } else { "o" },
+        nose_style,
+    );
+    render_scene_text_clipped(buffer, x + 1, top + 1, "<(•)==", body_style);
+    render_scene_text_clipped(buffer, x + 3, top + 2, "║ ║", leg_style);
+
+    let legs = if frame.is_multiple_of(2) {
+        "╱  ╲"
+    } else {
+        "╲  ╱"
+    };
+    render_scene_text_clipped(buffer, x + 2, top + 3, legs, leg_style);
 }
 
 fn render_jack_scene(area: Rect, seed: u64, frame: u64, buffer: &mut Buffer) {
@@ -10664,6 +10782,36 @@ mod tests {
     }
 
     #[test]
+    fn sleigh_scene_team_moves_between_frames() {
+        let area = Rect::new(0, 0, 44, 10);
+        let mut first = Buffer::empty(area);
+        let mut second = Buffer::empty(area);
+
+        render_sleigh_scene(area, 0, 10, &mut first);
+        render_sleigh_scene(area, 0, 12, &mut second);
+
+        let first = sleigh_nose_positions(&first, area);
+        let second = sleigh_nose_positions(&second, area);
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert!(second[0].0 < first[0].0);
+    }
+
+    #[test]
+    fn sleigh_scene_draws_reindeer_and_sleigh() {
+        let area = Rect::new(0, 0, 44, 10);
+        let mut buffer = Buffer::empty(area);
+
+        render_sleigh_scene(area, 0, 12, &mut buffer);
+
+        let text = buffer_text(&buffer, area);
+        assert!(text.contains('●'));
+        assert!(text.contains("<(•)=="));
+        assert!(text.contains("╲____╱"));
+    }
+
+    #[test]
     fn santa_scene_pops_out_between_frames() {
         let area = Rect::new(0, 0, 30, 9);
         let mut hidden = Buffer::empty(area);
@@ -10775,12 +10923,13 @@ mod tests {
         assert!(choices.contains(&SceneKind::Santa));
         assert!(choices.contains(&SceneKind::Jack));
         assert!(choices.contains(&SceneKind::Skating));
+        assert!(choices.contains(&SceneKind::Sleigh));
     }
 
     #[test]
     fn scene_selection_uses_current_area_size() {
         let compact = Rect::new(0, 0, 24, 4);
-        let roomy = Rect::new(0, 0, 28, 8);
+        let roomy = Rect::new(0, 0, 40, 8);
         let too_small = Rect::new(0, 0, 17, 7);
 
         assert!(scene_fits(SceneKind::Fireplace, compact));
@@ -10804,6 +10953,7 @@ mod tests {
         assert!(choices.contains(&SceneKind::Santa));
         assert!(choices.contains(&SceneKind::Jack));
         assert!(choices.contains(&SceneKind::Skating));
+        assert!(choices.contains(&SceneKind::Sleigh));
     }
 
     #[test]
@@ -10825,6 +10975,8 @@ mod tests {
         );
         assert_eq!(parse_dev_scene_kind("skating"), Some(SceneKind::Skating));
         assert_eq!(parse_dev_scene_kind("lake"), Some(SceneKind::Skating));
+        assert_eq!(parse_dev_scene_kind("sleigh"), Some(SceneKind::Sleigh));
+        assert_eq!(parse_dev_scene_kind("reindeer"), Some(SceneKind::Sleigh));
     }
 
     #[test]
@@ -11992,6 +12144,18 @@ mod tests {
         for row in area.y..area.bottom() {
             for column in area.x..area.right() {
                 if buffer[(column, row)].symbol() == "o" {
+                    positions.push((column, row));
+                }
+            }
+        }
+        positions
+    }
+
+    fn sleigh_nose_positions(buffer: &Buffer, area: Rect) -> Vec<(u16, u16)> {
+        let mut positions = Vec::new();
+        for row in area.y..area.bottom() {
+            for column in area.x..area.right() {
+                if buffer[(column, row)].symbol() == "●" {
                     positions.push((column, row));
                 }
             }
