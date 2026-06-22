@@ -6655,16 +6655,15 @@ fn common_prefix(values: &[String]) -> String {
 }
 
 fn reserved_scene_rect(content: Rect) -> Option<Rect> {
-    if content.width < 18 || content.height < 8 {
+    if content.width < 18 {
         return None;
     }
-    let height = if content.height >= 14 {
-        7
-    } else if content.height >= 10 {
-        5
-    } else {
-        4
-    };
+    let max_scene_height = content.height.saturating_sub(3);
+    if max_scene_height < 4 {
+        return None;
+    }
+    let preferred = ((u32::from(content.height) * 3).div_ceil(4)) as u16;
+    let height = preferred.clamp(4, max_scene_height);
     Some(Rect::new(
         content.x,
         content.bottom().saturating_sub(height),
@@ -6698,7 +6697,7 @@ fn render_scene(area: Rect, scene: SceneState, frame: u64, buffer: &mut Buffer) 
         SceneKind::Snow => render_snow_scene(area, scene.seed, frame, buffer),
         SceneKind::Tree => render_tree_scene(area, scene.seed, frame, buffer),
         SceneKind::Santa => render_santa_scene(area, frame, buffer),
-        SceneKind::Jack => render_jack_scene(area, frame, buffer),
+        SceneKind::Jack => render_jack_scene(area, scene.seed, frame, buffer),
     }
 }
 
@@ -7013,7 +7012,7 @@ fn render_santa(buffer: &mut Buffer, chimney_x: i32, chimney_top: u16, frame: u6
     );
 }
 
-fn render_jack_scene(area: Rect, frame: u64, buffer: &mut Buffer) {
+fn render_jack_scene(area: Rect, seed: u64, frame: u64, buffer: &mut Buffer) {
     if !scene_fits(SceneKind::Jack, area) {
         return;
     }
@@ -7021,14 +7020,26 @@ fn render_jack_scene(area: Rect, frame: u64, buffer: &mut Buffer) {
     let ground_y = area.bottom().saturating_sub(1);
     render_snow_ground(area, ground_y, buffer);
 
-    let box_width = area.width.saturating_sub(8).clamp(9, 13);
-    let box_height = if area.height >= 9 { 3 } else { 2 };
+    let box_width = if area.width >= 36 {
+        ((u32::from(area.width) * 3) / 10).clamp(13, 26) as u16
+    } else {
+        area.width.saturating_sub(8).clamp(9, 13)
+    };
+    let box_height = if area.height >= 16 {
+        4
+    } else if area.height >= 9 {
+        3
+    } else {
+        2
+    };
     let box_x = area.x + area.width.saturating_sub(box_width) / 2;
     let box_y = ground_y.saturating_sub(box_height);
     let center = box_x + box_width / 2;
+    let large = area.width >= 32 && area.height >= 12;
 
-    render_jack(buffer, i32::from(center), box_y, frame);
+    render_jack_confetti(area, seed, frame, center, box_y, buffer);
     render_jack_box(buffer, box_x, box_y, box_width, box_height, frame);
+    render_jack(buffer, i32::from(center), box_y, frame, large);
 }
 
 fn render_jack_box(buffer: &mut Buffer, x: u16, y: u16, width: u16, height: u16, frame: u64) {
@@ -7065,75 +7076,196 @@ fn render_jack_box(buffer: &mut Buffer, x: u16, y: u16, width: u16, height: u16,
         }
     } else {
         let lid_y = y.saturating_sub(1);
+        let flap_width = (width / 4).clamp(3, 6);
+        let left_flap = format!("╲{}", "▄".repeat(usize::from(flap_width)));
+        let right_flap = format!("{}╱", "▄".repeat(usize::from(flap_width)));
+        let left = i32::from(x + center).saturating_sub(i32::from(flap_width) + 3);
+        let right = i32::from(x + center) + 3;
         render_scene_text_clipped(
             buffer,
-            i32::from(x) + i32::from(center).saturating_sub(5),
+            left,
             i32::from(lid_y),
-            "╲▄▄▄▄╱",
+            &left_flap,
+            pane_style().fg(THEME_GOLD_HOVER),
+        );
+        render_scene_text_clipped(
+            buffer,
+            right,
+            i32::from(lid_y),
+            &right_flap,
             pane_style().fg(THEME_GOLD_HOVER),
         );
     }
 }
 
-fn render_jack(buffer: &mut Buffer, center: i32, box_y: u16, frame: u64) {
+fn render_jack_confetti(
+    area: Rect,
+    seed: u64,
+    frame: u64,
+    center: u16,
+    box_y: u16,
+    buffer: &mut Buffer,
+) {
+    let phase = frame % 8;
+    if phase == 0 || phase == 7 || box_y <= area.y + 2 {
+        return;
+    }
+
+    let top = area.y + 1;
+    let bottom = box_y.saturating_sub(2);
+    if bottom <= top {
+        return;
+    }
+    let height = bottom - top + 1;
+    let spread = area.width.saturating_sub(4).min((area.width / 2).max(14));
+    let left = i32::from(center) - i32::from(spread / 2);
+    let count = usize::from((area.width / 7).clamp(6, 22));
+
+    for index in 0..count {
+        let value = mix_scene_seed(seed, index as u64, 0x0b0c_51de_u64);
+        let x = left
+            + i32::try_from(value % u64::from(spread.max(1))).unwrap_or_default()
+            + ((frame + index as u64) % 3) as i32
+            - 1;
+        let y = top + ((value / 17 + frame + index as u64) % u64::from(height)) as u16;
+        let symbol = match value % 4 {
+            0 => "✦",
+            1 => "·",
+            2 => "*",
+            _ => "•",
+        };
+        let color = match value % 3 {
+            0 => THEME_GOLD_HOVER,
+            1 => THEME_RED_HOVER,
+            _ => THEME_SNOW,
+        };
+        paint_scene_cell(buffer, x, y, symbol, pane_style().fg(color));
+    }
+}
+
+fn render_jack(buffer: &mut Buffer, center: i32, box_y: u16, frame: u64, large: bool) {
     let phase = frame % 8;
     if phase == 0 || phase == 7 {
         return;
     }
 
-    let rise = match phase {
-        1 | 6 => 1,
-        2 | 5 => 2,
-        _ => 3,
-    };
-    let top = i32::from(box_y).saturating_sub(rise + 3);
-    let arm_row = if phase.is_multiple_of(2) {
-        "\\ | /"
+    let height = if large {
+        match phase {
+            1 | 6 => 2,
+            2 | 5 => 4,
+            _ => 7,
+        }
     } else {
-        "/ | \\"
+        match phase {
+            1 | 6 => 1,
+            2 | 5 => 3,
+            _ => 5,
+        }
     };
-    let spring = if phase.is_multiple_of(2) {
-        " ╱╲ "
+    let lid_y = i32::from(box_y).saturating_sub(1);
+    let (left, hat, brim, face, arms, body, spring_a, spring_b) = if large {
+        let arms = if phase.is_multiple_of(2) {
+            "\\ ███ /"
+        } else {
+            "/ ███ \\"
+        };
+        (
+            center - 3,
+            "   ▲   ",
+            "  ▔▔▔  ",
+            " (o o) ",
+            arms,
+            "  ███  ",
+            "  ╱╲   ",
+            "   ╲╱  ",
+        )
     } else {
-        " ╲╱ "
+        let arms = if phase.is_multiple_of(2) {
+            "\\ | /"
+        } else {
+            "/ | \\"
+        };
+        let spring = if phase.is_multiple_of(2) {
+            " ╱╲ "
+        } else {
+            " ╲╱ "
+        };
+        (center - 2, "  ▲  ", "", " (☺) ", arms, " ███ ", spring, "")
     };
 
-    if rise >= 3 {
+    if large && height >= 7 {
         render_scene_text_clipped(
             buffer,
-            center - 2,
-            top,
-            "  ▲  ",
+            left,
+            lid_y - 6,
+            hat,
+            pane_style()
+                .fg(THEME_GOLD_HOVER)
+                .add_modifier(Modifier::BOLD),
+        );
+        render_scene_text_clipped(
+            buffer,
+            left,
+            lid_y - 5,
+            brim,
+            pane_style().fg(THEME_SNOW).add_modifier(Modifier::BOLD),
+        );
+    } else if !large && height >= 5 {
+        render_scene_text_clipped(
+            buffer,
+            left,
+            lid_y - 4,
+            hat,
             pane_style()
                 .fg(THEME_GOLD_HOVER)
                 .add_modifier(Modifier::BOLD),
         );
     }
-    if rise >= 2 {
+    if height >= 4 {
         render_scene_text_clipped(
             buffer,
-            center - 2,
-            top + 1,
-            " (☺) ",
+            left,
+            if large { lid_y - 4 } else { lid_y - 3 },
+            face,
             pane_style().fg(THEME_SNOW).add_modifier(Modifier::BOLD),
         );
     }
-    if rise >= 3 {
+    if height >= 5 {
         render_scene_text_clipped(
             buffer,
-            center - 2,
-            top + 2,
-            arm_row,
+            left,
+            if large { lid_y - 3 } else { lid_y - 2 },
+            arms,
             pane_style()
                 .fg(THEME_RED_HOVER)
                 .add_modifier(Modifier::BOLD),
         );
     }
+    if height >= 3 {
+        render_scene_text_clipped(
+            buffer,
+            left,
+            if large { lid_y - 2 } else { lid_y - 1 },
+            body,
+            pane_style()
+                .fg(THEME_RED_HOVER)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+    if large && height >= 2 {
+        render_scene_text_clipped(
+            buffer,
+            left,
+            lid_y - 1,
+            spring_a,
+            pane_style().fg(THEME_GOLD_HOVER),
+        );
+    }
     render_scene_text_clipped(
         buffer,
-        center - 2,
-        i32::from(box_y).saturating_sub(1),
-        spring,
+        left,
+        lid_y,
+        if large { spring_b } else { spring_a },
         pane_style().fg(THEME_GOLD_HOVER),
     );
 }
@@ -10183,6 +10315,21 @@ mod tests {
     }
 
     #[test]
+    fn exited_scene_uses_most_of_pane_but_keeps_output_tail() {
+        let content = Rect::new(0, 0, 80, 20);
+        let scene = reserved_scene_rect(content).unwrap();
+
+        assert_eq!(scene.height, 15);
+        assert_eq!(content.height - scene.height, 5);
+
+        let compact = Rect::new(0, 0, 80, 8);
+        let scene = reserved_scene_rect(compact).unwrap();
+        assert_eq!(compact.height - scene.height, 3);
+
+        assert!(reserved_scene_rect(Rect::new(0, 0, 80, 6)).is_none());
+    }
+
+    #[test]
     fn scene_rendering_does_not_enter_visible_text() {
         let mut app = test_app();
         app.update_layout(Rect::new(0, 0, 80, 24));
@@ -10291,12 +10438,37 @@ mod tests {
         let mut closed = Buffer::empty(area);
         let mut open = Buffer::empty(area);
 
-        render_jack_scene(area, 0, &mut closed);
-        render_jack_scene(area, 3, &mut open);
+        render_jack_scene(area, 42, 0, &mut closed);
+        render_jack_scene(area, 42, 3, &mut open);
 
         assert!(!buffer_text(&closed, area).contains('☺'));
         assert!(buffer_text(&open, area).contains('☺'));
         assert_ne!(buffer_text(&closed, area), buffer_text(&open, area));
+    }
+
+    #[test]
+    fn jack_scene_keeps_open_sprite_attached_to_box() {
+        let area = Rect::new(0, 0, 24, 8);
+        let mut buffer = Buffer::empty(area);
+        render_jack_scene(area, 42, 3, &mut buffer);
+
+        let ground_y = area.bottom().saturating_sub(1);
+        let box_width = area.width.saturating_sub(8).clamp(9, 13);
+        let box_x = area.x + area.width.saturating_sub(box_width) / 2;
+        let box_y = ground_y.saturating_sub(2);
+        let center = box_x + box_width / 2;
+
+        for row in box_y.saturating_sub(5)..box_y {
+            assert_ne!(
+                buffer[(center, row)].symbol(),
+                " ",
+                "jack should not float above the present at row {row}"
+            );
+        }
+
+        let rendered = buffer_text(&buffer, area);
+        assert!(rendered.contains("╲▄▄▄"));
+        assert!(rendered.contains("▄▄▄╱"));
     }
 
     #[test]
