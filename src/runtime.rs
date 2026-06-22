@@ -77,6 +77,8 @@ const THEME_FLAME: Color = Color::Rgb(221, 92, 38);
 const THEME_EMBER: Color = Color::Rgb(249, 177, 72);
 const THEME_LOG: Color = Color::Rgb(112, 68, 39);
 const THEME_LOG_DARK: Color = Color::Rgb(68, 39, 24);
+const THEME_ICE: Color = Color::Rgb(104, 164, 166);
+const THEME_ICE_DARK: Color = Color::Rgb(64, 115, 123);
 const THEME_ACCENT_MARK: &str = "❄";
 
 type ProcessRegistry = Arc<Mutex<HashSet<u32>>>;
@@ -88,6 +90,7 @@ enum SceneKind {
     Tree,
     Santa,
     Jack,
+    Skating,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -181,6 +184,7 @@ fn fitting_scene_kinds(area: Rect) -> Vec<SceneKind> {
         SceneKind::Tree,
         SceneKind::Santa,
         SceneKind::Jack,
+        SceneKind::Skating,
     ]
     .into_iter()
     .filter(|kind| scene_fits(*kind, area))
@@ -199,6 +203,7 @@ fn scene_min_size(kind: SceneKind) -> (u16, u16) {
         SceneKind::Tree => (18, 7),
         SceneKind::Santa => (24, 8),
         SceneKind::Jack => (20, 7),
+        SceneKind::Skating => (28, 8),
     }
 }
 
@@ -227,6 +232,7 @@ fn parse_dev_scene_kind(value: &str) -> Option<SceneKind> {
         "tree" => Some(SceneKind::Tree),
         "santa" | "rooftop" => Some(SceneKind::Santa),
         "jack" | "jack-in-the-box" | "jack_in_the_box" => Some(SceneKind::Jack),
+        "skate" | "skating" | "lake" | "pond" => Some(SceneKind::Skating),
         _ => None,
     }
 }
@@ -6698,6 +6704,7 @@ fn render_scene(area: Rect, scene: SceneState, frame: u64, buffer: &mut Buffer) 
         SceneKind::Tree => render_tree_scene(area, scene.seed, frame / 2, buffer),
         SceneKind::Santa => render_santa_scene(area, frame / 2, buffer),
         SceneKind::Jack => render_jack_scene(area, scene.seed, frame, buffer),
+        SceneKind::Skating => render_skating_scene(area, scene.seed, frame, buffer),
     }
 }
 
@@ -7041,6 +7048,231 @@ fn render_santa_beard_row(
     render_scene_text_clipped(buffer, x, y, left_arm, red);
     render_scene_text_clipped(buffer, x + 1, y, beard, snow);
     render_scene_text_clipped(buffer, x + 1 + beard_width, y, right_arm, red);
+}
+
+fn render_skating_scene(area: Rect, seed: u64, frame: u64, buffer: &mut Buffer) {
+    if !scene_fits(SceneKind::Skating, area) {
+        return;
+    }
+
+    let lake_height = if area.height >= 13 {
+        5
+    } else if area.height >= 10 {
+        4
+    } else {
+        3
+    };
+    let lake_y = area.bottom().saturating_sub(lake_height);
+    let snowbank_y = lake_y.saturating_sub(1);
+
+    render_skating_sky(area, snowbank_y, seed, frame, buffer);
+    render_skating_snow(area, snowbank_y, buffer);
+    render_skating_pines(area, snowbank_y, seed, buffer);
+    render_frozen_lake(area, lake_y, buffer);
+    render_skating_tracks(area, lake_y, seed, buffer);
+    render_skaters(area, lake_y, seed, frame, buffer);
+}
+
+fn render_skating_sky(area: Rect, snowbank_y: u16, seed: u64, frame: u64, buffer: &mut Buffer) {
+    if snowbank_y <= area.y + 1 {
+        return;
+    }
+
+    let sky_height = snowbank_y.saturating_sub(area.y);
+    let flakes = usize::from((area.width / 12).clamp(3, 12));
+    for index in 0..flakes {
+        let value = mix_scene_seed(seed, index as u64, 0x5e7a_51de_u64);
+        let slot_x = ((index as u64 * u64::from(area.width)) / flakes as u64) as i16;
+        let drift = ((frame / 3 + value / 13) % 3) as i16 - 1;
+        let x = area.x + (slot_x + drift).rem_euclid(i16::try_from(area.width).unwrap_or(1)) as u16;
+        let y = area.y + ((value / 29 + frame / 2) % u64::from(sky_height)) as u16;
+        let symbol = if value & 1 == 0 { "·" } else { "*" };
+        paint_scene_cell(buffer, i32::from(x), y, symbol, pane_style().fg(THEME_SNOW));
+    }
+}
+
+fn render_skating_snow(area: Rect, y: u16, buffer: &mut Buffer) {
+    if y < area.y {
+        return;
+    }
+    for column in 0..area.width {
+        let x = area.x + column;
+        let ridge = if column % 7 == 0 || column % 11 == 3 {
+            "▔"
+        } else {
+            "─"
+        };
+        paint_scene_cell(buffer, i32::from(x), y, ridge, pane_style().fg(THEME_SNOW));
+    }
+}
+
+fn render_skating_pines(area: Rect, snowbank_y: u16, seed: u64, buffer: &mut Buffer) {
+    if area.height < 11 || snowbank_y <= area.y + 3 {
+        return;
+    }
+
+    let count = usize::from((area.width / 18).clamp(2, 5));
+    for index in 0..count {
+        let value = mix_scene_seed(seed, index as u64, 0x0051_ca7e_u64);
+        let slot = u64::from(area.width) / count as u64;
+        let x =
+            area.x + ((index as u64 * slot + value % slot.max(1)) % u64::from(area.width)) as u16;
+        let height = 2 + (value % 2) as u16;
+        let y = snowbank_y.saturating_sub(height);
+        if y <= area.y {
+            continue;
+        }
+        render_scene_text_clipped(
+            buffer,
+            i32::from(x).saturating_sub(1),
+            i32::from(y),
+            "▲",
+            pane_style().fg(THEME_GREEN_HOVER),
+        );
+        if height >= 3 {
+            render_scene_text_clipped(
+                buffer,
+                i32::from(x).saturating_sub(2),
+                i32::from(y + 1),
+                "▲▲▲",
+                pane_style().fg(THEME_GREEN),
+            );
+        }
+        render_scene_text_clipped(
+            buffer,
+            i32::from(x).saturating_sub(1),
+            i32::from(y + height.saturating_sub(1)),
+            "▐▌",
+            pane_style().fg(THEME_LOG),
+        );
+    }
+}
+
+fn render_frozen_lake(area: Rect, lake_y: u16, buffer: &mut Buffer) {
+    for y in lake_y..area.bottom() {
+        for column in 0..area.width {
+            let x = area.x + column;
+            let ice = if (column * 3 + y) % 17 == 0 {
+                THEME_ICE
+            } else {
+                THEME_ICE_DARK
+            };
+            paint_scene_cell(
+                buffer,
+                i32::from(x),
+                y,
+                " ",
+                Style::default().fg(THEME_BLACK).bg(ice),
+            );
+        }
+    }
+
+    for column in 0..area.width {
+        let x = area.x + column;
+        paint_scene_cell(
+            buffer,
+            i32::from(x),
+            lake_y,
+            "▄",
+            Style::default().fg(THEME_SNOW).bg(THEME_ICE_DARK),
+        );
+    }
+}
+
+fn render_skating_tracks(area: Rect, lake_y: u16, seed: u64, buffer: &mut Buffer) {
+    let available_height = area.bottom().saturating_sub(lake_y);
+    if available_height < 3 || area.width < 12 {
+        return;
+    }
+
+    let track_count = usize::from((area.width / 16).clamp(2, 6));
+    for index in 0..track_count {
+        let value = mix_scene_seed(seed, index as u64, 0x1ced_1a4e_u64);
+        let y = lake_y + 1 + (value % u64::from(available_height.saturating_sub(1))) as u16;
+        let x = area.x + (value % u64::from(area.width.saturating_sub(4))) as u16;
+        let symbol = if value & 1 == 0 { "╱" } else { "╲" };
+        render_scene_text_clipped(
+            buffer,
+            i32::from(x),
+            i32::from(y),
+            symbol,
+            Style::default().fg(THEME_SNOW).bg(THEME_ICE_DARK),
+        );
+        if x + 3 < area.right() {
+            render_scene_text_clipped(
+                buffer,
+                i32::from(x + 2),
+                i32::from(y),
+                "─",
+                Style::default().fg(THEME_SNOW).bg(THEME_ICE_DARK),
+            );
+        }
+    }
+}
+
+fn render_skaters(area: Rect, lake_y: u16, seed: u64, frame: u64, buffer: &mut Buffer) {
+    let available_height = area.bottom().saturating_sub(lake_y);
+    if available_height < 3 || area.width < 12 {
+        return;
+    }
+
+    let skater_count = usize::from((area.width / 18).clamp(2, 3));
+    let path_span = i32::from(area.width.saturating_sub(8).max(1));
+    let path_period = (path_span * 2).max(1);
+    for index in 0..skater_count {
+        let value = mix_scene_seed(seed, index as u64, 0x5ca7_1ace_u64);
+        let lane_count = available_height.saturating_sub(2).max(1);
+        let foot_y = lake_y + 1 + ((index as u16 * 2) % lane_count);
+        let phase = frame + index as u64;
+        let offset = (value % path_span as u64) as i32 + index as i32 * 7;
+        let progress = ((frame as i32 + offset).rem_euclid(path_period)).min(path_period);
+        let local_x = if progress <= path_span {
+            progress
+        } else {
+            path_period - progress
+        };
+        let x = i32::from(area.x) + 2 + local_x;
+        let direction = if progress <= path_span { 1 } else { -1 };
+        render_skater(buffer, x, foot_y, phase, direction);
+    }
+}
+
+fn render_skater(buffer: &mut Buffer, x: i32, foot_y: u16, phase: u64, direction: i32) {
+    let head_y = i32::from(foot_y).saturating_sub(2);
+    let body_y = i32::from(foot_y).saturating_sub(1);
+    let foot_y = i32::from(foot_y);
+    let red = pane_style()
+        .fg(THEME_RED_HOVER)
+        .bg(THEME_ICE_DARK)
+        .add_modifier(Modifier::BOLD);
+    let gold = pane_style()
+        .fg(THEME_GOLD_HOVER)
+        .bg(THEME_ICE_DARK)
+        .add_modifier(Modifier::BOLD);
+    let snow = Style::default()
+        .fg(THEME_SNOW)
+        .bg(THEME_ICE_DARK)
+        .add_modifier(Modifier::BOLD);
+
+    let scarf_x = if direction >= 0 { x - 1 } else { x + 3 };
+    render_scene_text_clipped(buffer, scarf_x, body_y, "~", red);
+    render_scene_text_clipped(buffer, x + 1, head_y, "o", snow);
+    render_scene_text_clipped(buffer, x, body_y, "/█\\", gold);
+
+    let stride = if phase.is_multiple_of(2) {
+        if direction >= 0 { "╱ ╲" } else { "╲ ╱" }
+    } else if direction >= 0 {
+        "─╱ "
+    } else {
+        " ╲─"
+    };
+    render_scene_text_clipped(
+        buffer,
+        x,
+        foot_y,
+        stride,
+        Style::default().fg(THEME_SNOW).bg(THEME_ICE_DARK),
+    );
 }
 
 fn render_jack_scene(area: Rect, seed: u64, frame: u64, buffer: &mut Buffer) {
@@ -10404,6 +10636,34 @@ mod tests {
     }
 
     #[test]
+    fn skating_scene_skaters_glide_between_frames() {
+        let area = Rect::new(0, 0, 34, 8);
+        let mut first = Buffer::empty(area);
+        let mut second = Buffer::empty(area);
+
+        render_skating_scene(area, 42, 0, &mut first);
+        render_skating_scene(area, 42, 3, &mut second);
+
+        assert_ne!(
+            skater_head_positions(&first, area),
+            skater_head_positions(&second, area)
+        );
+    }
+
+    #[test]
+    fn skating_scene_draws_lake_and_skaters() {
+        let area = Rect::new(0, 0, 34, 8);
+        let mut buffer = Buffer::empty(area);
+
+        render_skating_scene(area, 42, 0, &mut buffer);
+
+        let text = buffer_text(&buffer, area);
+        assert!(text.contains('o'));
+        assert!(text.contains("─"));
+        assert!(text.contains("╱") || text.contains("╲"));
+    }
+
+    #[test]
     fn santa_scene_pops_out_between_frames() {
         let area = Rect::new(0, 0, 30, 9);
         let mut hidden = Buffer::empty(area);
@@ -10514,6 +10774,7 @@ mod tests {
         assert!(choices.contains(&SceneKind::Tree));
         assert!(choices.contains(&SceneKind::Santa));
         assert!(choices.contains(&SceneKind::Jack));
+        assert!(choices.contains(&SceneKind::Skating));
     }
 
     #[test]
@@ -10542,6 +10803,7 @@ mod tests {
         assert!(choices.contains(&SceneKind::Tree));
         assert!(choices.contains(&SceneKind::Santa));
         assert!(choices.contains(&SceneKind::Jack));
+        assert!(choices.contains(&SceneKind::Skating));
     }
 
     #[test]
@@ -10561,6 +10823,8 @@ mod tests {
             parse_dev_scene_kind("jack-in-the-box"),
             Some(SceneKind::Jack)
         );
+        assert_eq!(parse_dev_scene_kind("skating"), Some(SceneKind::Skating));
+        assert_eq!(parse_dev_scene_kind("lake"), Some(SceneKind::Skating));
     }
 
     #[test]
@@ -11717,6 +11981,18 @@ mod tests {
                 let symbol = buffer[(column, row)].symbol();
                 if symbol == "●" || symbol == "◆" || symbol == "•" {
                     positions.push((column, row, symbol.to_owned()));
+                }
+            }
+        }
+        positions
+    }
+
+    fn skater_head_positions(buffer: &Buffer, area: Rect) -> Vec<(u16, u16)> {
+        let mut positions = Vec::new();
+        for row in area.y..area.bottom() {
+            for column in area.x..area.right() {
+                if buffer[(column, row)].symbol() == "o" {
+                    positions.push((column, row));
                 }
             }
         }
