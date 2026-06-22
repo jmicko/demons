@@ -7297,19 +7297,11 @@ fn render_sleigh_sky(area: Rect, seed: u64, frame: u64, buffer: &mut Buffer) {
         let value = mix_scene_seed(seed, index as u64, 0x51e1_6a00_u64);
         let slot_x = ((index as u64 * u64::from(area.width)) / stars as u64) as i16;
         let jitter = (value % 5) as i16 - 2;
-        let drift = ((frame / 4 + value / 17) % 3) as i16 - 1;
-        let x = area.x + (slot_x + jitter + drift).rem_euclid(width) as u16;
-        let y = area.y + ((value / 23 + frame / 5) % u64::from(area.height)) as u16;
-        let symbol = match value % 5 {
-            0 => "✦",
-            1 | 2 => "·",
-            _ => "*",
-        };
-        let color = if value.is_multiple_of(4) {
-            THEME_GOLD_HOVER
-        } else {
-            THEME_SNOW
-        };
+        let x = area.x + (slot_x + jitter).rem_euclid(width) as u16;
+        let y = area.y + ((value / 23) % u64::from(area.height)) as u16;
+        let bright = (frame / 2 + value).is_multiple_of(4);
+        let symbol = if bright { "✦" } else { "·" };
+        let color = if bright { THEME_GOLD_HOVER } else { THEME_SNOW };
         paint_scene_cell(buffer, i32::from(x), y, symbol, pane_style().fg(color));
     }
 }
@@ -7319,11 +7311,12 @@ fn render_sleigh_moon(area: Rect, buffer: &mut Buffer) {
         return;
     }
 
-    let x = i32::from(area.right().saturating_sub(7));
+    let x = i32::from(area.right().saturating_sub(9));
     let y = i32::from(area.y + 1);
     let style = pane_style().fg(THEME_GOLD_HOVER);
-    render_scene_text_clipped(buffer, x, y, "◜◝", style);
-    render_scene_text_clipped(buffer, x, y + 1, "◟◞", style);
+    render_scene_text_clipped(buffer, x + 1, y, "▄██▄", style);
+    render_scene_text_clipped(buffer, x, y + 1, "██████", style);
+    render_scene_text_clipped(buffer, x + 1, y + 2, "▀██▀", style);
 }
 
 fn render_sleigh_team(area: Rect, seed: u64, frame: u64, buffer: &mut Buffer) {
@@ -7358,8 +7351,9 @@ fn render_sleigh_sprite(buffer: &mut Buffer, x: i32, top: u16, frame: u64) {
     render_reindeer(buffer, x + 1, y, true, frame);
     render_reindeer(buffer, x + 12, y, false, frame + 1);
 
-    render_scene_text_clipped(buffer, x + 25, y + 3, "__╱▔▔╲", runner_style);
-    render_scene_text_clipped(buffer, x + 25, y + 4, "╲____╱", sleigh_style);
+    render_scene_text_clipped(buffer, x + 26, y + 1, "▁▁▁▁", runner_style);
+    render_scene_text_clipped(buffer, x + 25, y + 2, "▟████▙", sleigh_style);
+    render_scene_text_clipped(buffer, x + 25, y + 3, "╲____╱", runner_style);
 }
 
 fn render_reindeer(buffer: &mut Buffer, x: i32, top: i32, red_nose: bool, frame: u64) {
@@ -10799,6 +10793,25 @@ mod tests {
     }
 
     #[test]
+    fn sleigh_scene_stars_twinkle_without_drifting() {
+        let area = Rect::new(0, 0, 44, 10);
+        let mut first = Buffer::empty(area);
+        let mut second = Buffer::empty(area);
+
+        render_sleigh_sky(area, 42, 0, &mut first);
+        render_sleigh_sky(area, 42, 2, &mut second);
+
+        assert_eq!(
+            sleigh_star_positions(&first, area),
+            sleigh_star_positions(&second, area)
+        );
+        assert_ne!(
+            sleigh_star_symbols(&first, area),
+            sleigh_star_symbols(&second, area)
+        );
+    }
+
+    #[test]
     fn sleigh_scene_draws_reindeer_and_sleigh() {
         let area = Rect::new(0, 0, 44, 10);
         let mut buffer = Buffer::empty(area);
@@ -10808,7 +10821,8 @@ mod tests {
         let text = buffer_text(&buffer, area);
         assert!(text.contains('●'));
         assert!(text.contains("<(•)=="));
-        assert!(text.contains("╲____╱"));
+        assert!(text.contains("▟████▙"));
+        assert!(text.contains("███"));
     }
 
     #[test]
@@ -12157,6 +12171,26 @@ mod tests {
             for column in area.x..area.right() {
                 if buffer[(column, row)].symbol() == "●" {
                     positions.push((column, row));
+                }
+            }
+        }
+        positions
+    }
+
+    fn sleigh_star_positions(buffer: &Buffer, area: Rect) -> Vec<(u16, u16)> {
+        sleigh_star_symbols(buffer, area)
+            .into_iter()
+            .map(|(column, row, _)| (column, row))
+            .collect()
+    }
+
+    fn sleigh_star_symbols(buffer: &Buffer, area: Rect) -> Vec<(u16, u16, String)> {
+        let mut positions = Vec::new();
+        for row in area.y..area.bottom() {
+            for column in area.x..area.right() {
+                let symbol = buffer[(column, row)].symbol();
+                if symbol == "✦" || symbol == "·" {
+                    positions.push((column, row, symbol.to_owned()));
                 }
             }
         }
