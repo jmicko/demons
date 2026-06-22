@@ -52,7 +52,7 @@ const EVENT_INTERVAL: Duration = Duration::from_millis(25);
 const ALT_ESCAPE_TIMEOUT: Duration = Duration::from_millis(50);
 const MODE_BUTTON_WIDTH: u16 = 13;
 const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(45);
-const SCENE_FRAME_INTERVAL: Duration = Duration::from_millis(700);
+const SCENE_FRAME_INTERVAL: Duration = Duration::from_millis(350);
 const NOTICE_DURATION: Duration = Duration::from_secs(6);
 const MAX_FULL_HISTORY_OSC52_BYTES: usize = 512 * 1024;
 const DEV_SCENE_ENV: &str = "DEMONS_DEV_SCENE";
@@ -6694,9 +6694,9 @@ fn render_scene(area: Rect, scene: SceneState, frame: u64, buffer: &mut Buffer) 
     clear_rect(buffer, area, pane_style());
     match scene.kind {
         SceneKind::Fireplace => render_fireplace(area, scene.seed, frame, buffer),
-        SceneKind::Snow => render_snow_scene(area, scene.seed, frame, buffer),
-        SceneKind::Tree => render_tree_scene(area, scene.seed, frame, buffer),
-        SceneKind::Santa => render_santa_scene(area, frame, buffer),
+        SceneKind::Snow => render_snow_scene(area, scene.seed, frame / 2, buffer),
+        SceneKind::Tree => render_tree_scene(area, scene.seed, frame / 2, buffer),
+        SceneKind::Santa => render_santa_scene(area, frame / 2, buffer),
         SceneKind::Jack => render_jack_scene(area, scene.seed, frame, buffer),
     }
 }
@@ -7043,7 +7043,7 @@ fn render_jack_scene(area: Rect, seed: u64, frame: u64, buffer: &mut Buffer) {
 }
 
 fn render_jack_box(buffer: &mut Buffer, x: u16, y: u16, width: u16, height: u16, frame: u64) {
-    let phase = frame % 8;
+    let phase = frame % 10;
     let box_style = Style::default().fg(THEME_RED_HOVER).bg(THEME_RED_HOVER);
     let ribbon_style = Style::default().fg(THEME_GOLD_HOVER).bg(THEME_GOLD_HOVER);
     let center = width / 2;
@@ -7059,7 +7059,7 @@ fn render_jack_box(buffer: &mut Buffer, x: u16, y: u16, width: u16, height: u16,
         }
     }
 
-    if phase == 0 || phase == 7 {
+    if phase == 0 || phase >= 8 {
         for column in 0..width {
             let style = if column == center {
                 ribbon_style
@@ -7110,8 +7110,8 @@ fn render_jack_confetti(
     box_y: u16,
     buffer: &mut Buffer,
 ) {
-    let phase = frame % 8;
-    if phase == 0 || phase == 7 || box_y <= area.y + 2 {
+    let phase = frame % 10;
+    if !(2..=6).contains(&phase) || box_y <= area.y + 2 {
         return;
     }
 
@@ -7148,130 +7148,80 @@ fn render_jack_confetti(
 }
 
 fn render_jack(buffer: &mut Buffer, center: i32, box_y: u16, frame: u64, large: bool) {
-    let phase = frame % 8;
-    if phase == 0 || phase == 7 {
+    let phase = frame % 10;
+    if phase == 0 || phase >= 8 {
         return;
     }
 
-    let height = if large {
-        match phase {
-            1 | 6 => 2,
-            2 | 5 => 4,
-            _ => 7,
-        }
-    } else {
-        match phase {
-            1 | 6 => 1,
-            2 | 5 => 3,
-            _ => 5,
-        }
-    };
     let lid_y = i32::from(box_y).saturating_sub(1);
-    let (left, hat, brim, face, arms, body, spring_a, spring_b) = if large {
-        let arms = if phase.is_multiple_of(2) {
-            "\\ ███ /"
-        } else {
-            "/ ███ \\"
-        };
-        (
-            center - 3,
-            "   ▲   ",
-            "  ▔▔▔  ",
-            " (o o) ",
-            arms,
-            "  ███  ",
-            "  ╱╲   ",
-            "   ╲╱  ",
-        )
+    if large {
+        render_large_jack(buffer, center, lid_y, phase);
     } else {
-        let arms = if phase.is_multiple_of(2) {
-            "\\ | /"
-        } else {
-            "/ | \\"
-        };
-        let spring = if phase.is_multiple_of(2) {
-            " ╱╲ "
-        } else {
-            " ╲╱ "
-        };
-        (center - 2, "  ▲  ", "", " (☺) ", arms, " ███ ", spring, "")
-    };
+        render_small_jack(buffer, center, lid_y, phase);
+    }
+}
 
-    if large && height >= 7 {
-        render_scene_text_clipped(
-            buffer,
-            left,
-            lid_y - 6,
-            hat,
-            pane_style()
-                .fg(THEME_GOLD_HOVER)
-                .add_modifier(Modifier::BOLD),
-        );
-        render_scene_text_clipped(
-            buffer,
-            left,
-            lid_y - 5,
-            brim,
-            pane_style().fg(THEME_SNOW).add_modifier(Modifier::BOLD),
-        );
-    } else if !large && height >= 5 {
-        render_scene_text_clipped(
-            buffer,
-            left,
-            lid_y - 4,
-            hat,
-            pane_style()
-                .fg(THEME_GOLD_HOVER)
-                .add_modifier(Modifier::BOLD),
-        );
+fn render_large_jack(buffer: &mut Buffer, center: i32, lid_y: i32, phase: u64) {
+    let left = center - 3;
+    let spring_style = pane_style().fg(THEME_GOLD_HOVER);
+    if phase == 1 || phase == 7 {
+        render_scene_text_clipped(buffer, left, lid_y - 2, "  ╱╲   ", spring_style);
+        render_scene_text_clipped(buffer, left, lid_y - 1, "  ╲╱   ", spring_style);
+        render_scene_text_clipped(buffer, left, lid_y, "  ╱╲   ", spring_style);
+        return;
     }
-    if height >= 4 {
-        render_scene_text_clipped(
-            buffer,
-            left,
-            if large { lid_y - 4 } else { lid_y - 3 },
-            face,
-            pane_style().fg(THEME_SNOW).add_modifier(Modifier::BOLD),
-        );
+
+    let arms = if phase.is_multiple_of(2) {
+        "\\ ███ /"
+    } else {
+        "/ ███ \\"
+    };
+    let top_shift = if phase == 4 { 1 } else { 0 };
+    let red = pane_style()
+        .fg(THEME_RED_HOVER)
+        .add_modifier(Modifier::BOLD);
+    let snow = pane_style().fg(THEME_SNOW).add_modifier(Modifier::BOLD);
+    let gold = pane_style()
+        .fg(THEME_GOLD_HOVER)
+        .add_modifier(Modifier::BOLD);
+
+    render_scene_text_clipped(buffer, left, lid_y - 7 + top_shift, "   ▲   ", gold);
+    render_scene_text_clipped(buffer, left, lid_y - 6 + top_shift, "  ▔▔▔  ", snow);
+    render_scene_text_clipped(buffer, left, lid_y - 5 + top_shift, " (o o) ", snow);
+    render_scene_text_clipped(buffer, left, lid_y - 4 + top_shift, arms, red);
+    render_scene_text_clipped(buffer, left, lid_y - 3 + top_shift, "  ███  ", red);
+    render_scene_text_clipped(buffer, left, lid_y - 2, "  ╱╲   ", spring_style);
+    render_scene_text_clipped(buffer, left, lid_y - 1, "  ╲╱   ", spring_style);
+    render_scene_text_clipped(buffer, left, lid_y, "  ╱╲   ", spring_style);
+}
+
+fn render_small_jack(buffer: &mut Buffer, center: i32, lid_y: i32, phase: u64) {
+    let left = center - 2;
+    let spring_style = pane_style().fg(THEME_GOLD_HOVER);
+    if phase == 1 || phase == 7 {
+        render_scene_text_clipped(buffer, left, lid_y - 1, " ╱╲ ", spring_style);
+        render_scene_text_clipped(buffer, left, lid_y, " ╲╱ ", spring_style);
+        return;
     }
-    if height >= 5 {
-        render_scene_text_clipped(
-            buffer,
-            left,
-            if large { lid_y - 3 } else { lid_y - 2 },
-            arms,
-            pane_style()
-                .fg(THEME_RED_HOVER)
-                .add_modifier(Modifier::BOLD),
-        );
-    }
-    if height >= 3 {
-        render_scene_text_clipped(
-            buffer,
-            left,
-            if large { lid_y - 2 } else { lid_y - 1 },
-            body,
-            pane_style()
-                .fg(THEME_RED_HOVER)
-                .add_modifier(Modifier::BOLD),
-        );
-    }
-    if large && height >= 2 {
-        render_scene_text_clipped(
-            buffer,
-            left,
-            lid_y - 1,
-            spring_a,
-            pane_style().fg(THEME_GOLD_HOVER),
-        );
-    }
-    render_scene_text_clipped(
-        buffer,
-        left,
-        lid_y,
-        if large { spring_b } else { spring_a },
-        pane_style().fg(THEME_GOLD_HOVER),
-    );
+
+    let arms = if phase.is_multiple_of(2) {
+        "\\ | /"
+    } else {
+        "/ | \\"
+    };
+    let red = pane_style()
+        .fg(THEME_RED_HOVER)
+        .add_modifier(Modifier::BOLD);
+    let snow = pane_style().fg(THEME_SNOW).add_modifier(Modifier::BOLD);
+    let gold = pane_style()
+        .fg(THEME_GOLD_HOVER)
+        .add_modifier(Modifier::BOLD);
+
+    render_scene_text_clipped(buffer, left, lid_y - 4, "  ▲  ", gold);
+    render_scene_text_clipped(buffer, left, lid_y - 3, " (☺) ", snow);
+    render_scene_text_clipped(buffer, left, lid_y - 2, arms, red);
+    render_scene_text_clipped(buffer, left, lid_y - 1, " ███ ", red);
+    render_scene_text_clipped(buffer, left, lid_y, "╱╲╱╲", spring_style);
 }
 
 fn render_fire(buffer: &mut Buffer, area: Rect, seed: u64, frame: u64, fire: FireGeometry) {
@@ -10448,6 +10398,23 @@ mod tests {
         assert!(!buffer_text(&closed, area).contains('☺'));
         assert!(buffer_text(&open, area).contains('☺'));
         assert_ne!(buffer_text(&closed, area), buffer_text(&open, area));
+    }
+
+    #[test]
+    fn jack_scene_uses_spring_phase_before_full_sprite() {
+        let area = Rect::new(0, 0, 24, 8);
+        let mut spring = Buffer::empty(area);
+        let mut open = Buffer::empty(area);
+
+        render_jack_scene(area, 42, 1, &mut spring);
+        render_jack_scene(area, 42, 2, &mut open);
+
+        let spring_text = buffer_text(&spring, area);
+        let open_text = buffer_text(&open, area);
+        assert!(spring_text.contains('╱'));
+        assert!(spring_text.contains('╲'));
+        assert!(!spring_text.contains('☺'));
+        assert!(open_text.contains('☺'));
     }
 
     #[test]
