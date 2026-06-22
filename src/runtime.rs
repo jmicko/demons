@@ -7351,9 +7351,8 @@ fn render_sleigh_sprite(buffer: &mut Buffer, x: i32, top: u16, frame: u64) {
     render_reindeer(buffer, x + 1, y, true, frame);
     render_reindeer(buffer, x + 12, y, false, frame + 1);
 
-    render_scene_text_clipped(buffer, x + 26, y + 1, "▁▁▁▁", runner_style);
-    render_scene_text_clipped(buffer, x + 25, y + 2, "▟████▙", sleigh_style);
-    render_scene_text_clipped(buffer, x + 25, y + 3, "╲____╱", runner_style);
+    render_scene_text_clipped(buffer, x + 25, y + 1, "__╱▔▔╲", runner_style);
+    render_scene_text_clipped(buffer, x + 25, y + 2, "╲____╱", sleigh_style);
 }
 
 fn render_reindeer(buffer: &mut Buffer, x: i32, top: i32, red_nose: bool, frame: u64) {
@@ -10821,7 +10820,8 @@ mod tests {
         let text = buffer_text(&buffer, area);
         assert!(text.contains('●'));
         assert!(text.contains("<(•)=="));
-        assert!(text.contains("▟████▙"));
+        assert!(text.contains("__╱▔▔╲"));
+        assert!(text.contains("╲____╱"));
         assert!(text.contains("███"));
     }
 
