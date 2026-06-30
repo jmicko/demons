@@ -7334,10 +7334,10 @@ fn render_sleigh_team(area: Rect, seed: u64, frame: u64, buffer: &mut Buffer) {
     ) as u16;
     let left = i32::from(area.right()) - local;
 
-    render_sleigh_sprite(buffer, left, top, frame);
+    render_sleigh_sprite(buffer, area, left, top, frame);
 }
 
-fn render_sleigh_sprite(buffer: &mut Buffer, x: i32, top: u16, frame: u64) {
+fn render_sleigh_sprite(buffer: &mut Buffer, clip: Rect, x: i32, top: u16, frame: u64) {
     let y = i32::from(top);
     let rein_style = pane_style().fg(THEME_SNOW);
     let sleigh_style = pane_style()
@@ -7345,17 +7345,17 @@ fn render_sleigh_sprite(buffer: &mut Buffer, x: i32, top: u16, frame: u64) {
         .add_modifier(Modifier::BOLD);
     let runner_style = pane_style().fg(THEME_GOLD_HOVER);
 
-    render_scene_text_clipped(buffer, x + 9, y + 1, "───", rein_style);
-    render_scene_text_clipped(buffer, x + 20, y + 1, "──────", rein_style);
+    render_scene_text_in_rect(buffer, clip, x + 11, y + 1, "───", rein_style);
+    render_scene_text_in_rect(buffer, clip, x + 22, y + 1, "────╮", rein_style);
 
-    render_reindeer(buffer, x + 1, y, true, frame);
-    render_reindeer(buffer, x + 12, y, false, frame + 1);
+    render_reindeer(buffer, clip, x + 3, y, true, frame);
+    render_reindeer(buffer, clip, x + 14, y, false, frame + 1);
 
-    render_scene_text_clipped(buffer, x + 25, y + 1, "__╱▔▔╲", runner_style);
-    render_scene_text_clipped(buffer, x + 25, y + 2, "╲____╱", sleigh_style);
+    render_scene_text_in_rect(buffer, clip, x + 27, y + 1, "__◢██◣", runner_style);
+    render_scene_text_in_rect(buffer, clip, x + 27, y + 2, "◥████◤", sleigh_style);
 }
 
-fn render_reindeer(buffer: &mut Buffer, x: i32, top: i32, red_nose: bool, frame: u64) {
+fn render_reindeer(buffer: &mut Buffer, clip: Rect, x: i32, top: i32, red_nose: bool, frame: u64) {
     let antler_style = pane_style().fg(THEME_GOLD_HOVER);
     let body_style = pane_style().fg(THEME_LOG).add_modifier(Modifier::BOLD);
     let leg_style = pane_style().fg(THEME_LOG);
@@ -7367,23 +7367,24 @@ fn render_reindeer(buffer: &mut Buffer, x: i32, top: i32, red_nose: bool, frame:
         })
         .add_modifier(Modifier::BOLD);
 
-    render_scene_text_clipped(buffer, x + 2, top, "Y Y", antler_style);
-    render_scene_text_clipped(
+    render_scene_text_in_rect(buffer, clip, x + 2, top, "Y Y", antler_style);
+    render_scene_text_in_rect(
         buffer,
+        clip,
         x,
         top + 1,
         if red_nose { "●" } else { "o" },
         nose_style,
     );
-    render_scene_text_clipped(buffer, x + 1, top + 1, "<(•)==", body_style);
-    render_scene_text_clipped(buffer, x + 3, top + 2, "║ ║", leg_style);
+    render_scene_text_in_rect(buffer, clip, x + 1, top + 1, "<(•)==", body_style);
+    render_scene_text_in_rect(buffer, clip, x + 3, top + 2, "║ ║", leg_style);
 
     let legs = if frame.is_multiple_of(2) {
         "╱  ╲"
     } else {
         "╲  ╱"
     };
-    render_scene_text_clipped(buffer, x + 2, top + 3, legs, leg_style);
+    render_scene_text_in_rect(buffer, clip, x + 2, top + 3, legs, leg_style);
 }
 
 fn render_jack_scene(area: Rect, seed: u64, frame: u64, buffer: &mut Buffer) {
@@ -7818,6 +7819,37 @@ fn render_scene_text_clipped(buffer: &mut Buffer, x: i32, y: i32, text: &str, st
         }
         let cell_x = cell_x as u16;
         if !contains(buffer.area, cell_x, y) {
+            continue;
+        }
+        let mut encoded = [0_u8; 4];
+        let symbol = if character.is_control() {
+            " "
+        } else {
+            character.encode_utf8(&mut encoded)
+        };
+        buffer[(cell_x, y)].set_symbol(symbol).set_style(style);
+    }
+}
+
+fn render_scene_text_in_rect(
+    buffer: &mut Buffer,
+    clip: Rect,
+    x: i32,
+    y: i32,
+    text: &str,
+    style: Style,
+) {
+    if y < 0 {
+        return;
+    }
+    let y = y as u16;
+    for (offset, character) in text.chars().enumerate() {
+        let cell_x = x + offset as i32;
+        if cell_x < 0 {
+            continue;
+        }
+        let cell_x = cell_x as u16;
+        if !contains(clip, cell_x, y) || !contains(buffer.area, cell_x, y) {
             continue;
         }
         let mut encoded = [0_u8; 4];
@@ -10820,9 +10852,29 @@ mod tests {
         let text = buffer_text(&buffer, area);
         assert!(text.contains('●'));
         assert!(text.contains("<(•)=="));
-        assert!(text.contains("__╱▔▔╲"));
-        assert!(text.contains("╲____╱"));
+        assert!(text.contains("────╮"));
+        assert!(text.contains("__◢██◣"));
+        assert!(text.contains("◥████◤"));
         assert!(text.contains("███"));
+    }
+
+    #[test]
+    fn sleigh_scene_clips_team_to_scene_area() {
+        let scene_area = Rect::new(0, 0, 44, 10);
+        let buffer_area = Rect::new(0, 0, 88, 10);
+        let mut buffer = Buffer::empty(buffer_area);
+
+        render_sleigh_scene(scene_area, 0, 0, &mut buffer);
+
+        for y in buffer_area.y..buffer_area.bottom() {
+            for x in scene_area.right()..buffer_area.right() {
+                assert_eq!(
+                    buffer[(x, y)].symbol(),
+                    " ",
+                    "sleigh scene leaked into neighboring area at ({x}, {y})"
+                );
+            }
+        }
     }
 
     #[test]
