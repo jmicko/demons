@@ -80,6 +80,8 @@ const THEME_LOG_DARK: Color = Color::Rgb(68, 39, 24);
 const THEME_ICE: Color = Color::Rgb(104, 164, 166);
 const THEME_ICE_DARK: Color = Color::Rgb(64, 115, 123);
 const THEME_ACCENT_MARK: &str = "❄";
+const SKATING_SNOWBANK_PATTERN: &[u8] =
+    b"#__#####______###____########______##_____########______###____###___##____#####";
 
 type ProcessRegistry = Arc<Mutex<HashSet<u32>>>;
 
@@ -7104,12 +7106,12 @@ fn render_skating_snow(area: Rect, y: u16, buffer: &mut Buffer) {
     }
     for column in 0..area.width {
         let x = area.x + column;
-        let ridge = if column % 7 == 0 || column % 11 == 3 {
-            "▔"
-        } else {
-            "─"
-        };
-        paint_scene_cell(buffer, i32::from(x), y, ridge, pane_style().fg(THEME_SNOW));
+        let symbol = SKATING_SNOWBANK_PATTERN
+            .get(usize::from(column) % SKATING_SNOWBANK_PATTERN.len())
+            .copied()
+            .unwrap_or(b'_');
+        let symbol = if symbol == b'#' { "█" } else { "▄" };
+        paint_scene_cell(buffer, i32::from(x), y, symbol, pane_style().fg(THEME_SNOW));
     }
 }
 
@@ -10814,7 +10816,7 @@ mod tests {
 
         let text = buffer_text(&buffer, area);
         assert!(text.contains('o'));
-        assert!(text.contains("─"));
+        assert!(text.contains('█') || text.contains('▄'));
         assert!(text.contains('║') || text.contains("/|") || text.contains("|\\"));
     }
 
