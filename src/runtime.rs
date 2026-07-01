@@ -205,7 +205,7 @@ fn scene_min_size(kind: SceneKind) -> (u16, u16) {
         SceneKind::Fireplace => (18, 4),
         SceneKind::Snow => (18, 7),
         SceneKind::Tree => (18, 7),
-        SceneKind::Santa => (24, 8),
+        SceneKind::Santa => (26, 11),
         SceneKind::Jack => (20, 7),
         SceneKind::Skating => (28, 8),
         SceneKind::Sleigh => (34, 8),
@@ -6916,7 +6916,7 @@ fn render_santa_scene(area: Rect, frame: u64, buffer: &mut Buffer) {
     let roof_y = area.bottom().saturating_sub(2);
     render_rooftop(area, roof_y, buffer);
 
-    let chimney_width = if area.width >= 30 { 7 } else { 5 };
+    let chimney_width = 5;
     let chimney_x = area.x + area.width.saturating_sub(chimney_width) / 2;
     let chimney_top = roof_y.saturating_sub(3);
     render_santa(
@@ -6924,7 +6924,6 @@ fn render_santa_scene(area: Rect, frame: u64, buffer: &mut Buffer) {
         i32::from(chimney_x + chimney_width / 2),
         chimney_top,
         frame,
-        chimney_width,
     );
     render_chimney(buffer, chimney_x, chimney_width, chimney_top, roof_y);
 }
@@ -6989,72 +6988,37 @@ fn render_chimney(buffer: &mut Buffer, x: u16, width: u16, top: u16, roof_y: u16
     }
 }
 
-fn render_santa(buffer: &mut Buffer, center: i32, chimney_top: u16, frame: u64, width: u16) {
-    let phase = frame % 14;
-    let offset = match phase {
-        0 | 1 | 12 | 13 => 4,
-        2 | 11 => 3,
-        3 | 10 => 2,
-        4 | 9 => 1,
-        _ => 0,
-    };
-    let top = i32::from(chimney_top).saturating_sub(4) + offset;
-    let wide = width >= 7;
-    let left = if wide { center - 3 } else { center - 2 };
-    let wave_right = matches!(phase, 6 | 8);
-    let (hat, brim, face, beard) = if wide {
-        (" ◢███◣ ", " ▔▔▔▔▔ ", " (• •) ", "╰███╯")
+fn render_santa(buffer: &mut Buffer, center: i32, chimney_top: u16, frame: u64) {
+    let top = i32::from(chimney_top).saturating_sub(6);
+    let left = center - 7;
+    let hand_high = frame.is_multiple_of(2);
+    let red = pane_style()
+        .fg(THEME_RED_HOVER)
+        .add_modifier(Modifier::BOLD);
+    let snow = pane_style().fg(THEME_SNOW).add_modifier(Modifier::BOLD);
+    let gold = pane_style()
+        .fg(THEME_GOLD_HOVER)
+        .add_modifier(Modifier::BOLD);
+
+    render_scene_text_clipped(buffer, left + 4, top, "◢█████◣", red);
+    render_scene_text_clipped(buffer, left + 2, top + 1, "▔▔▔▔▔▔▔▔▔▔▔", snow);
+    render_scene_text_clipped(buffer, left + 4, top + 2, "(•  •)", snow);
+    render_scene_text_clipped(buffer, left + 2, top + 3, "╭███████╮", snow);
+    render_scene_text_clipped(buffer, left, top + 4, "╱███████████╲", red);
+    render_scene_text_clipped(buffer, left + 1, top + 5, "█████", red);
+    render_scene_text_clipped(buffer, left + 6, top + 5, "╋", gold);
+    render_scene_text_clipped(buffer, left + 7, top + 5, "█████", red);
+    render_scene_text_clipped(buffer, left + 3, top + 6, "█████████", red);
+
+    if hand_high {
+        render_scene_text_clipped(buffer, left + 14, top + 1, "o", snow);
+        render_scene_text_clipped(buffer, left + 13, top + 2, "/", red);
+        render_scene_text_clipped(buffer, left + 12, top + 3, "/", red);
     } else {
-        (" ◢██◣", "▔▔▔▔▔", "(• •)", "███")
-    };
-    let red = pane_style()
-        .fg(THEME_RED_HOVER)
-        .add_modifier(Modifier::BOLD);
-    let snow = pane_style().fg(THEME_SNOW).add_modifier(Modifier::BOLD);
-    let chimney_lip = i32::from(chimney_top);
-
-    render_santa_row(buffer, left, top, chimney_lip, hat, red);
-    render_santa_row(buffer, left, top + 1, chimney_lip, brim, snow);
-    render_santa_row(buffer, left, top + 2, chimney_lip, face, snow);
-    render_santa_beard_row(buffer, left, top + 3, chimney_lip, beard, wave_right);
-}
-
-fn render_santa_row(
-    buffer: &mut Buffer,
-    x: i32,
-    y: i32,
-    chimney_lip: i32,
-    text: &str,
-    style: Style,
-) {
-    if y < chimney_lip {
-        render_scene_text_clipped(buffer, x, y, text, style);
+        render_scene_text_clipped(buffer, left + 13, top + 2, "o", snow);
+        render_scene_text_clipped(buffer, left + 12, top + 3, "/", red);
+        render_scene_text_clipped(buffer, left + 11, top + 4, "/", red);
     }
-}
-
-fn render_santa_beard_row(
-    buffer: &mut Buffer,
-    x: i32,
-    y: i32,
-    chimney_lip: i32,
-    beard: &str,
-    wave_right: bool,
-) {
-    if y >= chimney_lip {
-        return;
-    }
-
-    let red = pane_style()
-        .fg(THEME_RED_HOVER)
-        .add_modifier(Modifier::BOLD);
-    let snow = pane_style().fg(THEME_SNOW).add_modifier(Modifier::BOLD);
-    let left_arm = if wave_right { "\\" } else { "/" };
-    let right_arm = if wave_right { "/" } else { "\\" };
-    let beard_width = i32::try_from(beard.chars().count()).unwrap_or_default();
-
-    render_scene_text_clipped(buffer, x, y, left_arm, red);
-    render_scene_text_clipped(buffer, x + 1, y, beard, snow);
-    render_scene_text_clipped(buffer, x + 1 + beard_width, y, right_arm, red);
 }
 
 fn render_skating_scene(area: Rect, seed: u64, frame: u64, buffer: &mut Buffer) {
@@ -10986,35 +10950,32 @@ mod tests {
     }
 
     #[test]
-    fn santa_scene_pops_out_between_frames() {
-        let area = Rect::new(0, 0, 30, 9);
-        let mut hidden = Buffer::empty(area);
-        let mut visible = Buffer::empty(area);
+    fn santa_scene_waves_between_frames() {
+        let area = Rect::new(0, 0, 32, 11);
+        let mut low_wave = Buffer::empty(area);
+        let mut high_wave = Buffer::empty(area);
 
-        render_santa_scene(area, 0, &mut hidden);
-        render_santa_scene(area, 4, &mut visible);
+        render_santa_scene(area, 0, &mut high_wave);
+        render_santa_scene(area, 1, &mut low_wave);
 
-        assert!(!buffer_text(&hidden, area).contains("(• •)"));
-        assert!(buffer_text(&visible, area).contains("(• •)"));
-        assert_ne!(buffer_text(&hidden, area), buffer_text(&visible, area));
+        let high_text = buffer_text(&high_wave, area);
+        let low_text = buffer_text(&low_wave, area);
+        assert!(high_text.contains("(•  •)"));
+        assert!(low_text.contains("(•  •)"));
+        assert_ne!(high_text, low_text);
     }
 
     #[test]
-    fn santa_scene_descends_inside_chimney() {
-        let area = Rect::new(0, 0, 30, 9);
-        let mut full = Buffer::empty(area);
-        let mut descending = Buffer::empty(area);
+    fn santa_scene_draws_fat_santa_over_small_chimney() {
+        let area = Rect::new(0, 0, 32, 11);
+        let mut buffer = Buffer::empty(area);
 
-        render_santa_scene(area, 5, &mut full);
-        render_santa_scene(area, 10, &mut descending);
+        render_santa_scene(area, 0, &mut buffer);
 
-        let full_text = buffer_text(&full, area);
-        let descending_text = buffer_text(&descending, area);
-        assert!(full_text.contains("(• •)"));
-        assert!(full_text.contains("╰███╯"));
-        assert!(!descending_text.contains("(• •)"));
-        assert!(!descending_text.contains("╰███╯"));
-        assert!(descending_text.contains('█'));
+        let text = buffer_text(&buffer, area);
+        assert!(text.contains("◢█████◣"));
+        assert!(text.contains("╱███████████╲"));
+        assert!(text.contains("▀▀▀▀▀"));
     }
 
     #[test]
@@ -11103,7 +11064,7 @@ mod tests {
     #[test]
     fn scene_selection_uses_current_area_size() {
         let compact = Rect::new(0, 0, 24, 4);
-        let roomy = Rect::new(0, 0, 40, 8);
+        let roomy = Rect::new(0, 0, 40, 11);
         let too_small = Rect::new(0, 0, 17, 7);
 
         assert!(scene_fits(SceneKind::Fireplace, compact));
