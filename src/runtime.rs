@@ -205,7 +205,7 @@ fn scene_min_size(kind: SceneKind) -> (u16, u16) {
         SceneKind::Fireplace => (18, 4),
         SceneKind::Snow => (18, 7),
         SceneKind::Tree => (18, 7),
-        SceneKind::Santa => (26, 11),
+        SceneKind::Santa => (34, 14),
         SceneKind::Jack => (20, 7),
         SceneKind::Skating => (28, 8),
         SceneKind::Sleigh => (34, 8),
@@ -6913,12 +6913,13 @@ fn render_santa_scene(area: Rect, frame: u64, buffer: &mut Buffer) {
         return;
     }
 
-    let roof_y = area.bottom().saturating_sub(2);
+    let roof_y = area.bottom().saturating_sub(3);
+    render_santa_sky(area, roof_y, frame, buffer);
     render_rooftop(area, roof_y, buffer);
 
-    let chimney_width = 5;
+    let chimney_width = 11;
     let chimney_x = area.x + area.width.saturating_sub(chimney_width) / 2;
-    let chimney_top = roof_y.saturating_sub(3);
+    let chimney_top = roof_y.saturating_sub(4);
     render_santa(
         buffer,
         i32::from(chimney_x + chimney_width / 2),
@@ -6928,69 +6929,117 @@ fn render_santa_scene(area: Rect, frame: u64, buffer: &mut Buffer) {
     render_chimney(buffer, chimney_x, chimney_width, chimney_top, roof_y);
 }
 
+fn render_santa_sky(area: Rect, roof_y: u16, frame: u64, buffer: &mut Buffer) {
+    let sky_height = roof_y.saturating_sub(area.y);
+    if sky_height < 5 {
+        return;
+    }
+
+    let flakes = usize::from((area.width / 16).clamp(2, 6));
+    for index in 0..flakes {
+        let x = area.x + ((index as u16 * 17 + 5) % area.width);
+        let y = area.y + 1 + ((index as u16 * 5 + 2) % sky_height.saturating_sub(1));
+        let symbol = if (frame + index as u64).is_multiple_of(2) {
+            "*"
+        } else {
+            "·"
+        };
+        let color = if index % 3 == 0 {
+            THEME_GOLD_HOVER
+        } else {
+            THEME_SNOW
+        };
+        paint_scene_cell(buffer, i32::from(x), y, symbol, pane_style().fg(color));
+    }
+}
+
 fn render_rooftop(area: Rect, roof_y: u16, buffer: &mut Buffer) {
-    for column in 1..area.width.saturating_sub(1) {
+    let snow_pattern = b"#___######____####_______######___";
+    for column in 0..area.width {
         let x = area.x + column;
-        buffer[(x, roof_y)]
-            .set_symbol("▔")
-            .set_style(pane_style().fg(THEME_SNOW));
+        let snow = snow_pattern
+            .get(usize::from(column) % snow_pattern.len())
+            .copied()
+            .unwrap_or(b'_');
+        let snow = if snow == b'#' { "█" } else { "▄" };
+        paint_scene_cell(
+            buffer,
+            i32::from(x),
+            roof_y,
+            snow,
+            pane_style().fg(THEME_SNOW),
+        );
+
         if roof_y + 1 < area.bottom() {
             let color = if column % 2 == 0 {
                 THEME_RED
             } else {
                 THEME_RED_HOVER
             };
-            buffer[(x, roof_y + 1)]
-                .set_symbol("▄")
-                .set_style(pane_style().fg(color));
+            paint_scene_cell(
+                buffer,
+                i32::from(x),
+                roof_y + 1,
+                " ",
+                Style::default().fg(color).bg(color),
+            );
+        }
+        if roof_y + 2 < area.bottom() {
+            let color = if column % 4 < 2 {
+                THEME_RED
+            } else {
+                THEME_LOG_DARK
+            };
+            paint_scene_cell(
+                buffer,
+                i32::from(x),
+                roof_y + 2,
+                "▄",
+                Style::default().fg(color).bg(THEME_RED),
+            );
         }
     }
 }
 
 fn render_chimney(buffer: &mut Buffer, x: u16, width: u16, top: u16, roof_y: u16) {
-    for y in top..roof_y {
+    let cap_style = Style::default().fg(THEME_SNOW).bg(THEME_LOG);
+    for offset in 0..width.saturating_add(6) {
+        paint_scene_cell(
+            buffer,
+            i32::from(x + offset).saturating_sub(3),
+            top,
+            "▀",
+            cap_style,
+        );
+    }
+
+    for y in top.saturating_add(1)..=roof_y.saturating_add(1) {
+        let row = y.saturating_sub(top);
+        let base = if row.is_multiple_of(2) {
+            THEME_LOG
+        } else {
+            THEME_LOG_DARK
+        };
         for offset in 0..width {
             paint_scene_cell(
                 buffer,
                 i32::from(x + offset),
                 y,
                 " ",
-                Style::default().fg(THEME_RED).bg(THEME_RED),
+                Style::default().fg(base).bg(base),
             );
         }
-        paint_scene_cell(
-            buffer,
-            i32::from(x + 1),
-            y,
-            "▌",
-            Style::default().fg(THEME_RED_HOVER).bg(THEME_RED),
-        );
-        if width >= 6 {
-            paint_scene_cell(
-                buffer,
-                i32::from(x + width - 2),
-                y,
-                "▐",
-                Style::default().fg(THEME_RED_HOVER).bg(THEME_RED),
-            );
-        }
-    }
-    if top > 0 {
-        for offset in 0..width {
-            paint_scene_cell(
-                buffer,
-                i32::from(x + offset),
-                top,
-                "▀",
-                Style::default().fg(THEME_SNOW).bg(THEME_RED),
-            );
+        let mortar = Style::default().fg(THEME_BLACK).bg(base);
+        let stagger = if row.is_multiple_of(2) { 2 } else { 4 };
+        for divider in (stagger..usize::from(width)).step_by(5) {
+            paint_scene_cell(buffer, i32::from(x) + divider as i32, y, "▏", mortar);
         }
     }
 }
 
 fn render_santa(buffer: &mut Buffer, center: i32, chimney_top: u16, frame: u64) {
-    let top = i32::from(chimney_top).saturating_sub(6);
-    let left = center - 7;
+    let top = i32::from(chimney_top).saturating_sub(7);
+    let left = center - 12;
     let hand_high = frame.is_multiple_of(2);
     let red = pane_style()
         .fg(THEME_RED_HOVER)
@@ -7000,24 +7049,26 @@ fn render_santa(buffer: &mut Buffer, center: i32, chimney_top: u16, frame: u64) 
         .fg(THEME_GOLD_HOVER)
         .add_modifier(Modifier::BOLD);
 
-    render_scene_text_clipped(buffer, left + 4, top, "◢█████◣", red);
-    render_scene_text_clipped(buffer, left + 2, top + 1, "▔▔▔▔▔▔▔▔▔▔▔", snow);
-    render_scene_text_clipped(buffer, left + 4, top + 2, "(•  •)", snow);
-    render_scene_text_clipped(buffer, left + 2, top + 3, "╭███████╮", snow);
-    render_scene_text_clipped(buffer, left, top + 4, "╱███████████╲", red);
-    render_scene_text_clipped(buffer, left + 1, top + 5, "█████", red);
-    render_scene_text_clipped(buffer, left + 6, top + 5, "╋", gold);
-    render_scene_text_clipped(buffer, left + 7, top + 5, "█████", red);
-    render_scene_text_clipped(buffer, left + 3, top + 6, "█████████", red);
+    render_scene_text_clipped(buffer, left + 6, top, "◢████████◣", red);
+    render_scene_text_clipped(buffer, left + 16, top, "●", snow);
+    render_scene_text_clipped(buffer, left + 4, top + 1, "▔▔▔▔▔▔▔▔▔▔▔▔▔", snow);
+    render_scene_text_clipped(buffer, left + 8, top + 2, "(•‿•)", snow);
+    render_scene_text_clipped(buffer, left + 6, top + 3, "╭██████╮", snow);
+    render_scene_text_clipped(buffer, left + 4, top + 4, "╭╯██████╰╮", snow);
+    render_scene_text_clipped(buffer, left + 1, top + 5, "╭██████████████╮", red);
+    render_scene_text_clipped(buffer, left, top + 6, "╱███████", red);
+    render_scene_text_clipped(buffer, left + 8, top + 6, "╋", gold);
+    render_scene_text_clipped(buffer, left + 9, top + 6, "███████╲", red);
+    render_scene_text_clipped(buffer, left + 3, top + 7, "██████████████", red);
 
     if hand_high {
-        render_scene_text_clipped(buffer, left + 14, top + 1, "o", snow);
-        render_scene_text_clipped(buffer, left + 13, top + 2, "/", red);
-        render_scene_text_clipped(buffer, left + 12, top + 3, "/", red);
+        render_scene_text_clipped(buffer, left + 21, top + 1, "●", snow);
+        render_scene_text_clipped(buffer, left + 20, top + 2, "╱", red);
+        render_scene_text_clipped(buffer, left + 19, top + 3, "╱", red);
     } else {
-        render_scene_text_clipped(buffer, left + 13, top + 2, "o", snow);
-        render_scene_text_clipped(buffer, left + 12, top + 3, "/", red);
-        render_scene_text_clipped(buffer, left + 11, top + 4, "/", red);
+        render_scene_text_clipped(buffer, left + 20, top + 4, "●", snow);
+        render_scene_text_clipped(buffer, left + 19, top + 5, "╱", red);
+        render_scene_text_clipped(buffer, left + 18, top + 6, "╱", red);
     }
 }
 
@@ -10951,7 +11002,7 @@ mod tests {
 
     #[test]
     fn santa_scene_waves_between_frames() {
-        let area = Rect::new(0, 0, 32, 11);
+        let area = Rect::new(0, 0, 38, 14);
         let mut low_wave = Buffer::empty(area);
         let mut high_wave = Buffer::empty(area);
 
@@ -10960,21 +11011,21 @@ mod tests {
 
         let high_text = buffer_text(&high_wave, area);
         let low_text = buffer_text(&low_wave, area);
-        assert!(high_text.contains("(•  •)"));
-        assert!(low_text.contains("(•  •)"));
+        assert!(high_text.contains("(•‿•)"));
+        assert!(low_text.contains("(•‿•)"));
         assert_ne!(high_text, low_text);
     }
 
     #[test]
     fn santa_scene_draws_fat_santa_over_small_chimney() {
-        let area = Rect::new(0, 0, 32, 11);
+        let area = Rect::new(0, 0, 38, 14);
         let mut buffer = Buffer::empty(area);
 
         render_santa_scene(area, 0, &mut buffer);
 
         let text = buffer_text(&buffer, area);
-        assert!(text.contains("◢█████◣"));
-        assert!(text.contains("╱███████████╲"));
+        assert!(text.contains("◢████████◣"));
+        assert!(text.contains("╭██████████████╮"));
         assert!(text.contains("▀▀▀▀▀"));
     }
 
@@ -11064,7 +11115,7 @@ mod tests {
     #[test]
     fn scene_selection_uses_current_area_size() {
         let compact = Rect::new(0, 0, 24, 4);
-        let roomy = Rect::new(0, 0, 40, 11);
+        let roomy = Rect::new(0, 0, 40, 14);
         let too_small = Rect::new(0, 0, 17, 7);
 
         assert!(scene_fits(SceneKind::Fireplace, compact));
