@@ -65,6 +65,7 @@ const THEME_GREEN_HOVER: Color = Color::Rgb(61, 132, 96);
 const THEME_SNOW: Color = Color::Rgb(229, 224, 204);
 const THEME_GOLD: Color = Color::Rgb(188, 146, 54);
 const THEME_GOLD_HOVER: Color = Color::Rgb(224, 185, 82);
+const THEME_SKIN: Color = Color::Rgb(226, 181, 135);
 const THEME_COMMAND: Color = THEME_GOLD;
 const THEME_HOLLY: Color = Color::Rgb(91, 111, 100);
 const THEME_BLACK: Color = Color::Rgb(11, 20, 17);
@@ -7039,8 +7040,8 @@ fn render_chimney(buffer: &mut Buffer, x: u16, width: u16, top: u16, roof_y: u16
 
 fn render_santa(buffer: &mut Buffer, center: i32, chimney_top: u16, frame: u64) {
     let top = i32::from(chimney_top).saturating_sub(7);
-    let left = center - 12;
-    let hand_high = frame.is_multiple_of(2);
+    let left = center - 13;
+    let hand_out = frame.is_multiple_of(2);
     let red = pane_style()
         .fg(THEME_RED_HOVER)
         .add_modifier(Modifier::BOLD);
@@ -7048,27 +7049,33 @@ fn render_santa(buffer: &mut Buffer, center: i32, chimney_top: u16, frame: u64) 
     let gold = pane_style()
         .fg(THEME_GOLD_HOVER)
         .add_modifier(Modifier::BOLD);
+    let face = Style::default()
+        .fg(THEME_BLACK)
+        .bg(THEME_SKIN)
+        .add_modifier(Modifier::BOLD);
 
-    render_scene_text_clipped(buffer, left + 6, top, "◢████████◣", red);
-    render_scene_text_clipped(buffer, left + 16, top, "●", snow);
-    render_scene_text_clipped(buffer, left + 4, top + 1, "▔▔▔▔▔▔▔▔▔▔▔▔▔", snow);
-    render_scene_text_clipped(buffer, left + 8, top + 2, "(•‿•)", snow);
-    render_scene_text_clipped(buffer, left + 6, top + 3, "╭██████╮", snow);
-    render_scene_text_clipped(buffer, left + 4, top + 4, "╭╯██████╰╮", snow);
-    render_scene_text_clipped(buffer, left + 1, top + 5, "╭██████████████╮", red);
-    render_scene_text_clipped(buffer, left, top + 6, "╱███████", red);
-    render_scene_text_clipped(buffer, left + 8, top + 6, "╋", gold);
-    render_scene_text_clipped(buffer, left + 9, top + 6, "███████╲", red);
-    render_scene_text_clipped(buffer, left + 3, top + 7, "██████████████", red);
+    render_scene_text_clipped(buffer, left + 6, top, "◢█████████◣", red);
+    render_scene_text_clipped(buffer, left + 17, top, "●", snow);
+    render_scene_text_clipped(buffer, left + 4, top + 1, "▔▔▔▔▔▔▔▔▔▔▔▔▔▔", snow);
+    render_scene_text_clipped(buffer, left + 7, top + 2, " ●   ● ", face);
+    render_scene_text_clipped(buffer, left + 6, top + 3, "╭  ‿  ╮", face);
+    render_scene_text_clipped(buffer, left + 5, top + 3, "╭", snow);
+    render_scene_text_clipped(buffer, left + 14, top + 3, "╮", snow);
+    render_scene_text_clipped(buffer, left + 5, top + 4, "╭████████╮", snow);
+    render_scene_text_clipped(buffer, left + 3, top + 5, "╭╯████████╰╮", snow);
+    render_scene_text_clipped(buffer, left + 1, top + 6, "╭████████████████╮", red);
+    render_scene_text_clipped(buffer, left + 9, top + 6, "╋", gold);
+    render_scene_text_clipped(buffer, left + 10, top + 6, "╋", gold);
+    render_scene_text_clipped(buffer, left + 4, top + 7, "██████████████", red);
 
-    if hand_high {
-        render_scene_text_clipped(buffer, left + 21, top + 1, "●", snow);
-        render_scene_text_clipped(buffer, left + 20, top + 2, "╱", red);
-        render_scene_text_clipped(buffer, left + 19, top + 3, "╱", red);
+    render_scene_text_clipped(buffer, left + 18, top + 6, "╲", red);
+    render_scene_text_clipped(buffer, left + 19, top + 5, "╲", red);
+    if hand_out {
+        render_scene_text_clipped(buffer, left + 21, top + 3, "●", snow);
+        render_scene_text_clipped(buffer, left + 20, top + 4, "╲", red);
     } else {
-        render_scene_text_clipped(buffer, left + 20, top + 4, "●", snow);
-        render_scene_text_clipped(buffer, left + 19, top + 5, "╱", red);
-        render_scene_text_clipped(buffer, left + 18, top + 6, "╱", red);
+        render_scene_text_clipped(buffer, left + 19, top + 3, "●", snow);
+        render_scene_text_clipped(buffer, left + 20, top + 4, "╱", red);
     }
 }
 
@@ -11011,8 +11018,10 @@ mod tests {
 
         let high_text = buffer_text(&high_wave, area);
         let low_text = buffer_text(&low_wave, area);
-        assert!(high_text.contains("(•‿•)"));
-        assert!(low_text.contains("(•‿•)"));
+        assert!(high_text.contains("●   ●"));
+        assert!(high_text.contains("╭  ‿  ╮"));
+        assert!(low_text.contains("●   ●"));
+        assert!(low_text.contains("╭  ‿  ╮"));
         assert_ne!(high_text, low_text);
     }
 
@@ -11024,8 +11033,8 @@ mod tests {
         render_santa_scene(area, 0, &mut buffer);
 
         let text = buffer_text(&buffer, area);
-        assert!(text.contains("◢████████◣"));
-        assert!(text.contains("╭██████████████╮"));
+        assert!(text.contains("◢█████████◣"));
+        assert!(text.contains("╭████████"));
         assert!(text.contains("▀▀▀▀▀"));
     }
 
