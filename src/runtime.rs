@@ -7060,12 +7060,14 @@ fn render_skating_scene(area: Rect, seed: u64, frame: u64, buffer: &mut Buffer) 
         return;
     }
 
-    let lake_height = if area.height >= 13 {
-        5
+    let lake_height = if area.height >= 18 {
+        ((u32::from(area.height) * 2) / 5).clamp(7, 10) as u16
+    } else if area.height >= 13 {
+        6
     } else if area.height >= 10 {
-        4
+        5
     } else {
-        3
+        4
     };
     let lake_y = area.bottom().saturating_sub(lake_height);
     let snowbank_y = lake_y.saturating_sub(1);
@@ -7172,14 +7174,15 @@ fn render_frozen_lake(area: Rect, lake_y: u16, buffer: &mut Buffer) {
         }
     }
 
+    // Keep the rink edge blue so skaters never visually collide with a white shoreline.
     for column in 0..area.width {
         let x = area.x + column;
         paint_scene_cell(
             buffer,
             i32::from(x),
             lake_y,
-            "▄",
-            Style::default().fg(THEME_SNOW).bg(THEME_ICE_DARK),
+            " ",
+            Style::default().fg(THEME_BLACK).bg(THEME_ICE_DARK),
         );
     }
 }
@@ -7195,21 +7198,20 @@ fn render_skating_tracks(area: Rect, lake_y: u16, seed: u64, buffer: &mut Buffer
         let value = mix_scene_seed(seed, index as u64, 0x1ced_1a4e_u64);
         let y = lake_y + 1 + (value % u64::from(available_height.saturating_sub(1))) as u16;
         let x = area.x + (value % u64::from(area.width.saturating_sub(4))) as u16;
-        let symbol = if value & 1 == 0 { "╱" } else { "╲" };
         render_scene_text_clipped(
             buffer,
             i32::from(x),
             i32::from(y),
-            symbol,
-            Style::default().fg(THEME_SNOW).bg(THEME_ICE_DARK),
+            "·",
+            Style::default().fg(THEME_ICE),
         );
         if x + 3 < area.right() {
             render_scene_text_clipped(
                 buffer,
                 i32::from(x + 2),
                 i32::from(y),
-                "─",
-                Style::default().fg(THEME_SNOW).bg(THEME_ICE_DARK),
+                "·",
+                Style::default().fg(THEME_ICE),
             );
         }
     }
@@ -7221,15 +7223,24 @@ fn render_skaters(area: Rect, lake_y: u16, seed: u64, frame: u64, buffer: &mut B
         return;
     }
 
-    let skater_count = usize::from((area.width / 18).clamp(2, 3));
+    let first_lane = lake_y.saturating_add(3);
+    let last_lane = area.bottom().saturating_sub(1);
+    if first_lane > last_lane {
+        return;
+    }
+    let lane_slots = usize::from((last_lane - first_lane) / 2 + 1);
+    let width_slots = usize::from((area.width / 24).clamp(1, 3));
+    let skater_count = width_slots.min(lane_slots).max(1);
     let path_span = i32::from(area.width.saturating_sub(8).max(1));
     let path_period = (path_span * 2).max(1);
+    let mut skaters = Vec::with_capacity(skater_count);
     for index in 0..skater_count {
         let value = mix_scene_seed(seed, index as u64, 0x5ca7_1ace_u64);
-        let lane_count = available_height.saturating_sub(2).max(1);
-        let foot_y = lake_y + 1 + ((index as u16 * 2) % lane_count);
+        let foot_y = first_lane + index as u16 * 2;
         let phase = frame + index as u64;
-        let offset = (value % path_span as u64) as i32 + index as i32 * 7;
+        let spacing = path_period / i32::try_from(skater_count).unwrap_or(1).max(1);
+        let drift = (value % 5) as i32 - 2;
+        let offset = index as i32 * spacing + drift;
         let progress = ((frame as i32 + offset).rem_euclid(path_period)).min(path_period);
         let local_x = if progress <= path_span {
             progress
@@ -7238,6 +7249,11 @@ fn render_skaters(area: Rect, lake_y: u16, seed: u64, frame: u64, buffer: &mut B
         };
         let x = i32::from(area.x) + 2 + local_x;
         let direction = if progress <= path_span { 1 } else { -1 };
+        skaters.push((foot_y, x, phase, direction));
+    }
+
+    skaters.sort_by_key(|(foot_y, ..)| *foot_y);
+    for (foot_y, x, phase, direction) in skaters {
         render_skater(buffer, x, foot_y, phase, direction);
     }
 }
@@ -7246,37 +7262,33 @@ fn render_skater(buffer: &mut Buffer, x: i32, foot_y: u16, phase: u64, direction
     let head_y = i32::from(foot_y).saturating_sub(2);
     let body_y = i32::from(foot_y).saturating_sub(1);
     let foot_y = i32::from(foot_y);
-    let red = pane_style()
+    let red = Style::default()
         .fg(THEME_RED_HOVER)
-        .bg(THEME_ICE_DARK)
         .add_modifier(Modifier::BOLD);
-    let gold = pane_style()
+    let gold = Style::default()
         .fg(THEME_GOLD_HOVER)
-        .bg(THEME_ICE_DARK)
         .add_modifier(Modifier::BOLD);
-    let snow = Style::default()
-        .fg(THEME_SNOW)
-        .bg(THEME_ICE_DARK)
-        .add_modifier(Modifier::BOLD);
+    let snow = Style::default().fg(THEME_SNOW).add_modifier(Modifier::BOLD);
 
     let scarf_x = if direction >= 0 { x - 1 } else { x + 3 };
     render_scene_text_clipped(buffer, scarf_x, body_y, "~", red);
+    let body = if direction >= 0 { "/█>" } else { "<█\\" };
     render_scene_text_clipped(buffer, x + 1, head_y, "o", snow);
-    render_scene_text_clipped(buffer, x, body_y, "/█\\", gold);
+    render_scene_text_clipped(buffer, x, body_y, body, gold);
 
-    let stride = if phase.is_multiple_of(2) {
-        if direction >= 0 { "╱ ╲" } else { "╲ ╱" }
+    let (leg_x, stride) = if phase.is_multiple_of(2) {
+        (x + 1, "║")
     } else if direction >= 0 {
-        "─╱ "
+        (x, "/|")
     } else {
-        " ╲─"
+        (x + 1, "|\\")
     };
     render_scene_text_clipped(
         buffer,
-        x,
+        leg_x,
         foot_y,
         stride,
-        Style::default().fg(THEME_SNOW).bg(THEME_ICE_DARK),
+        Style::default().fg(THEME_SNOW),
     );
 }
 
@@ -10803,7 +10815,101 @@ mod tests {
         let text = buffer_text(&buffer, area);
         assert!(text.contains('o'));
         assert!(text.contains("─"));
-        assert!(text.contains("╱") || text.contains("╲"));
+        assert!(text.contains('║') || text.contains("/|") || text.contains("|\\"));
+    }
+
+    #[test]
+    fn skating_tracks_do_not_look_like_extra_legs() {
+        let area = Rect::new(0, 0, 34, 8);
+        let lake_y = 4;
+        let mut buffer = Buffer::empty(area);
+
+        render_frozen_lake(area, lake_y, &mut buffer);
+        render_skating_tracks(area, lake_y, 42, &mut buffer);
+
+        let text = buffer_text(&buffer, area);
+        assert!(text.contains('·'));
+        assert!(!text.contains('╱'));
+        assert!(!text.contains('╲'));
+    }
+
+    #[test]
+    fn skater_sprite_preserves_existing_backgrounds() {
+        let area = Rect::new(0, 0, 12, 6);
+        let mut buffer = Buffer::empty(area);
+
+        buffer[(6, 2)].set_bg(THEME_PANEL);
+        for x in 5..=7 {
+            buffer[(x, 3)].set_bg(THEME_ICE);
+        }
+        buffer[(6, 4)].set_bg(THEME_ICE);
+
+        render_skater(&mut buffer, 5, 4, 0, 1);
+
+        assert_eq!(buffer[(6, 2)].symbol(), "o");
+        assert_eq!(buffer[(6, 2)].bg, THEME_PANEL);
+        for x in 5..=7 {
+            assert_ne!(buffer[(x, 3)].symbol(), " ");
+            assert_eq!(buffer[(x, 3)].bg, THEME_ICE);
+        }
+        assert_eq!(buffer[(6, 4)].symbol(), "║");
+        assert_eq!(buffer[(6, 4)].bg, THEME_ICE);
+    }
+
+    #[test]
+    fn skating_tracks_preserve_ice_backgrounds() {
+        let area = Rect::new(0, 0, 34, 8);
+        let lake_y = 4;
+        let mut buffer = Buffer::empty(area);
+
+        render_frozen_lake(area, lake_y, &mut buffer);
+        let mut before = Vec::new();
+        for y in lake_y..area.bottom() {
+            for x in area.x..area.right() {
+                before.push((x, y, buffer[(x, y)].bg));
+            }
+        }
+
+        render_skating_tracks(area, lake_y, 42, &mut buffer);
+
+        for (x, y, bg) in before {
+            assert_eq!(
+                buffer[(x, y)].bg,
+                bg,
+                "track changed ice background at ({x}, {y})"
+            );
+        }
+    }
+
+    #[test]
+    fn skating_scene_keeps_heads_visible_while_skaters_pass() {
+        let area = Rect::new(0, 0, 58, 20);
+
+        for frame in 0..120 {
+            let mut buffer = Buffer::empty(area);
+            render_skating_scene(area, 42, frame, &mut buffer);
+
+            assert_eq!(
+                skater_head_positions(&buffer, area).len(),
+                2,
+                "frame {frame} lost a skater head"
+            );
+        }
+    }
+
+    #[test]
+    fn skating_scene_keeps_heads_on_ice() {
+        let area = Rect::new(0, 0, 58, 20);
+        let mut buffer = Buffer::empty(area);
+
+        render_skating_scene(area, 42, 0, &mut buffer);
+
+        for (x, y) in skater_head_positions(&buffer, area) {
+            assert!(
+                matches!(buffer[(x, y)].bg, THEME_ICE | THEME_ICE_DARK),
+                "skater head at ({x}, {y}) was not on ice"
+            );
+        }
     }
 
     #[test]
