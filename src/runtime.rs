@@ -7068,14 +7068,14 @@ fn render_santa(buffer: &mut Buffer, center: i32, chimney_top: u16, frame: u64) 
     render_scene_text_clipped(buffer, left + 10, top + 6, "╋", gold);
     render_scene_text_clipped(buffer, left + 4, top + 7, "██████████████", red);
 
-    render_scene_text_clipped(buffer, left + 18, top + 6, "╲", red);
-    render_scene_text_clipped(buffer, left + 19, top + 5, "╲", red);
+    render_scene_text_clipped(buffer, left + 18, top + 5, "◢◤", red);
+    render_scene_text_clipped(buffer, left + 18, top + 6, "◤", red);
     if hand_out {
         render_scene_text_clipped(buffer, left + 21, top + 3, "●", snow);
-        render_scene_text_clipped(buffer, left + 20, top + 4, "╲", red);
+        render_scene_text_clipped(buffer, left + 19, top + 4, "◢◤", red);
     } else {
         render_scene_text_clipped(buffer, left + 19, top + 3, "●", snow);
-        render_scene_text_clipped(buffer, left + 20, top + 4, "╱", red);
+        render_scene_text_clipped(buffer, left + 19, top + 4, "█", red);
     }
 }
 
@@ -11020,8 +11020,10 @@ mod tests {
         let low_text = buffer_text(&low_wave, area);
         assert!(high_text.contains("●   ●"));
         assert!(high_text.contains("╭  ‿  ╮"));
+        assert!(high_text.contains("◢◤"));
         assert!(low_text.contains("●   ●"));
         assert!(low_text.contains("╭  ‿  ╮"));
+        assert!(low_text.contains("◢◤"));
         assert_ne!(high_text, low_text);
     }
 
