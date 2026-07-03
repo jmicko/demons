@@ -7060,9 +7060,9 @@ fn render_santa(buffer: &mut Buffer, center: i32, chimney_top: u16, frame: u64) 
 
     render_scene_text_clipped(buffer, left + 6, top, "◢█████████◣", red);
     render_scene_text_clipped(buffer, left + 17, top, "●", snow);
-    render_scene_text_clipped(buffer, left + 4, top + 1, "▔▔▔▔", snow);
-    render_scene_text_clipped(buffer, left + 8, top + 1, "▔▔▔▔▔", brim_on_face);
-    render_scene_text_clipped(buffer, left + 13, top + 1, "▔▔▔▔▔", snow);
+    render_scene_text_clipped(buffer, left + 4, top + 1, "▔▔▔", snow);
+    render_scene_text_clipped(buffer, left + 7, top + 1, "▔▔▔▔▔▔▔", brim_on_face);
+    render_scene_text_clipped(buffer, left + 14, top + 1, "▔▔▔▔", snow);
     render_scene_text_clipped(buffer, left + 7, top + 2, " ●   ● ", face);
     render_scene_text_clipped(buffer, left + 6, top + 3, "╭  ‿  ╮", face);
     render_scene_text_clipped(buffer, left + 5, top + 3, "╭", snow);
@@ -11044,7 +11044,9 @@ mod tests {
         assert!(text.contains("◢█████████◣"));
         assert!(text.contains("╭████████"));
         assert!(text.contains("▀▀▀▀▀"));
+        assert_eq!(buffer[(12, 1)].bg, THEME_SKIN);
         assert_eq!(buffer[(15, 1)].bg, THEME_SKIN);
+        assert_eq!(buffer[(18, 1)].bg, THEME_SKIN);
         assert_ne!(buffer[(11, 1)].bg, THEME_SKIN);
     }
 
