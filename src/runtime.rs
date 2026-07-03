@@ -7105,7 +7105,7 @@ fn render_skating_scene(area: Rect, seed: u64, frame: u64, buffer: &mut Buffer) 
     render_skating_sky(area, snowbank_y, seed, frame, buffer);
     render_skating_snow(area, snowbank_y, buffer);
     render_skating_pines(area, snowbank_y, seed, buffer);
-    render_frozen_lake(area, lake_y, buffer);
+    render_frozen_lake(area, lake_y, seed, buffer);
     render_skating_tracks(area, lake_y, seed, buffer);
     render_skaters(area, lake_y, seed, frame, buffer);
 }
@@ -7185,11 +7185,17 @@ fn render_skating_pines(area: Rect, snowbank_y: u16, seed: u64, buffer: &mut Buf
     }
 }
 
-fn render_frozen_lake(area: Rect, lake_y: u16, buffer: &mut Buffer) {
+fn render_frozen_lake(area: Rect, lake_y: u16, seed: u64, buffer: &mut Buffer) {
     for y in lake_y..area.bottom() {
         for column in 0..area.width {
             let x = area.x + column;
-            let ice = if (column * 3 + y) % 17 == 0 {
+            let row = y.saturating_sub(lake_y);
+            let value = mix_scene_seed(
+                seed,
+                u64::from(row) << 32 | u64::from(column),
+                0x1ce_5ca7e_u64,
+            );
+            let ice = if row > 0 && value % 73 == 0 {
                 THEME_ICE
             } else {
                 THEME_ICE_DARK
@@ -10854,7 +10860,7 @@ mod tests {
         let lake_y = 4;
         let mut buffer = Buffer::empty(area);
 
-        render_frozen_lake(area, lake_y, &mut buffer);
+        render_frozen_lake(area, lake_y, 42, &mut buffer);
         render_skating_tracks(area, lake_y, 42, &mut buffer);
 
         let text = buffer_text(&buffer, area);
@@ -10892,7 +10898,7 @@ mod tests {
         let lake_y = 4;
         let mut buffer = Buffer::empty(area);
 
-        render_frozen_lake(area, lake_y, &mut buffer);
+        render_frozen_lake(area, lake_y, 42, &mut buffer);
         let mut before = Vec::new();
         for y in lake_y..area.bottom() {
             for x in area.x..area.right() {
@@ -10909,6 +10915,25 @@ mod tests {
                 "track changed ice background at ({x}, {y})"
             );
         }
+    }
+
+    #[test]
+    fn frozen_lake_uses_sparse_seeded_ice_highlights() {
+        let area = Rect::new(0, 0, 58, 20);
+        let lake_y = 12;
+        let mut first = Buffer::empty(area);
+        let mut second = Buffer::empty(area);
+
+        render_frozen_lake(area, lake_y, 42, &mut first);
+        render_frozen_lake(area, lake_y, 99, &mut second);
+
+        let first_highlights = ice_highlight_positions(&first, area, lake_y);
+        let second_highlights = ice_highlight_positions(&second, area, lake_y);
+        let lake_cells =
+            usize::from(area.width) * usize::from(area.bottom().saturating_sub(lake_y + 1));
+
+        assert!(first_highlights.len() < lake_cells / 30);
+        assert_ne!(first_highlights, second_highlights);
     }
 
     #[test]
@@ -12351,6 +12376,18 @@ mod tests {
         for row in area.y..area.bottom() {
             for column in area.x..area.right() {
                 if buffer[(column, row)].symbol() == "o" {
+                    positions.push((column, row));
+                }
+            }
+        }
+        positions
+    }
+
+    fn ice_highlight_positions(buffer: &Buffer, area: Rect, lake_y: u16) -> Vec<(u16, u16)> {
+        let mut positions = Vec::new();
+        for row in lake_y.saturating_add(1)..area.bottom() {
+            for column in area.x..area.right() {
+                if buffer[(column, row)].bg == THEME_ICE {
                     positions.push((column, row));
                 }
             }
