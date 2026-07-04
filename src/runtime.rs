@@ -7186,7 +7186,7 @@ fn render_skating_pines(area: Rect, snowbank_y: u16, seed: u64, buffer: &mut Buf
 }
 
 fn render_frozen_lake(area: Rect, lake_y: u16, seed: u64, buffer: &mut Buffer) {
-    for y in lake_y.saturating_add(1)..area.bottom() {
+    for y in lake_y..area.bottom() {
         let snow_width = skating_snow_width(area, lake_y, y);
         for column in 0..area.width {
             let x = area.x + column;
@@ -7202,7 +7202,7 @@ fn render_frozen_lake(area: Rect, lake_y: u16, seed: u64, buffer: &mut Buffer) {
             } else {
                 THEME_ICE_DARK
             };
-            if row > 0 && column < snow_width {
+            if column < snow_width {
                 paint_scene_cell(
                     buffer,
                     i32::from(x),
@@ -7210,7 +7210,7 @@ fn render_frozen_lake(area: Rect, lake_y: u16, seed: u64, buffer: &mut Buffer) {
                     " ",
                     Style::default().fg(THEME_BLACK).bg(THEME_SNOW),
                 );
-            } else if row > 0 && column == snow_width && snow_width > 0 {
+            } else if column == snow_width && snow_width > 0 {
                 paint_scene_cell(
                     buffer,
                     i32::from(x),
@@ -7229,54 +7229,22 @@ fn render_frozen_lake(area: Rect, lake_y: u16, seed: u64, buffer: &mut Buffer) {
             }
         }
     }
-
-    let top_snow_width = area.width / 4;
-    for column in 0..area.width {
-        let x = area.x + column;
-        if column < top_snow_width {
-            paint_scene_cell(
-                buffer,
-                i32::from(x),
-                lake_y,
-                " ",
-                Style::default().fg(THEME_BLACK).bg(THEME_SNOW),
-            );
-        } else if column == top_snow_width && top_snow_width > 0 {
-            paint_scene_cell(
-                buffer,
-                i32::from(x),
-                lake_y,
-                "▌",
-                Style::default().fg(THEME_SNOW).bg(THEME_ICE_DARK),
-            );
-        } else {
-            paint_scene_cell(
-                buffer,
-                i32::from(x),
-                lake_y,
-                " ",
-                Style::default().fg(THEME_BLACK).bg(THEME_ICE_DARK),
-            );
-        }
-    }
 }
 
 fn skating_snow_width(area: Rect, lake_y: u16, y: u16) -> u16 {
-    if y <= lake_y {
+    if y < lake_y {
         return 0;
     }
     let max_width = area.width / 4;
     if max_width == 0 {
         return 0;
     }
-    let lake_rows = area
+    let curve_rows = area
         .bottom()
         .saturating_sub(lake_y)
         .saturating_sub(1)
         .max(1);
-    let row = y.saturating_sub(lake_y).min(lake_rows);
-    let curve_rows = lake_rows.saturating_sub(1).max(1);
-    let curve_row = row.saturating_sub(1).min(curve_rows);
+    let curve_row = y.saturating_sub(lake_y).min(curve_rows);
     let midpoint = u32::from(curve_rows);
     let distance_from_middle = u32::from(curve_row.saturating_mul(2)).abs_diff(midpoint);
     let max_width = u32::from(max_width);
@@ -7284,11 +7252,6 @@ fn skating_snow_width(area: Rect, lake_y: u16, y: u16) -> u16 {
         .saturating_mul(distance_from_middle)
         .saturating_mul(max_width.saturating_sub(1))
         / midpoint.saturating_mul(midpoint).max(1);
-    let curved = if row == 1 && lake_rows > 2 {
-        curved.saturating_sub(1)
-    } else {
-        curved
-    };
     u16::try_from(curved).unwrap_or(u16::MAX)
 }
 
@@ -11034,11 +10997,7 @@ mod tests {
                 snow_cells <= usize::from(max_snow_width),
                 "row {y} used {snow_cells} snow cells"
             );
-            let snow_width = if y == lake_y {
-                area.width / 4
-            } else {
-                skating_snow_width(area, lake_y, y)
-            };
+            let snow_width = skating_snow_width(area, lake_y, y);
             let edge = area.x + snow_width;
             assert_eq!(buffer[(edge, y)].symbol(), "▌");
         }
@@ -11048,16 +11007,24 @@ mod tests {
     fn frozen_lake_snowbank_uses_concave_curve() {
         let area = Rect::new(0, 0, 60, 20);
         let lake_y = 12;
-        let top_shelf_width = area.width / 4;
-        let first_curve_width = skating_snow_width(area, lake_y, lake_y + 1);
+        let top_width = skating_snow_width(area, lake_y, lake_y);
+        let next_width = skating_snow_width(area, lake_y, lake_y + 1);
         let mid_width = skating_snow_width(area, lake_y, lake_y + 4);
         let bottom_width = skating_snow_width(area, lake_y, area.bottom() - 1);
 
-        assert_eq!(first_curve_width + 1, top_shelf_width);
+        assert_eq!(top_width, area.width / 4);
         assert_eq!(bottom_width, area.width / 4);
         assert!(
-            mid_width < top_shelf_width / 2,
-            "middle width {mid_width} should pinch below half of top shelf width {top_shelf_width}"
+            next_width < top_width,
+            "row below top width {next_width} should be shorter than top width {top_width}"
+        );
+        assert!(
+            mid_width < next_width,
+            "middle width {mid_width} should pinch below next width {next_width}"
+        );
+        assert!(
+            mid_width < top_width / 2,
+            "middle width {mid_width} should pinch below half of top width {top_width}"
         );
         assert!(
             mid_width < bottom_width / 2,
