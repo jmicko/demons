@@ -7257,10 +7257,15 @@ fn skating_snow_width(area: Rect, lake_y: u16, y: u16) -> u16 {
         .saturating_sub(1)
         .max(1);
     let row = y.saturating_sub(lake_y).min(lake_rows);
-    let row = u32::from(row);
-    let lake_rows = u32::from(lake_rows);
+    let curve_rows = lake_rows.saturating_sub(1).max(1);
+    let curve_row = row.saturating_sub(1).min(curve_rows);
+    let midpoint = u32::from(curve_rows);
+    let distance_from_middle = u32::from(curve_row.saturating_mul(2)).abs_diff(midpoint);
     let max_width = u32::from(max_width);
-    let curved = 1 + row * row * max_width.saturating_sub(1) / (lake_rows * lake_rows);
+    let curved = 1 + distance_from_middle
+        .saturating_mul(distance_from_middle)
+        .saturating_mul(max_width.saturating_sub(1))
+        / midpoint.saturating_mul(midpoint).max(1);
     u16::try_from(curved).unwrap_or(u16::MAX)
 }
 
@@ -11019,14 +11024,15 @@ mod tests {
         let mid_width = skating_snow_width(area, lake_y, lake_y + 4);
         let bottom_width = skating_snow_width(area, lake_y, area.bottom() - 1);
 
+        assert_eq!(top_width, area.width / 4);
         assert_eq!(bottom_width, area.width / 4);
         assert!(
-            mid_width < bottom_width / 2,
-            "midpoint width {mid_width} should stay below half of bottom width {bottom_width}"
+            mid_width < top_width / 2,
+            "middle width {mid_width} should pinch below half of top width {top_width}"
         );
         assert!(
-            mid_width.saturating_sub(top_width) < bottom_width.saturating_sub(mid_width),
-            "snowbank should accelerate outward instead of forming a straight diagonal"
+            mid_width < bottom_width / 2,
+            "middle width {mid_width} should pinch below half of bottom width {bottom_width}"
         );
     }
 
