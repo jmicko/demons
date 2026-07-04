@@ -92,7 +92,6 @@ const ROAD_CAR_SPEED: u64 = 4;
 const ROAD_CAR_OFFSCREEN_PAD: i32 = 5;
 const ROAD_CAR_FRONT_LEFT_OFFSET: i32 = 1;
 const ROAD_CAR_FRONT_RIGHT_OFFSET: i32 = 12;
-const LADDER_LEAN_SEQUENCE: [i32; 8] = [-3, -2, 0, 2, 3, 2, 0, -2];
 
 type ProcessRegistry = Arc<Mutex<HashSet<u32>>>;
 
@@ -106,7 +105,6 @@ enum SceneKind {
     Skating,
     Sleigh,
     Road,
-    Ladder,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -203,7 +201,6 @@ fn fitting_scene_kinds(area: Rect) -> Vec<SceneKind> {
         SceneKind::Skating,
         SceneKind::Sleigh,
         SceneKind::Road,
-        SceneKind::Ladder,
     ]
     .into_iter()
     .filter(|kind| scene_fits(*kind, area))
@@ -225,7 +222,6 @@ fn scene_min_size(kind: SceneKind) -> (u16, u16) {
         SceneKind::Skating => (28, 8),
         SceneKind::Sleigh => (34, 8),
         SceneKind::Road => (46, 12),
-        SceneKind::Ladder => (42, 15),
     }
 }
 
@@ -257,7 +253,6 @@ fn parse_dev_scene_kind(value: &str) -> Option<SceneKind> {
         "skate" | "skating" | "lake" | "pond" => Some(SceneKind::Skating),
         "sleigh" | "reindeer" | "rudolph" => Some(SceneKind::Sleigh),
         "road" | "car" | "christmas-car" | "christmas_car" => Some(SceneKind::Road),
-        "ladder" | "lights" | "roof-lights" | "roof_lights" => Some(SceneKind::Ladder),
         _ => None,
     }
 }
@@ -6732,7 +6727,6 @@ fn render_scene(area: Rect, scene: SceneState, frame: u64, buffer: &mut Buffer) 
         SceneKind::Skating => render_skating_scene(area, scene.seed, frame, buffer),
         SceneKind::Sleigh => render_sleigh_scene(area, scene.seed, frame, buffer),
         SceneKind::Road => render_winter_road_scene(area, scene.seed, frame, buffer),
-        SceneKind::Ladder => render_ladder_scene(area, scene.seed, frame, buffer),
     }
 }
 
@@ -7703,451 +7697,6 @@ fn render_car_windows(buffer: &mut Buffer, clip: Rect, x: i32, y: i32) {
         .bg(THEME_RED)
         .add_modifier(Modifier::BOLD);
     render_scene_text_in_rect(buffer, clip, x, y, "▪ ▪", style);
-}
-
-fn render_ladder_scene(area: Rect, seed: u64, frame: u64, buffer: &mut Buffer) {
-    if !scene_fits(SceneKind::Ladder, area) {
-        return;
-    }
-
-    let ground_y = area.bottom().saturating_sub(1);
-    let house = ladder_house_geometry(area, ground_y);
-    render_ladder_sky(area, seed, frame, house.roof_peak_y, buffer);
-    render_ladder_house(area, house, seed, frame, buffer);
-    render_snow_ground(area, ground_y, buffer);
-
-    let ladder_top = house
-        .eave_y
-        .saturating_add(1)
-        .min(ground_y.saturating_sub(4));
-    let ladder_bottom = ground_y.saturating_sub(1);
-    let lean = ladder_lean_for_frame(frame);
-    let bottom_center = i32::from(house.center_x);
-    let top_center = (bottom_center + lean).clamp(
-        i32::from(house.wall_x.saturating_add(4)),
-        i32::from((house.wall_x + house.wall_width).saturating_sub(5)),
-    );
-    let half_width = ladder_half_width(area);
-
-    clear_ladder_channel(
-        buffer,
-        area,
-        top_center,
-        bottom_center,
-        ladder_top,
-        ladder_bottom,
-        half_width,
-    );
-    render_wobbly_ladder(
-        buffer,
-        area,
-        top_center,
-        bottom_center,
-        ladder_top,
-        ladder_bottom,
-        half_width,
-    );
-    render_roof_decorator(
-        buffer,
-        area,
-        frame,
-        lean,
-        top_center,
-        bottom_center,
-        ladder_top,
-        ladder_bottom,
-    );
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct LadderHouseGeometry {
-    wall_x: u16,
-    wall_width: u16,
-    roof_peak_y: u16,
-    eave_y: u16,
-    wall_bottom: u16,
-    center_x: u16,
-}
-
-fn ladder_house_geometry(area: Rect, ground_y: u16) -> LadderHouseGeometry {
-    let wall_width = area.width.saturating_sub(6).clamp(28, 58).min(area.width);
-    let wall_x = area.x + area.width.saturating_sub(wall_width) / 2;
-    let center_x = wall_x + wall_width / 2;
-    let roof_height = ((u32::from(area.height) * 3) / 10).clamp(4, 7) as u16;
-    let eave_y = area
-        .y
-        .saturating_add(roof_height)
-        .saturating_add(2)
-        .min(ground_y.saturating_sub(7));
-    let roof_peak_y = eave_y.saturating_sub(roof_height);
-    LadderHouseGeometry {
-        wall_x,
-        wall_width,
-        roof_peak_y,
-        eave_y,
-        wall_bottom: ground_y.saturating_sub(1),
-        center_x,
-    }
-}
-
-fn ladder_lean_for_frame(frame: u64) -> i32 {
-    LADDER_LEAN_SEQUENCE[(frame as usize) % LADDER_LEAN_SEQUENCE.len()]
-}
-
-fn render_ladder_sky(area: Rect, seed: u64, frame: u64, roof_peak_y: u16, buffer: &mut Buffer) {
-    if roof_peak_y <= area.y {
-        return;
-    }
-    let sky_height = roof_peak_y.saturating_sub(area.y).max(1);
-    let flakes = usize::from((area.width / 10).clamp(3, 12));
-    for index in 0..flakes {
-        let value = mix_scene_seed(seed, index as u64, 0x1add_e212_u64);
-        let x = area.x
-            + (((index as u64 * u64::from(area.width)) / flakes as u64 + value % 5)
-                % u64::from(area.width)) as u16;
-        let y = area.y + ((value / 19 + frame / 2) % u64::from(sky_height)) as u16;
-        let symbol = if value & 1 == 0 { "·" } else { "*" };
-        paint_scene_cell_in_rect(
-            buffer,
-            area,
-            i32::from(x),
-            y,
-            symbol,
-            pane_style().fg(THEME_SNOW),
-        );
-    }
-}
-
-fn render_ladder_house(
-    area: Rect,
-    house: LadderHouseGeometry,
-    seed: u64,
-    frame: u64,
-    buffer: &mut Buffer,
-) {
-    render_ladder_wall(area, house, seed, frame, buffer);
-    render_ladder_pitched_roof(area, house, seed, frame, buffer);
-    render_ladder_roof_lights(area, house, frame, buffer);
-}
-
-fn render_ladder_wall(
-    area: Rect,
-    house: LadderHouseGeometry,
-    seed: u64,
-    frame: u64,
-    buffer: &mut Buffer,
-) {
-    let wall = Style::default().fg(THEME_LOG_DARK).bg(THEME_LOG_DARK);
-    let trim = Style::default().fg(THEME_LOG).bg(THEME_LOG_DARK);
-    let wall_top = house.eave_y.saturating_add(1);
-    for y in wall_top..=house.wall_bottom {
-        for offset in 0..house.wall_width {
-            let x = house.wall_x + offset;
-            paint_scene_cell_in_rect(buffer, area, i32::from(x), y, " ", wall);
-            if offset % 7 == 0 {
-                paint_scene_cell_in_rect(buffer, area, i32::from(x), y, "▏", trim);
-            }
-        }
-    }
-
-    render_ladder_window(area, house, seed, frame, buffer);
-}
-
-fn render_ladder_window(
-    area: Rect,
-    house: LadderHouseGeometry,
-    seed: u64,
-    frame: u64,
-    buffer: &mut Buffer,
-) {
-    if house.wall_width < 24 || house.wall_bottom <= house.eave_y + 4 {
-        return;
-    }
-
-    let window_x = house.wall_x + house.wall_width / 5;
-    let window_y = house.eave_y + 3;
-    let glow = if (frame / 3 + seed).is_multiple_of(2) {
-        THEME_GOLD_HOVER
-    } else {
-        THEME_HEADLIGHT
-    };
-    let glass = Style::default().fg(glow).bg(glow);
-    let frame_style = Style::default().fg(THEME_SNOW).bg(THEME_LOG_DARK);
-    render_scene_text_in_rect(
-        buffer,
-        area,
-        i32::from(window_x),
-        i32::from(window_y),
-        "╔══╗",
-        frame_style,
-    );
-    for row in 1..=2 {
-        for column in 1..=2 {
-            paint_scene_cell_in_rect(
-                buffer,
-                area,
-                i32::from(window_x + column),
-                window_y + row,
-                " ",
-                glass,
-            );
-        }
-        paint_scene_cell_in_rect(
-            buffer,
-            area,
-            i32::from(window_x),
-            window_y + row,
-            "║",
-            frame_style,
-        );
-        paint_scene_cell_in_rect(
-            buffer,
-            area,
-            i32::from(window_x + 3),
-            window_y + row,
-            "║",
-            frame_style,
-        );
-    }
-    render_scene_text_in_rect(
-        buffer,
-        area,
-        i32::from(window_x),
-        i32::from(window_y + 3),
-        "╚══╝",
-        frame_style,
-    );
-}
-
-fn render_ladder_pitched_roof(
-    area: Rect,
-    house: LadderHouseGeometry,
-    seed: u64,
-    _frame: u64,
-    buffer: &mut Buffer,
-) {
-    let snow = pane_style().fg(THEME_SNOW).add_modifier(Modifier::BOLD);
-    let roof = pane_style().fg(THEME_RED).add_modifier(Modifier::BOLD);
-    let roof_shadow = pane_style()
-        .fg(THEME_RED_HOVER)
-        .add_modifier(Modifier::BOLD);
-    let eave_style = Style::default().fg(THEME_LOG_DARK).bg(THEME_LOG_DARK);
-    let roof_height = house.eave_y.saturating_sub(house.roof_peak_y).max(1);
-    for row in 0..=roof_height {
-        let y = house.roof_peak_y + row;
-        let half = ((u32::from(row) * u32::from(house.wall_width / 2)) / u32::from(roof_height))
-            .max(1) as u16;
-        let left = i32::from(house.center_x).saturating_sub(i32::from(half));
-        let right = i32::from(house.center_x).saturating_add(i32::from(half));
-        for x in left..=right {
-            let edge = x == left || x == right;
-            let style = if edge {
-                snow
-            } else if (x + i32::from(row)).rem_euclid(5) == 0 {
-                roof_shadow
-            } else {
-                roof
-            };
-            let symbol = if edge {
-                if x == left { "◢" } else { "◣" }
-            } else {
-                "█"
-            };
-            paint_scene_cell_in_rect(buffer, area, x, y, symbol, style);
-        }
-    }
-
-    for offset in 0..house.wall_width {
-        let x = house.wall_x + offset;
-        let value = mix_scene_seed(seed, u64::from(offset), 0x500f_u64);
-        let symbol = if value.is_multiple_of(5) {
-            "█"
-        } else {
-            "▀"
-        };
-        paint_scene_cell_in_rect(buffer, area, i32::from(x), house.eave_y, symbol, snow);
-        if house.eave_y + 1 < area.bottom() {
-            paint_scene_cell_in_rect(
-                buffer,
-                area,
-                i32::from(x),
-                house.eave_y + 1,
-                " ",
-                eave_style,
-            );
-        }
-    }
-}
-
-fn render_ladder_roof_lights(
-    area: Rect,
-    house: LadderHouseGeometry,
-    frame: u64,
-    buffer: &mut Buffer,
-) {
-    let cable = pane_style().fg(THEME_HOLLY);
-    let lights_y = house.eave_y.saturating_add(1);
-    if lights_y >= area.bottom() {
-        return;
-    }
-    for offset in 0..house.wall_width {
-        paint_scene_cell_in_rect(
-            buffer,
-            area,
-            i32::from(house.wall_x + offset),
-            lights_y,
-            "─",
-            cable,
-        );
-    }
-
-    for offset in (2..house.wall_width.saturating_sub(1)).step_by(5) {
-        let x = house.wall_x + offset;
-        let lit = (frame / 2 + u64::from(offset)).is_multiple_of(3);
-        let color = match offset % 3 {
-            0 => THEME_RED_HOVER,
-            1 => THEME_GOLD_HOVER,
-            _ => THEME_GREEN_HOVER,
-        };
-        let style = pane_style()
-            .fg(if lit { color } else { THEME_HOLLY })
-            .add_modifier(if lit { Modifier::BOLD } else { Modifier::DIM });
-        paint_scene_cell_in_rect(buffer, area, i32::from(x), lights_y, "●", style);
-    }
-}
-
-fn render_wobbly_ladder(
-    buffer: &mut Buffer,
-    clip: Rect,
-    top_center: i32,
-    bottom_center: i32,
-    top_y: u16,
-    bottom_y: u16,
-    half_width: i32,
-) {
-    if bottom_y <= top_y {
-        return;
-    }
-
-    let rail_symbol = "|";
-    let rail = pane_style().fg(THEME_LOG).add_modifier(Modifier::BOLD);
-    let rung = pane_style().fg(THEME_LOG_DARK);
-
-    for y in top_y..=bottom_y {
-        let center = ladder_center_at_y(top_center, bottom_center, top_y, bottom_y, y);
-        let left = center - half_width;
-        let right = center + half_width;
-        if (y - top_y).is_multiple_of(2) && y != top_y && y != bottom_y {
-            for x in left + 1..right {
-                paint_scene_cell_in_rect(buffer, clip, x, y, "─", rung);
-            }
-        }
-        paint_scene_cell_in_rect(buffer, clip, left, y, rail_symbol, rail);
-        paint_scene_cell_in_rect(buffer, clip, right, y, rail_symbol, rail);
-    }
-
-    let foot_y = bottom_y
-        .saturating_add(1)
-        .min(clip.bottom().saturating_sub(1));
-    let left_foot = bottom_center - half_width - 1;
-    let right_foot = bottom_center + half_width;
-    render_scene_text_in_rect(buffer, clip, left_foot, i32::from(foot_y), "▔▔", rung);
-    render_scene_text_in_rect(buffer, clip, right_foot, i32::from(foot_y), "▔▔", rung);
-}
-
-fn ladder_half_width(area: Rect) -> i32 {
-    if area.width >= 46 { 3 } else { 2 }
-}
-
-fn clear_ladder_channel(
-    buffer: &mut Buffer,
-    clip: Rect,
-    top_center: i32,
-    bottom_center: i32,
-    top_y: u16,
-    bottom_y: u16,
-    half_width: i32,
-) {
-    let clear_style = pane_style();
-    for y in top_y..=bottom_y {
-        let center = ladder_center_at_y(top_center, bottom_center, top_y, bottom_y, y);
-        for x in center.saturating_sub(half_width)..=center.saturating_add(half_width) {
-            paint_scene_cell_in_rect(buffer, clip, x, y, " ", clear_style);
-        }
-    }
-}
-
-fn ladder_center_at_y(
-    top_center: i32,
-    bottom_center: i32,
-    top_y: u16,
-    bottom_y: u16,
-    y: u16,
-) -> i32 {
-    let span = i32::from(bottom_y.saturating_sub(top_y)).max(1);
-    let row = i32::from(y.saturating_sub(top_y));
-    top_center + ((bottom_center - top_center) * row) / span
-}
-
-fn render_roof_decorator(
-    buffer: &mut Buffer,
-    clip: Rect,
-    frame: u64,
-    lean: i32,
-    top_center: i32,
-    bottom_center: i32,
-    ladder_top: u16,
-    ladder_bottom: u16,
-) {
-    let torso_y = ladder_top
-        .saturating_add(4)
-        .min(ladder_bottom.saturating_sub(2));
-    let x = ladder_center_at_y(
-        top_center,
-        bottom_center,
-        ladder_top,
-        ladder_bottom,
-        torso_y,
-    );
-    let left = x.saturating_sub(3);
-    let body = pane_style()
-        .fg(THEME_RED_HOVER)
-        .add_modifier(Modifier::BOLD);
-    let skin = pane_style().fg(THEME_SKIN).add_modifier(Modifier::BOLD);
-    let hat = pane_style()
-        .fg(THEME_GOLD_HOVER)
-        .add_modifier(Modifier::BOLD);
-    let light = pane_style()
-        .fg(if frame.is_multiple_of(2) {
-            THEME_GOLD_HOVER
-        } else {
-            THEME_RED_HOVER
-        })
-        .add_modifier(Modifier::BOLD);
-
-    let torso_y_i32 = i32::from(torso_y);
-    render_scene_text_in_rect(buffer, clip, left, torso_y_i32 - 3, "   ▲   ", hat);
-    render_scene_text_in_rect(buffer, clip, left, torso_y_i32 - 2, "  (o)  ", skin);
-    render_scene_text_in_rect(buffer, clip, left + 2, torso_y_i32 - 1, "███", body);
-
-    let light_x = if lean > 0 {
-        left + 5
-    } else if lean < 0 {
-        left + 1
-    } else if frame.is_multiple_of(2) {
-        left + 5
-    } else {
-        left + 1
-    };
-    render_scene_text_in_rect(buffer, clip, light_x, torso_y_i32 - 1, "●", light);
-    render_scene_text_in_rect(
-        buffer,
-        clip,
-        left + 2,
-        torso_y_i32,
-        "║ ║",
-        pane_style().fg(THEME_SNOW),
-    );
 }
 
 fn render_reindeer(buffer: &mut Buffer, clip: Rect, x: i32, top: i32, red_nose: bool, frame: u64) {
@@ -12002,98 +11551,6 @@ mod tests {
     }
 
     #[test]
-    fn ladder_scene_tilts_between_frames() {
-        let area = Rect::new(0, 0, 42, 15);
-        let mut left = Buffer::empty(area);
-        let mut right = Buffer::empty(area);
-
-        render_ladder_scene(area, 42, 0, &mut left);
-        render_ladder_scene(area, 42, 4, &mut right);
-
-        let left_text = buffer_text(&left, area);
-        let right_text = buffer_text(&right, area);
-        assert!(left_text.contains('|'));
-        assert!(!ladder_rail_positions(&left, area).is_empty());
-        assert!(!ladder_rail_positions(&right, area).is_empty());
-        assert_ne!(
-            ladder_rail_positions(&left, area),
-            ladder_rail_positions(&right, area)
-        );
-        assert_ne!(left_text, right_text);
-    }
-
-    #[test]
-    fn ladder_scene_draws_house_lights_and_decorator() {
-        let area = Rect::new(0, 0, 42, 15);
-        let mut buffer = Buffer::empty(area);
-
-        render_ladder_scene(area, 42, 1, &mut buffer);
-
-        let text = buffer_text(&buffer, area);
-        assert!(text.contains('◢'));
-        assert!(text.contains('◣'));
-        assert!(text.contains("╔══╗"));
-        assert!(text.contains('●'));
-        assert!(text.contains('o'));
-        assert!(text.contains('█'));
-        assert!(text.contains('─'));
-        assert!(!text.contains('╲'));
-        assert!(!text.contains('╱'));
-    }
-
-    #[test]
-    fn ladder_roof_lights_blink_without_moving() {
-        let area = Rect::new(0, 0, 42, 15);
-        let house = ladder_house_geometry(area, area.bottom().saturating_sub(1));
-        let mut first = Buffer::empty(area);
-        let mut second = Buffer::empty(area);
-
-        render_ladder_roof_lights(area, house, 0, &mut first);
-        render_ladder_roof_lights(area, house, 2, &mut second);
-
-        assert_eq!(
-            ladder_bulb_positions(&first, area),
-            ladder_bulb_positions(&second, area)
-        );
-        assert_ne!(
-            ladder_bulb_colors(&first, area),
-            ladder_bulb_colors(&second, area)
-        );
-    }
-
-    #[test]
-    fn ladder_roof_snow_stays_fixed_between_frames() {
-        let area = Rect::new(0, 0, 42, 15);
-        let house = ladder_house_geometry(area, area.bottom().saturating_sub(1));
-        let mut first = Buffer::empty(area);
-        let mut second = Buffer::empty(area);
-
-        render_ladder_pitched_roof(area, house, 42, 0, &mut first);
-        render_ladder_pitched_roof(area, house, 42, 9, &mut second);
-
-        assert_eq!(buffer_text(&first, area), buffer_text(&second, area));
-    }
-
-    #[test]
-    fn ladder_scene_clips_to_scene_area() {
-        let scene_area = Rect::new(0, 0, 42, 15);
-        let buffer_area = Rect::new(0, 0, 84, 15);
-        let mut buffer = Buffer::empty(buffer_area);
-
-        render_ladder_scene(scene_area, 42, 3, &mut buffer);
-
-        for y in buffer_area.y..buffer_area.bottom() {
-            for x in scene_area.right()..buffer_area.right() {
-                assert_eq!(
-                    buffer[(x, y)].symbol(),
-                    " ",
-                    "ladder scene leaked into neighboring area at ({x}, {y})"
-                );
-            }
-        }
-    }
-
-    #[test]
     fn santa_scene_waves_between_frames() {
         let area = Rect::new(0, 0, 38, 14);
         let mut low_wave = Buffer::empty(area);
@@ -12255,7 +11712,6 @@ mod tests {
         assert!(choices.contains(&SceneKind::Skating));
         assert!(choices.contains(&SceneKind::Sleigh));
         assert!(choices.contains(&SceneKind::Road));
-        assert!(choices.contains(&SceneKind::Ladder));
     }
 
     #[test]
@@ -12268,7 +11724,6 @@ mod tests {
         assert!(!scene_fits(SceneKind::Snow, compact));
         assert!(!scene_fits(SceneKind::Santa, compact));
         assert!(!scene_fits(SceneKind::Road, Rect::new(0, 0, 45, 12)));
-        assert!(!scene_fits(SceneKind::Ladder, Rect::new(0, 0, 41, 15)));
         assert!(scene_state_for_area(0, too_small, None).is_none());
         assert_eq!(
             scene_state_for_area(0, compact, Some(SceneKind::Snow))
@@ -12289,7 +11744,6 @@ mod tests {
         assert!(choices.contains(&SceneKind::Skating));
         assert!(choices.contains(&SceneKind::Sleigh));
         assert!(choices.contains(&SceneKind::Road));
-        assert!(choices.contains(&SceneKind::Ladder));
     }
 
     #[test]
@@ -12316,8 +11770,6 @@ mod tests {
         assert_eq!(parse_dev_scene_kind("road"), Some(SceneKind::Road));
         assert_eq!(parse_dev_scene_kind("car"), Some(SceneKind::Road));
         assert_eq!(parse_dev_scene_kind("christmas-car"), Some(SceneKind::Road));
-        assert_eq!(parse_dev_scene_kind("ladder"), Some(SceneKind::Ladder));
-        assert_eq!(parse_dev_scene_kind("roof-lights"), Some(SceneKind::Ladder));
     }
 
     #[test]
@@ -13592,44 +13044,6 @@ mod tests {
             }
         }
         positions
-    }
-
-    fn ladder_bulb_positions(buffer: &Buffer, area: Rect) -> Vec<(u16, u16)> {
-        let mut positions = Vec::new();
-        for row in area.y..area.bottom() {
-            for column in area.x..area.right() {
-                if buffer[(column, row)].symbol() == "●" {
-                    positions.push((column, row));
-                }
-            }
-        }
-        positions
-    }
-
-    fn ladder_rail_positions(buffer: &Buffer, area: Rect) -> Vec<(u16, u16)> {
-        let mut positions = Vec::new();
-        for row in area.y..area.bottom() {
-            for column in area.x..area.right() {
-                let cell = &buffer[(column, row)];
-                if cell.symbol() == "|" && cell.fg == THEME_LOG {
-                    positions.push((column, row));
-                }
-            }
-        }
-        positions
-    }
-
-    fn ladder_bulb_colors(buffer: &Buffer, area: Rect) -> Vec<(u16, u16, Color)> {
-        let mut colors = Vec::new();
-        for row in area.y..area.bottom() {
-            for column in area.x..area.right() {
-                let cell = &buffer[(column, row)];
-                if cell.symbol() == "●" {
-                    colors.push((column, row, cell.fg));
-                }
-            }
-        }
-        colors
     }
 
     fn sleigh_star_positions(buffer: &Buffer, area: Rect) -> Vec<(u16, u16)> {
