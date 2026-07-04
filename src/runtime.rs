@@ -7506,7 +7506,7 @@ fn render_jack_scene(area: Rect, seed: u64, frame: u64, buffer: &mut Buffer) {
 
     render_jack_confetti(area, seed, frame, center, box_y, buffer);
     render_jack_box(buffer, box_x, box_y, box_width, box_height, frame);
-    render_jack(buffer, i32::from(center), box_y, frame, large);
+    render_jack(buffer, area, i32::from(center), box_y, frame, large);
 }
 
 fn render_jack_box(buffer: &mut Buffer, x: u16, y: u16, width: u16, height: u16, frame: u64) {
@@ -7614,7 +7614,7 @@ fn render_jack_confetti(
     }
 }
 
-fn render_jack(buffer: &mut Buffer, center: i32, box_y: u16, frame: u64, large: bool) {
+fn render_jack(buffer: &mut Buffer, area: Rect, center: i32, box_y: u16, frame: u64, large: bool) {
     let phase = frame % 10;
     if phase == 0 || phase >= 8 {
         return;
@@ -7622,28 +7622,23 @@ fn render_jack(buffer: &mut Buffer, center: i32, box_y: u16, frame: u64, large: 
 
     let lid_y = i32::from(box_y).saturating_sub(1);
     if large {
-        render_large_jack(buffer, center, lid_y, phase);
+        render_large_jack(buffer, area, center, lid_y, phase);
     } else {
         render_small_jack(buffer, center, lid_y, phase);
     }
 }
 
-fn render_large_jack(buffer: &mut Buffer, center: i32, lid_y: i32, phase: u64) {
+fn render_large_jack(buffer: &mut Buffer, area: Rect, center: i32, lid_y: i32, phase: u64) {
     let left = center - 3;
     let spring_style = pane_style().fg(THEME_GOLD_HOVER);
-    if phase == 1 || phase == 7 {
-        render_scene_text_clipped(buffer, left, lid_y - 2, "  ╱╲   ", spring_style);
-        render_scene_text_clipped(buffer, left, lid_y - 1, "  ╲╱   ", spring_style);
-        render_scene_text_clipped(buffer, left, lid_y, "  ╱╲   ", spring_style);
-        return;
-    }
+    let spring_rows = large_jack_spring_rows(area, lid_y, phase);
+    let body_y = lid_y.saturating_sub(i32::from(spring_rows));
 
     let arms = if phase.is_multiple_of(2) {
         "\\ ███ /"
     } else {
         "/ ███ \\"
     };
-    let top_shift = if phase == 4 { 1 } else { 0 };
     let red = pane_style()
         .fg(THEME_RED_HOVER)
         .add_modifier(Modifier::BOLD);
@@ -7652,14 +7647,42 @@ fn render_large_jack(buffer: &mut Buffer, center: i32, lid_y: i32, phase: u64) {
         .fg(THEME_GOLD_HOVER)
         .add_modifier(Modifier::BOLD);
 
-    render_scene_text_clipped(buffer, left, lid_y - 7 + top_shift, "   ▲   ", gold);
-    render_scene_text_clipped(buffer, left, lid_y - 6 + top_shift, " ╭▔▔▔╮ ", snow);
-    render_scene_text_clipped(buffer, left, lid_y - 5 + top_shift, " (o o) ", snow);
-    render_scene_text_clipped(buffer, left, lid_y - 4 + top_shift, arms, red);
-    render_scene_text_clipped(buffer, left, lid_y - 3 + top_shift, "  ███  ", red);
-    render_scene_text_clipped(buffer, left, lid_y - 2, "  ╱╲   ", spring_style);
-    render_scene_text_clipped(buffer, left, lid_y - 1, "  ╲╱   ", spring_style);
-    render_scene_text_clipped(buffer, left, lid_y, "  ╱╲   ", spring_style);
+    render_scene_text_clipped(buffer, left, body_y - 4, "   ▲   ", gold);
+    render_scene_text_clipped(buffer, left, body_y - 3, " ╭▔▔▔╮ ", snow);
+    render_scene_text_clipped(buffer, left, body_y - 2, " (o o) ", snow);
+    render_scene_text_clipped(buffer, left, body_y - 1, arms, red);
+    render_scene_text_clipped(buffer, left, body_y, "  ███  ", red);
+    render_large_jack_spring(buffer, left, body_y, lid_y, spring_style);
+}
+
+fn large_jack_spring_rows(area: Rect, lid_y: i32, phase: u64) -> u16 {
+    let available = u16::try_from(lid_y.saturating_sub(i32::from(area.y)).saturating_sub(4))
+        .unwrap_or_default();
+    let target = if available <= 3 {
+        3
+    } else {
+        (((u32::from(available) * 4) / 5) as u16).clamp(3, available.min(42))
+    };
+    match phase {
+        1 => (target / 3).max(3),
+        2 => ((u32::from(target) * 2) / 3) as u16,
+        3 | 5 => target,
+        4 => target.saturating_sub(1).max(3),
+        6 => target.saturating_sub(2).max(3),
+        7 => (target / 2).max(3),
+        _ => target,
+    }
+}
+
+fn render_large_jack_spring(buffer: &mut Buffer, left: i32, body_y: i32, lid_y: i32, style: Style) {
+    for y in body_y.saturating_add(1)..=lid_y {
+        let pattern = if (y - body_y) % 2 == 0 {
+            "  ╲╱   "
+        } else {
+            "  ╱╲   "
+        };
+        render_scene_text_clipped(buffer, left, y, pattern, style);
+    }
 }
 
 fn render_small_jack(buffer: &mut Buffer, center: i32, lid_y: i32, phase: u64) {
@@ -11241,6 +11264,35 @@ mod tests {
     }
 
     #[test]
+    fn large_jack_rides_up_as_spring_grows() {
+        let area = Rect::new(0, 0, 36, 28);
+        let mut early = Buffer::empty(area);
+        let mut extended = Buffer::empty(area);
+
+        render_jack_scene(area, 42, 1, &mut early);
+        render_jack_scene(area, 42, 3, &mut extended);
+
+        let early_eyes = jack_eye_rows(&early, area);
+        let extended_eyes = jack_eye_rows(&extended, area);
+        assert!(
+            !early_eyes.is_empty(),
+            "large jack should appear as soon as the spring starts"
+        );
+        assert!(
+            !extended_eyes.is_empty(),
+            "large jack should stay visible on the extended spring"
+        );
+        assert!(
+            extended_eyes[0] < early_eyes[0],
+            "jack should move upward as spring extends"
+        );
+        assert!(
+            spring_glyph_count(&extended, area) > spring_glyph_count(&early, area),
+            "extended phase should draw a longer spring"
+        );
+    }
+
+    #[test]
     fn jack_scene_keeps_open_sprite_attached_to_box() {
         let area = Rect::new(0, 0, 24, 8);
         let mut buffer = Buffer::empty(area);
@@ -12477,6 +12529,34 @@ mod tests {
             }
         }
         text
+    }
+
+    fn jack_eye_rows(buffer: &Buffer, area: Rect) -> Vec<u16> {
+        let mut rows = Vec::new();
+        for row in area.y..area.bottom() {
+            let mut eyes = 0;
+            for column in area.x..area.right() {
+                if buffer[(column, row)].symbol() == "o" {
+                    eyes += 1;
+                }
+            }
+            if eyes >= 2 {
+                rows.push(row);
+            }
+        }
+        rows
+    }
+
+    fn spring_glyph_count(buffer: &Buffer, area: Rect) -> usize {
+        let mut count = 0;
+        for row in area.y..area.bottom() {
+            for column in area.x..area.right() {
+                if matches!(buffer[(column, row)].symbol(), "╱" | "╲") {
+                    count += 1;
+                }
+            }
+        }
+        count
     }
 
     fn snowflake_positions(buffer: &Buffer, area: Rect) -> Vec<(u16, u16, String)> {
