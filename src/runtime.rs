@@ -80,9 +80,16 @@ const THEME_LOG: Color = Color::Rgb(112, 68, 39);
 const THEME_LOG_DARK: Color = Color::Rgb(68, 39, 24);
 const THEME_ICE: Color = Color::Rgb(104, 164, 166);
 const THEME_ICE_DARK: Color = Color::Rgb(64, 115, 123);
+const THEME_ROAD: Color = Color::Rgb(42, 49, 48);
+const THEME_ROAD_DARK: Color = Color::Rgb(29, 35, 34);
+const THEME_HEADLIGHT: Color = Color::Rgb(213, 187, 103);
 const THEME_ACCENT_MARK: &str = "❄";
 const SKATING_SNOWBANK_PATTERN: &[u8] =
     b"#__#####______###____########______##_____########______###____###___##____#####";
+const ROAD_IDLE_FRAMES: u64 = 14;
+const ROAD_CAR_WIDTH: i32 = 18;
+const ROAD_CAR_SPEED: u64 = 4;
+const ROAD_CAR_OFFSCREEN_PAD: i32 = 5;
 
 type ProcessRegistry = Arc<Mutex<HashSet<u32>>>;
 
@@ -95,6 +102,7 @@ enum SceneKind {
     Jack,
     Skating,
     Sleigh,
+    Road,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -190,6 +198,7 @@ fn fitting_scene_kinds(area: Rect) -> Vec<SceneKind> {
         SceneKind::Jack,
         SceneKind::Skating,
         SceneKind::Sleigh,
+        SceneKind::Road,
     ]
     .into_iter()
     .filter(|kind| scene_fits(*kind, area))
@@ -210,6 +219,7 @@ fn scene_min_size(kind: SceneKind) -> (u16, u16) {
         SceneKind::Jack => (20, 7),
         SceneKind::Skating => (28, 8),
         SceneKind::Sleigh => (34, 8),
+        SceneKind::Road => (46, 12),
     }
 }
 
@@ -240,6 +250,7 @@ fn parse_dev_scene_kind(value: &str) -> Option<SceneKind> {
         "jack" | "jack-in-the-box" | "jack_in_the_box" => Some(SceneKind::Jack),
         "skate" | "skating" | "lake" | "pond" => Some(SceneKind::Skating),
         "sleigh" | "reindeer" | "rudolph" => Some(SceneKind::Sleigh),
+        "road" | "car" | "christmas-car" | "christmas_car" => Some(SceneKind::Road),
         _ => None,
     }
 }
@@ -6713,6 +6724,7 @@ fn render_scene(area: Rect, scene: SceneState, frame: u64, buffer: &mut Buffer) 
         SceneKind::Jack => render_jack_scene(area, scene.seed, frame, buffer),
         SceneKind::Skating => render_skating_scene(area, scene.seed, frame, buffer),
         SceneKind::Sleigh => render_sleigh_scene(area, scene.seed, frame, buffer),
+        SceneKind::Road => render_winter_road_scene(area, scene.seed, frame, buffer),
     }
 }
 
@@ -7447,6 +7459,227 @@ fn render_sleigh_sprite(buffer: &mut Buffer, clip: Rect, x: i32, top: u16, frame
     render_scene_text_in_rect(buffer, clip, x + 27, y + 2, "◥████◤", sleigh_style);
 }
 
+fn render_winter_road_scene(area: Rect, seed: u64, frame: u64, buffer: &mut Buffer) {
+    if !scene_fits(SceneKind::Road, area) {
+        return;
+    }
+
+    let road_y = area.bottom().saturating_sub(4);
+    render_winter_road_sky(area, seed, frame, road_y, buffer);
+    render_winter_road(area, seed, frame, road_y, buffer);
+    render_christmas_car(area, seed, frame, road_y, buffer);
+}
+
+fn render_winter_road_sky(area: Rect, seed: u64, frame: u64, road_y: u16, buffer: &mut Buffer) {
+    if road_y <= area.y + 1 {
+        return;
+    }
+
+    let sky_height = road_y.saturating_sub(area.y);
+    let flakes = usize::from((area.width / 10).clamp(4, 12));
+    for index in 0..flakes {
+        let value = mix_scene_seed(seed, index as u64, 0x0022_1224_u64);
+        let slot_x = ((index as u64 * u64::from(area.width)) / flakes as u64) as i16;
+        let drift = ((frame / 4 + value / 19) % 3) as i16 - 1;
+        let width = i16::try_from(area.width).unwrap_or(1).max(1);
+        let x = area.x + (slot_x + drift).rem_euclid(width) as u16;
+        let y = area.y + ((value / 31 + frame / 2) % u64::from(sky_height)) as u16;
+        let symbol = if value & 3 == 0 { "*" } else { "·" };
+        paint_scene_cell_in_rect(
+            buffer,
+            area,
+            i32::from(x),
+            y,
+            symbol,
+            pane_style().fg(THEME_SNOW),
+        );
+    }
+
+    if area.width >= 62 && sky_height >= 6 {
+        let moon_x = area.x + area.width.saturating_sub(10);
+        let moon_y = area.y + 1;
+        render_scene_text_in_rect(
+            buffer,
+            area,
+            i32::from(moon_x),
+            i32::from(moon_y),
+            "▄██▄",
+            pane_style().fg(THEME_GOLD_HOVER),
+        );
+        render_scene_text_in_rect(
+            buffer,
+            area,
+            i32::from(moon_x),
+            i32::from(moon_y + 1),
+            "▀██▀",
+            pane_style().fg(THEME_GOLD_HOVER),
+        );
+    }
+}
+
+fn render_winter_road(area: Rect, seed: u64, frame: u64, road_y: u16, buffer: &mut Buffer) {
+    let snowbank_y = road_y.saturating_sub(1);
+    if snowbank_y >= area.y {
+        for column in 0..area.width {
+            let x = area.x + column;
+            let value = mix_scene_seed(seed, u64::from(column), 0x0050_ba11_u64);
+            let symbol = if value.is_multiple_of(5) {
+                "█"
+            } else {
+                "▄"
+            };
+            paint_scene_cell_in_rect(
+                buffer,
+                area,
+                i32::from(x),
+                snowbank_y,
+                symbol,
+                pane_style().fg(THEME_SNOW),
+            );
+        }
+    }
+
+    for y in road_y..area.bottom() {
+        for column in 0..area.width {
+            let x = area.x + column;
+            let bg = if (y + column).is_multiple_of(3) {
+                THEME_ROAD
+            } else {
+                THEME_ROAD_DARK
+            };
+            paint_scene_cell_in_rect(
+                buffer,
+                area,
+                i32::from(x),
+                y,
+                " ",
+                Style::default().fg(THEME_SNOW).bg(bg),
+            );
+        }
+    }
+
+    let lane_y = road_y
+        .saturating_add(2)
+        .min(area.bottom().saturating_sub(1));
+    for column in 0..area.width {
+        if (u64::from(column) + frame / 3).is_multiple_of(12)
+            || (u64::from(column) + frame / 3) % 12 == 1
+        {
+            paint_scene_cell_in_rect(
+                buffer,
+                area,
+                i32::from(area.x + column),
+                lane_y,
+                "─",
+                Style::default().fg(THEME_SNOW).bg(THEME_ROAD_DARK),
+            );
+        }
+    }
+}
+
+fn render_christmas_car(area: Rect, seed: u64, frame: u64, road_y: u16, buffer: &mut Buffer) {
+    let travel = u64::from(area.width)
+        .saturating_add(ROAD_CAR_WIDTH as u64)
+        .saturating_add((ROAD_CAR_OFFSCREEN_PAD as u64).saturating_mul(2));
+    let drive_frames = travel.div_ceil(ROAD_CAR_SPEED).max(1);
+    let cycle_frames = ROAD_IDLE_FRAMES.saturating_add(drive_frames);
+    let cycle_frame = frame % cycle_frames;
+    if cycle_frame < ROAD_IDLE_FRAMES {
+        return;
+    }
+
+    let cycle_index = frame / cycle_frames;
+    let left_to_right = (cycle_index + seed).is_multiple_of(2);
+    let progress = (cycle_frame - ROAD_IDLE_FRAMES).saturating_mul(ROAD_CAR_SPEED) as i32;
+    let x = if left_to_right {
+        i32::from(area.x) - ROAD_CAR_WIDTH - ROAD_CAR_OFFSCREEN_PAD + progress
+    } else {
+        i32::from(area.right()) + ROAD_CAR_OFFSCREEN_PAD - progress
+    };
+    let wheel_y = road_y
+        .saturating_add(2)
+        .min(area.bottom().saturating_sub(2));
+    if wheel_y <= area.y + 6 {
+        return;
+    }
+    let top = i32::from(wheel_y).saturating_sub(6);
+
+    render_car_headlights(buffer, area, x, wheel_y, left_to_right);
+    render_car_sprite(buffer, area, x, top, left_to_right);
+}
+
+fn render_car_headlights(
+    buffer: &mut Buffer,
+    clip: Rect,
+    x: i32,
+    wheel_y: u16,
+    left_to_right: bool,
+) {
+    let front_x = if left_to_right {
+        x + ROAD_CAR_WIDTH - 2
+    } else {
+        x + 1
+    };
+    let center_y = i32::from(wheel_y).saturating_sub(2);
+    let cone_len = (clip.width / 5).clamp(5, 9);
+    let style = pane_style().fg(THEME_HEADLIGHT).add_modifier(Modifier::DIM);
+
+    for step in 0..cone_len {
+        let spread = i32::from(step / 5);
+        let light_x = if left_to_right {
+            front_x + 1 + i32::from(step)
+        } else {
+            front_x - 1 - i32::from(step)
+        };
+        for dy in -spread..=spread {
+            let y = center_y + dy;
+            if y < 0 {
+                continue;
+            }
+            if dy != 0 && step % 2 == 1 {
+                continue;
+            }
+            let symbol = if step < 4 { "░" } else { "·" };
+            paint_scene_cell_in_rect(buffer, clip, light_x, y as u16, symbol, style);
+        }
+    }
+
+    let lamp_style = pane_style()
+        .fg(THEME_GOLD_HOVER)
+        .add_modifier(Modifier::BOLD);
+    paint_scene_cell_in_rect(buffer, clip, front_x, center_y as u16, "●", lamp_style);
+}
+
+fn render_car_sprite(buffer: &mut Buffer, clip: Rect, x: i32, top: i32, left_to_right: bool) {
+    let tree_dark = pane_style().fg(THEME_GREEN).add_modifier(Modifier::BOLD);
+    let tree_light = pane_style()
+        .fg(THEME_GREEN_HOVER)
+        .add_modifier(Modifier::BOLD);
+    let trunk = pane_style().fg(THEME_LOG).add_modifier(Modifier::BOLD);
+    let body = pane_style()
+        .fg(THEME_RED_HOVER)
+        .add_modifier(Modifier::BOLD);
+    let roof = pane_style().fg(THEME_RED).add_modifier(Modifier::BOLD);
+    let trim = pane_style().fg(THEME_SNOW).add_modifier(Modifier::BOLD);
+    let wheel = pane_style().fg(THEME_BLACK).add_modifier(Modifier::BOLD);
+
+    render_scene_text_in_rect(buffer, clip, x + 7, top, "▲", tree_light);
+    render_scene_text_in_rect(buffer, clip, x + 6, top + 1, "▲▲▲", tree_dark);
+    render_scene_text_in_rect(buffer, clip, x + 5, top + 2, "▲▲▲▲▲", tree_light);
+    render_scene_text_in_rect(buffer, clip, x + 7, top + 3, "▐▌", trunk);
+    render_scene_text_in_rect(buffer, clip, x + 4, top + 3, "━━━━━━━", trim);
+
+    if left_to_right {
+        render_scene_text_in_rect(buffer, clip, x + 3, top + 4, "▄▄██████▄▸", roof);
+        render_scene_text_in_rect(buffer, clip, x + 1, top + 5, "▐██████████▌", body);
+        render_scene_text_in_rect(buffer, clip, x + 2, top + 6, "●        ●", wheel);
+    } else {
+        render_scene_text_in_rect(buffer, clip, x + 3, top + 4, "◂▄██████▄▄", roof);
+        render_scene_text_in_rect(buffer, clip, x + 1, top + 5, "▐██████████▌", body);
+        render_scene_text_in_rect(buffer, clip, x + 2, top + 6, "●        ●", wheel);
+    }
+}
+
 fn render_reindeer(buffer: &mut Buffer, clip: Rect, x: i32, top: i32, red_nose: bool, frame: u64) {
     let antler_style = pane_style().fg(THEME_GOLD_HOVER);
     let body_style = pane_style().fg(THEME_LOG).add_modifier(Modifier::BOLD);
@@ -7917,6 +8150,24 @@ fn paint_scene_cell(buffer: &mut Buffer, x: i32, y: u16, symbol: &str, style: St
     }
     let x = x as u16;
     if !contains(buffer.area, x, y) {
+        return;
+    }
+    buffer[(x, y)].set_symbol(symbol).set_style(style);
+}
+
+fn paint_scene_cell_in_rect(
+    buffer: &mut Buffer,
+    clip: Rect,
+    x: i32,
+    y: u16,
+    symbol: &str,
+    style: Style,
+) {
+    if x < 0 {
+        return;
+    }
+    let x = x as u16;
+    if !contains(clip, x, y) || !contains(buffer.area, x, y) {
         return;
     }
     buffer[(x, y)].set_symbol(symbol).set_style(style);
@@ -11182,6 +11433,73 @@ mod tests {
     }
 
     #[test]
+    fn road_scene_waits_before_car_enters() {
+        let area = Rect::new(0, 0, 60, 14);
+        let mut quiet = Buffer::empty(area);
+        let mut driving = Buffer::empty(area);
+
+        render_winter_road_scene(area, 42, 0, &mut quiet);
+        render_winter_road_scene(area, 42, ROAD_IDLE_FRAMES + 8, &mut driving);
+
+        assert!(car_wheel_positions(&quiet, area).is_empty());
+        assert!(!car_wheel_positions(&driving, area).is_empty());
+        assert!(!headlight_positions(&driving, area).is_empty());
+    }
+
+    #[test]
+    fn road_scene_can_enter_from_either_side() {
+        let area = Rect::new(0, 0, 60, 14);
+        let travel = u64::from(area.width)
+            .saturating_add(ROAD_CAR_WIDTH as u64)
+            .saturating_add((ROAD_CAR_OFFSCREEN_PAD as u64).saturating_mul(2));
+        let cycle_frames = ROAD_IDLE_FRAMES + travel.div_ceil(ROAD_CAR_SPEED).max(1);
+        let sample_frame = ROAD_IDLE_FRAMES + 8;
+        let mut first_cycle = Buffer::empty(area);
+        let mut second_cycle = Buffer::empty(area);
+
+        render_winter_road_scene(area, 42, sample_frame, &mut first_cycle);
+        render_winter_road_scene(area, 42, cycle_frames + sample_frame, &mut second_cycle);
+
+        let first_x = car_wheel_positions(&first_cycle, area)
+            .into_iter()
+            .map(|(x, _)| x)
+            .min()
+            .unwrap();
+        let second_x = car_wheel_positions(&second_cycle, area)
+            .into_iter()
+            .map(|(x, _)| x)
+            .max()
+            .unwrap();
+        assert!(
+            first_x < area.x + area.width / 2,
+            "first visible pass should enter from the left"
+        );
+        assert!(
+            second_x > area.x + area.width / 2,
+            "next visible pass should enter from the right"
+        );
+    }
+
+    #[test]
+    fn road_scene_clips_car_to_scene_area() {
+        let scene_area = Rect::new(0, 0, 46, 12);
+        let buffer_area = Rect::new(0, 0, 92, 12);
+        let mut buffer = Buffer::empty(buffer_area);
+
+        render_winter_road_scene(scene_area, 42, ROAD_IDLE_FRAMES + 20, &mut buffer);
+
+        for y in buffer_area.y..buffer_area.bottom() {
+            for x in scene_area.right()..buffer_area.right() {
+                assert_eq!(
+                    buffer[(x, y)].symbol(),
+                    " ",
+                    "road scene leaked into neighboring area at ({x}, {y})"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn santa_scene_waves_between_frames() {
         let area = Rect::new(0, 0, 38, 14);
         let mut low_wave = Buffer::empty(area);
@@ -11342,17 +11660,19 @@ mod tests {
         assert!(choices.contains(&SceneKind::Jack));
         assert!(choices.contains(&SceneKind::Skating));
         assert!(choices.contains(&SceneKind::Sleigh));
+        assert!(choices.contains(&SceneKind::Road));
     }
 
     #[test]
     fn scene_selection_uses_current_area_size() {
         let compact = Rect::new(0, 0, 24, 4);
-        let roomy = Rect::new(0, 0, 40, 14);
+        let roomy = Rect::new(0, 0, 60, 14);
         let too_small = Rect::new(0, 0, 17, 7);
 
         assert!(scene_fits(SceneKind::Fireplace, compact));
         assert!(!scene_fits(SceneKind::Snow, compact));
         assert!(!scene_fits(SceneKind::Santa, compact));
+        assert!(!scene_fits(SceneKind::Road, Rect::new(0, 0, 45, 12)));
         assert!(scene_state_for_area(0, too_small, None).is_none());
         assert_eq!(
             scene_state_for_area(0, compact, Some(SceneKind::Snow))
@@ -11372,6 +11692,7 @@ mod tests {
         assert!(choices.contains(&SceneKind::Jack));
         assert!(choices.contains(&SceneKind::Skating));
         assert!(choices.contains(&SceneKind::Sleigh));
+        assert!(choices.contains(&SceneKind::Road));
     }
 
     #[test]
@@ -11395,6 +11716,9 @@ mod tests {
         assert_eq!(parse_dev_scene_kind("lake"), Some(SceneKind::Skating));
         assert_eq!(parse_dev_scene_kind("sleigh"), Some(SceneKind::Sleigh));
         assert_eq!(parse_dev_scene_kind("reindeer"), Some(SceneKind::Sleigh));
+        assert_eq!(parse_dev_scene_kind("road"), Some(SceneKind::Road));
+        assert_eq!(parse_dev_scene_kind("car"), Some(SceneKind::Road));
+        assert_eq!(parse_dev_scene_kind("christmas-car"), Some(SceneKind::Road));
     }
 
     #[test]
@@ -12614,6 +12938,31 @@ mod tests {
         for row in area.y..area.bottom() {
             for column in area.x..area.right() {
                 if buffer[(column, row)].symbol() == "●" {
+                    positions.push((column, row));
+                }
+            }
+        }
+        positions
+    }
+
+    fn car_wheel_positions(buffer: &Buffer, area: Rect) -> Vec<(u16, u16)> {
+        let mut positions = Vec::new();
+        for row in area.y..area.bottom() {
+            for column in area.x..area.right() {
+                let cell = &buffer[(column, row)];
+                if cell.symbol() == "●" && cell.fg == THEME_BLACK {
+                    positions.push((column, row));
+                }
+            }
+        }
+        positions
+    }
+
+    fn headlight_positions(buffer: &Buffer, area: Rect) -> Vec<(u16, u16)> {
+        let mut positions = Vec::new();
+        for row in area.y..area.bottom() {
+            for column in area.x..area.right() {
+                if buffer[(column, row)].fg == THEME_HEADLIGHT {
                     positions.push((column, row));
                 }
             }
