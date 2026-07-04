@@ -7187,6 +7187,7 @@ fn render_skating_pines(area: Rect, snowbank_y: u16, seed: u64, buffer: &mut Buf
 
 fn render_frozen_lake(area: Rect, lake_y: u16, seed: u64, buffer: &mut Buffer) {
     for y in lake_y..area.bottom() {
+        let snow_width = skating_snow_width(area, lake_y, y);
         for column in 0..area.width {
             let x = area.x + column;
             let row = y.saturating_sub(lake_y);
@@ -7195,18 +7196,37 @@ fn render_frozen_lake(area: Rect, lake_y: u16, seed: u64, buffer: &mut Buffer) {
                 u64::from(row) << 32 | u64::from(column),
                 0x1ce_5ca7e_u64,
             );
-            let ice = if row > 0 && value % 73 == 0 {
+            let diagonal = (u64::from(column) * 3 + u64::from(row) + seed % 17) % 23 == 0;
+            let ice = if row > 0 && column > snow_width && diagonal && value % 5 < 2 {
                 THEME_ICE
             } else {
                 THEME_ICE_DARK
             };
-            paint_scene_cell(
-                buffer,
-                i32::from(x),
-                y,
-                " ",
-                Style::default().fg(THEME_BLACK).bg(ice),
-            );
+            if row > 0 && column < snow_width {
+                paint_scene_cell(
+                    buffer,
+                    i32::from(x),
+                    y,
+                    " ",
+                    Style::default().fg(THEME_BLACK).bg(THEME_SNOW),
+                );
+            } else if row > 0 && column == snow_width && snow_width > 0 {
+                paint_scene_cell(
+                    buffer,
+                    i32::from(x),
+                    y,
+                    "▌",
+                    Style::default().fg(THEME_SNOW).bg(ice),
+                );
+            } else {
+                paint_scene_cell(
+                    buffer,
+                    i32::from(x),
+                    y,
+                    " ",
+                    Style::default().fg(THEME_BLACK).bg(ice),
+                );
+            }
         }
     }
 
@@ -7223,17 +7243,46 @@ fn render_frozen_lake(area: Rect, lake_y: u16, seed: u64, buffer: &mut Buffer) {
     }
 }
 
+fn skating_snow_width(area: Rect, lake_y: u16, y: u16) -> u16 {
+    if y <= lake_y {
+        return 0;
+    }
+    let max_width = area.width / 4;
+    if max_width == 0 {
+        return 0;
+    }
+    let lake_height = area.bottom().saturating_sub(lake_y).max(1);
+    let row = y.saturating_sub(lake_y).min(lake_height);
+    let curved = 1 + (u32::from(row) * u32::from(max_width) / u32::from(lake_height)) as u16;
+    let bend = match row % 5 {
+        1 | 2 => 1,
+        4 => -1,
+        _ => 0,
+    };
+    curved.saturating_add_signed(bend).clamp(1, max_width)
+}
+
+fn skating_ice_start(area: Rect) -> u16 {
+    let snow_width = area.width / 4;
+    area.x
+        .saturating_add(snow_width)
+        .saturating_add(2)
+        .min(area.right().saturating_sub(1))
+}
+
 fn render_skating_tracks(area: Rect, lake_y: u16, seed: u64, buffer: &mut Buffer) {
     let available_height = area.bottom().saturating_sub(lake_y);
-    if available_height < 3 || area.width < 12 {
+    let ice_start = skating_ice_start(area);
+    let ice_width = area.right().saturating_sub(ice_start);
+    if available_height < 3 || ice_width < 12 {
         return;
     }
 
-    let track_count = usize::from((area.width / 16).clamp(2, 6));
+    let track_count = usize::from((ice_width / 16).clamp(2, 6));
     for index in 0..track_count {
         let value = mix_scene_seed(seed, index as u64, 0x1ced_1a4e_u64);
         let y = lake_y + 1 + (value % u64::from(available_height.saturating_sub(1))) as u16;
-        let x = area.x + (value % u64::from(area.width.saturating_sub(4))) as u16;
+        let x = ice_start + (value % u64::from(ice_width.saturating_sub(4))) as u16;
         render_scene_text_clipped(
             buffer,
             i32::from(x),
@@ -7255,7 +7304,9 @@ fn render_skating_tracks(area: Rect, lake_y: u16, seed: u64, buffer: &mut Buffer
 
 fn render_skaters(area: Rect, lake_y: u16, seed: u64, frame: u64, buffer: &mut Buffer) {
     let available_height = area.bottom().saturating_sub(lake_y);
-    if available_height < 3 || area.width < 12 {
+    let ice_start = skating_ice_start(area);
+    let ice_width = area.right().saturating_sub(ice_start);
+    if available_height < 3 || ice_width < 12 {
         return;
     }
 
@@ -7265,9 +7316,9 @@ fn render_skaters(area: Rect, lake_y: u16, seed: u64, frame: u64, buffer: &mut B
         return;
     }
     let lane_slots = usize::from((last_lane - first_lane) / 2 + 1);
-    let width_slots = usize::from((area.width / 24).clamp(1, 3));
+    let width_slots = usize::from((ice_width / 18).clamp(1, 3));
     let skater_count = width_slots.min(lane_slots).max(1);
-    let path_span = i32::from(area.width.saturating_sub(8).max(1));
+    let path_span = i32::from(ice_width.saturating_sub(6).max(1));
     let path_period = (path_span * 2).max(1);
     let mut skaters = Vec::with_capacity(skater_count);
     for index in 0..skater_count {
@@ -7283,7 +7334,7 @@ fn render_skaters(area: Rect, lake_y: u16, seed: u64, frame: u64, buffer: &mut B
         } else {
             path_period - progress
         };
-        let x = i32::from(area.x) + 2 + local_x;
+        let x = i32::from(ice_start) + 1 + local_x;
         let direction = if progress <= path_span { 1 } else { -1 };
         skaters.push((foot_y, x, phase, direction));
     }
@@ -10934,6 +10985,52 @@ mod tests {
 
         assert!(first_highlights.len() < lake_cells / 30);
         assert_ne!(first_highlights, second_highlights);
+    }
+
+    #[test]
+    fn frozen_lake_snowbank_stays_on_left_side_under_quarter_width() {
+        let area = Rect::new(0, 0, 60, 20);
+        let lake_y = 12;
+        let mut buffer = Buffer::empty(area);
+
+        render_frozen_lake(area, lake_y, 42, &mut buffer);
+
+        let max_snow_width = area.width / 4;
+        for y in lake_y + 1..area.bottom() {
+            let snow_cells = (area.x..area.right())
+                .filter(|&x| buffer[(x, y)].bg == THEME_SNOW)
+                .count();
+            assert!(
+                snow_cells <= usize::from(max_snow_width),
+                "row {y} used {snow_cells} snow cells"
+            );
+            let edge = area.x + skating_snow_width(area, lake_y, y);
+            assert_eq!(buffer[(edge, y)].symbol(), "▌");
+        }
+    }
+
+    #[test]
+    fn skating_lanes_stay_on_ice_side_of_snowbank() {
+        let area = Rect::new(0, 0, 58, 20);
+        let lake_y = 12;
+        let mut buffer = Buffer::empty(area);
+
+        render_frozen_lake(area, lake_y, 42, &mut buffer);
+        render_skating_tracks(area, lake_y, 42, &mut buffer);
+        render_skaters(area, lake_y, 42, 15, &mut buffer);
+
+        for y in lake_y + 1..area.bottom() {
+            for x in area.x..skating_ice_start(area) {
+                let symbol = buffer[(x, y)].symbol();
+                assert!(
+                    !matches!(
+                        symbol,
+                        "o" | "~" | "/" | "\\" | "|" | "█" | ">" | "<" | "║" | "·"
+                    ),
+                    "skating lane marker {symbol:?} entered snowbank at ({x}, {y})"
+                );
+            }
+        }
     }
 
     #[test]
