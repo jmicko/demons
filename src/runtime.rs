@@ -7653,7 +7653,7 @@ fn render_large_jack(buffer: &mut Buffer, center: i32, lid_y: i32, phase: u64) {
         .add_modifier(Modifier::BOLD);
 
     render_scene_text_clipped(buffer, left, lid_y - 7 + top_shift, "   ▲   ", gold);
-    render_scene_text_clipped(buffer, left, lid_y - 6 + top_shift, "  ▔▔▔  ", snow);
+    render_scene_text_clipped(buffer, left, lid_y - 6 + top_shift, " ╭▔▔▔╮ ", snow);
     render_scene_text_clipped(buffer, left, lid_y - 5 + top_shift, " (o o) ", snow);
     render_scene_text_clipped(buffer, left, lid_y - 4 + top_shift, arms, red);
     render_scene_text_clipped(buffer, left, lid_y - 3 + top_shift, "  ███  ", red);
@@ -11224,6 +11224,20 @@ mod tests {
         assert!(spring_text.contains('╲'));
         assert!(!spring_text.contains('☺'));
         assert!(open_text.contains('☺'));
+    }
+
+    #[test]
+    fn large_jack_uses_connected_hat_and_head() {
+        let area = Rect::new(0, 0, 36, 14);
+        let mut buffer = Buffer::empty(area);
+
+        render_jack_scene(area, 42, 3, &mut buffer);
+
+        let text = buffer_text(&buffer, area);
+        assert!(text.contains("   ▲"));
+        assert!(text.contains("╭▔▔▔╮"));
+        assert!(text.contains("(o o)"));
+        assert!(!text.contains("( o o )"));
     }
 
     #[test]
