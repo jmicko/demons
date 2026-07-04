@@ -7251,15 +7251,17 @@ fn skating_snow_width(area: Rect, lake_y: u16, y: u16) -> u16 {
     if max_width == 0 {
         return 0;
     }
-    let lake_height = area.bottom().saturating_sub(lake_y).max(1);
-    let row = y.saturating_sub(lake_y).min(lake_height);
-    let curved = 1 + (u32::from(row) * u32::from(max_width) / u32::from(lake_height)) as u16;
-    let bend = match row % 5 {
-        1 | 2 => 1,
-        4 => -1,
-        _ => 0,
-    };
-    curved.saturating_add_signed(bend).clamp(1, max_width)
+    let lake_rows = area
+        .bottom()
+        .saturating_sub(lake_y)
+        .saturating_sub(1)
+        .max(1);
+    let row = y.saturating_sub(lake_y).min(lake_rows);
+    let row = u32::from(row);
+    let lake_rows = u32::from(lake_rows);
+    let max_width = u32::from(max_width);
+    let curved = 1 + row * row * max_width.saturating_sub(1) / (lake_rows * lake_rows);
+    u16::try_from(curved).unwrap_or(u16::MAX)
 }
 
 fn skating_ice_start(area: Rect) -> u16 {
@@ -11007,6 +11009,25 @@ mod tests {
             let edge = area.x + skating_snow_width(area, lake_y, y);
             assert_eq!(buffer[(edge, y)].symbol(), "▌");
         }
+    }
+
+    #[test]
+    fn frozen_lake_snowbank_uses_concave_curve() {
+        let area = Rect::new(0, 0, 60, 20);
+        let lake_y = 12;
+        let top_width = skating_snow_width(area, lake_y, lake_y + 1);
+        let mid_width = skating_snow_width(area, lake_y, lake_y + 4);
+        let bottom_width = skating_snow_width(area, lake_y, area.bottom() - 1);
+
+        assert_eq!(bottom_width, area.width / 4);
+        assert!(
+            mid_width < bottom_width / 2,
+            "midpoint width {mid_width} should stay below half of bottom width {bottom_width}"
+        );
+        assert!(
+            mid_width.saturating_sub(top_width) < bottom_width.saturating_sub(mid_width),
+            "snowbank should accelerate outward instead of forming a straight diagonal"
+        );
     }
 
     #[test]
