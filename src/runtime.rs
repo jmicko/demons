@@ -465,6 +465,10 @@ fn terminal_stream_attached<T: IsTerminal>(stream: &T) -> bool {
 
 #[cfg(unix)]
 fn terminal_fd_attached(fd: libc::c_int) -> bool {
+    if terminal_fd_target_deleted(fd) {
+        return false;
+    }
+
     let mut poll_fd = libc::pollfd {
         fd,
         events: 0,
@@ -478,8 +482,29 @@ fn terminal_fd_attached(fd: libc::c_int) -> bool {
     poll_fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) == 0
 }
 
+#[cfg(target_os = "linux")]
+fn terminal_fd_target_deleted(fd: libc::c_int) -> bool {
+    proc_fd_target_deleted_path(&format!("/proc/self/fd/{fd}"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn terminal_fd_target_deleted(_fd: libc::c_int) -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn proc_fd_target_deleted_path(path: &str) -> bool {
+    fs::read_link(path)
+        .map(|target| target.to_string_lossy().ends_with(" (deleted)"))
+        .unwrap_or(true)
+}
+
 #[cfg(unix)]
 fn poll_terminal_fd_input(fd: libc::c_int, timeout: Duration) -> Result<TerminalInputPoll> {
+    if !terminal_fd_attached(fd) {
+        return Ok(TerminalInputPoll::Detached);
+    }
+
     let mut poll_fd = libc::pollfd {
         fd,
         events: libc::POLLIN,
@@ -490,6 +515,9 @@ fn poll_terminal_fd_input(fd: libc::c_int, timeout: Duration) -> Result<Terminal
     loop {
         let result = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
         if result > 0 {
+            if terminal_fd_target_deleted(fd) {
+                return Ok(TerminalInputPoll::Detached);
+            }
             if poll_fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
                 return Ok(TerminalInputPoll::Detached);
             }
@@ -9594,6 +9622,23 @@ mod tests {
         );
 
         assert_eq!(unsafe { libc::close(read_fd) }, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_fd_target_deleted_path_detects_deleted_terminal_suffix() {
+        let dir = tempdir().unwrap();
+        let deleted = dir.path().join("deleted-tty");
+        let active = dir.path().join("active-tty");
+
+        std::os::unix::fs::symlink("/dev/pts/2 (deleted)", &deleted).unwrap();
+        std::os::unix::fs::symlink("/dev/pts/2", &active).unwrap();
+
+        assert!(proc_fd_target_deleted_path(deleted.to_str().unwrap()));
+        assert!(!proc_fd_target_deleted_path(active.to_str().unwrap()));
+        assert!(proc_fd_target_deleted_path(
+            dir.path().join("missing").to_str().unwrap()
+        ));
     }
 
     #[test]
