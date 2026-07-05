@@ -1,9 +1,12 @@
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::{
+    fd::AsRawFd,
+    unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
+};
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
     env, fs,
-    io::{self, Read, Stdout, Write},
+    io::{self, IsTerminal, Read, Stdout, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -365,6 +368,10 @@ fn run_loop(
             terminal.draw(|frame| app.draw(frame)).ok();
             return Ok(());
         }
+        if !terminal_stdio_attached() {
+            app.mark_stopping();
+            return Ok(());
+        }
         dirty |= app.drain_process_events();
         dirty |= app.tick()?;
 
@@ -375,18 +382,141 @@ fn run_loop(
             dirty = false;
         }
 
-        if event::poll(EVENT_INTERVAL).context("failed to poll terminal input")? {
-            let event = event::read().context("failed to read terminal input")?;
-            if app.handle_terminal_event(event)? == Action::Quit {
-                app.mark_stopping();
-                if app.tasks_started {
-                    terminal.draw(|frame| app.draw(frame)).ok();
+        match poll_terminal_input(EVENT_INTERVAL)? {
+            TerminalInputPoll::Ready => {
+                if !terminal_stdio_attached() {
+                    app.mark_stopping();
+                    return Ok(());
                 }
+                let event = event::read().context("failed to read terminal input")?;
+                if app.handle_terminal_event(event)? == Action::Quit {
+                    app.mark_stopping();
+                    if app.tasks_started {
+                        terminal.draw(|frame| app.draw(frame)).ok();
+                    }
+                    return Ok(());
+                }
+                dirty = true;
+            }
+            TerminalInputPoll::Detached => {
+                app.mark_stopping();
                 return Ok(());
             }
-            dirty = true;
+            TerminalInputPoll::Timeout => {}
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalInputPoll {
+    Ready,
+    Timeout,
+    Detached,
+}
+
+fn poll_terminal_input(timeout: Duration) -> Result<TerminalInputPoll> {
+    poll_terminal_stream_input(&io::stdin(), timeout)
+}
+
+#[cfg(unix)]
+fn poll_terminal_stream_input<T: IsTerminal + AsRawFd>(
+    stream: &T,
+    timeout: Duration,
+) -> Result<TerminalInputPoll> {
+    if !terminal_stream_attached(stream) {
+        return Ok(TerminalInputPoll::Detached);
+    }
+
+    poll_terminal_fd_input(stream.as_raw_fd(), timeout)
+}
+
+#[cfg(not(unix))]
+fn poll_terminal_stream_input<T: IsTerminal>(
+    stream: &T,
+    timeout: Duration,
+) -> Result<TerminalInputPoll> {
+    if !stream.is_terminal() {
+        return Ok(TerminalInputPoll::Detached);
+    }
+    if event::poll(timeout).context("failed to poll terminal input")? {
+        Ok(TerminalInputPoll::Ready)
+    } else {
+        Ok(TerminalInputPoll::Timeout)
+    }
+}
+
+fn terminal_stdio_attached() -> bool {
+    terminal_stream_attached(&io::stdin()) && terminal_stream_attached(&io::stdout())
+}
+
+#[cfg(unix)]
+fn terminal_stream_attached<T: IsTerminal + AsRawFd>(stream: &T) -> bool {
+    if !stream.is_terminal() {
+        return false;
+    }
+
+    terminal_fd_attached(stream.as_raw_fd())
+}
+
+#[cfg(not(unix))]
+fn terminal_stream_attached<T: IsTerminal>(stream: &T) -> bool {
+    stream.is_terminal()
+}
+
+#[cfg(unix)]
+fn terminal_fd_attached(fd: libc::c_int) -> bool {
+    let mut poll_fd = libc::pollfd {
+        fd,
+        events: 0,
+        revents: 0,
+    };
+    let result = unsafe { libc::poll(&mut poll_fd, 1, 0) };
+    if result < 0 {
+        return false;
+    }
+
+    poll_fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) == 0
+}
+
+#[cfg(unix)]
+fn poll_terminal_fd_input(fd: libc::c_int, timeout: Duration) -> Result<TerminalInputPoll> {
+    let mut poll_fd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout_ms = poll_timeout_ms(timeout);
+
+    loop {
+        let result = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+        if result > 0 {
+            if poll_fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+                return Ok(TerminalInputPoll::Detached);
+            }
+            if poll_fd.revents & libc::POLLIN != 0 {
+                return Ok(TerminalInputPoll::Ready);
+            }
+            return Ok(TerminalInputPoll::Timeout);
+        }
+        if result == 0 {
+            return Ok(TerminalInputPoll::Timeout);
+        }
+
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        return Err(error).context("failed to poll terminal input");
+    }
+}
+
+#[cfg(unix)]
+fn poll_timeout_ms(timeout: Duration) -> libc::c_int {
+    timeout
+        .as_millis()
+        .min(libc::c_int::MAX as u128)
+        .try_into()
+        .unwrap_or(libc::c_int::MAX)
 }
 
 struct App {
@@ -9416,6 +9546,54 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_fd_attached_detects_hangup() {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+
+        let read_fd = fds[0];
+        let write_fd = fds[1];
+        assert!(terminal_fd_attached(read_fd));
+
+        assert_eq!(unsafe { libc::close(write_fd) }, 0);
+        assert!(!terminal_fd_attached(read_fd));
+
+        assert_eq!(unsafe { libc::close(read_fd) }, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn poll_terminal_fd_input_reports_ready_timeout_and_hangup() {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+
+        let read_fd = fds[0];
+        let write_fd = fds[1];
+        assert_eq!(
+            poll_terminal_fd_input(read_fd, Duration::ZERO).unwrap(),
+            TerminalInputPoll::Timeout
+        );
+
+        let byte = [b'x'];
+        assert_eq!(
+            unsafe { libc::write(write_fd, byte.as_ptr().cast(), byte.len()) },
+            1
+        );
+        assert_eq!(
+            poll_terminal_fd_input(read_fd, Duration::ZERO).unwrap(),
+            TerminalInputPoll::Ready
+        );
+
+        assert_eq!(unsafe { libc::close(write_fd) }, 0);
+        assert_eq!(
+            poll_terminal_fd_input(read_fd, Duration::ZERO).unwrap(),
+            TerminalInputPoll::Detached
+        );
+
+        assert_eq!(unsafe { libc::close(read_fd) }, 0);
     }
 
     #[test]
