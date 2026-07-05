@@ -57,6 +57,8 @@ const MODE_BUTTON_WIDTH: u16 = 13;
 const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(45);
 const SCENE_FRAME_INTERVAL: Duration = Duration::from_millis(350);
 const NOTICE_DURATION: Duration = Duration::from_secs(6);
+#[cfg(not(test))]
+const SYSTEM_CLIPBOARD_WAIT: Duration = Duration::from_millis(150);
 const MAX_FULL_HISTORY_OSC52_BYTES: usize = 512 * 1024;
 const DEV_SCENE_ENV: &str = "DEMONS_DEV_SCENE";
 const DEV_SCENE_SEED_ENV: &str = "DEMONS_DEV_SCENE_SEED";
@@ -3283,13 +3285,13 @@ impl App {
         };
         let pane = self.selection.as_ref().map(|selection| selection.pane);
         self.clipboard = text.clone();
-        let copied_to_terminal = write_osc52_clipboard(&text).is_ok();
+        let copied = write_clipboard(&text, true);
         let chars = text.chars().count();
         let suffix = pane
             .and_then(|pane| self.tasks.get(pane))
             .map(|task| format!(" from {}", task.task.name))
             .unwrap_or_default();
-        if copied_to_terminal {
+        if copied.system_or_terminal() {
             self.set_notice(format!("Copied {chars} characters{suffix}."));
         } else {
             self.set_notice(format!("Copied {chars} characters internally{suffix}."));
@@ -3306,9 +3308,9 @@ impl App {
             return;
         };
         self.clipboard = text.clone();
-        let copied_to_terminal = write_osc52_clipboard(&text).is_ok();
+        let copied = write_clipboard(&text, true);
         let chars = text.chars().count();
-        if copied_to_terminal {
+        if copied.system_or_terminal() {
             self.set_notice(format!("Copied {chars} visible characters."));
         } else {
             self.set_notice(format!("Copied {chars} visible characters internally."));
@@ -3331,9 +3333,9 @@ impl App {
 
         self.clipboard = text.clone();
         let osc52_allowed = text.len() <= MAX_FULL_HISTORY_OSC52_BYTES;
-        let copied_to_terminal = osc52_allowed && write_osc52_clipboard(&text).is_ok();
+        let copied = write_clipboard(&text, osc52_allowed);
         let chars = text.chars().count();
-        if copied_to_terminal {
+        if copied.system_or_terminal() {
             self.set_notice(format!(
                 "Copied {chars} history characters from {task_name}."
             ));
@@ -3369,8 +3371,8 @@ impl App {
         let path = write_history_log(dir, &task_name, &text)?;
         let path_text = path.display().to_string();
         self.clipboard = path_text.clone();
-        let copied_to_terminal = write_osc52_clipboard(&path_text).is_ok();
-        if copied_to_terminal {
+        let copied = write_clipboard(&path_text, true);
+        if copied.system_or_terminal() {
             self.set_notice(format!(
                 "Saved {task_name} scrollback to {path_text}; path copied."
             ));
@@ -4458,7 +4460,14 @@ struct Notice {
 #[derive(Clone, Debug, Default)]
 struct HistoryLine {
     text: String,
+    styles: Vec<Style>,
     wrapped: bool,
+}
+
+impl HistoryLine {
+    fn style_at(&self, column: usize) -> Style {
+        self.styles.get(column).copied().unwrap_or_else(pane_style)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -4486,6 +4495,7 @@ struct TextHistory {
     max_lines: usize,
     state: TextParserState,
     csi: String,
+    style: Style,
 }
 
 impl TextHistory {
@@ -4502,6 +4512,7 @@ impl TextHistory {
             max_lines,
             state: TextParserState::Ground,
             csi: String::new(),
+            style: pane_style(),
         }
     }
 
@@ -4514,6 +4525,7 @@ impl TextHistory {
         self.pending_wrap = false;
         self.state = TextParserState::Ground;
         self.csi.clear();
+        self.style = pane_style();
     }
 
     fn clear_visible_screen(&mut self) {
@@ -4651,9 +4663,11 @@ impl TextHistory {
         }
         while char_count(&self.current.text) < self.column {
             self.current.text.push(' ');
+            self.current.styles.push(pane_style());
         }
 
         replace_char(&mut self.current.text, self.column, character);
+        replace_style(&mut self.current.styles, self.column, self.style);
         self.column += 1;
         if self.column >= usize::from(self.width) {
             self.pending_wrap = true;
@@ -4663,7 +4677,9 @@ impl TextHistory {
 
     fn push_current(&mut self, wrapped: bool) -> usize {
         let mut line = std::mem::take(&mut self.current);
-        line.text.truncate(line.text.trim_end().len());
+        let trimmed_len = line.text.trim_end().chars().count();
+        truncate_chars(&mut line.text, trimmed_len);
+        line.styles.truncate(trimmed_len);
         line.wrapped = wrapped;
         self.lines.push_back(line);
         while self.lines.len() > self.max_lines {
@@ -4680,6 +4696,7 @@ impl TextHistory {
             'H' | 'f' => self.apply_cursor_position(),
             'J' => self.apply_erase_display(),
             'K' => self.apply_erase_line(),
+            'm' => self.apply_sgr(),
             _ => self.cursor_home = false,
         }
     }
@@ -4712,17 +4729,84 @@ impl TextHistory {
 
     fn apply_erase_line(&mut self) {
         match first_csi_param(&self.csi).unwrap_or(0) {
-            0 => truncate_chars(&mut self.current.text, self.column),
+            0 => {
+                truncate_chars(&mut self.current.text, self.column);
+                self.current.styles.truncate(self.column);
+            }
             1 => {
                 let end = byte_index_for_char(&self.current.text, self.column);
                 self.current.text.replace_range(0..end, "");
+                self.current
+                    .styles
+                    .drain(0..self.column.min(self.current.styles.len()));
                 self.column = 0;
             }
             2 => {
                 self.current.text.clear();
+                self.current.styles.clear();
                 self.column = 0;
             }
             _ => {}
+        }
+        self.cursor_home = false;
+    }
+
+    fn apply_sgr(&mut self) {
+        let params = csi_params(&self.csi);
+        let mut index = 0;
+        while index < params.len() {
+            match params[index] {
+                0 => self.style = pane_style(),
+                1 => self.style = self.style.add_modifier(Modifier::BOLD),
+                3 => self.style = self.style.add_modifier(Modifier::ITALIC),
+                4 => self.style = self.style.add_modifier(Modifier::UNDERLINED),
+                7 => self.style = self.style.add_modifier(Modifier::REVERSED),
+                22 => self.style = self.style.remove_modifier(Modifier::BOLD),
+                23 => self.style = self.style.remove_modifier(Modifier::ITALIC),
+                24 => self.style = self.style.remove_modifier(Modifier::UNDERLINED),
+                27 => self.style = self.style.remove_modifier(Modifier::REVERSED),
+                30..=37 => self.style = self.style.fg(Color::Indexed((params[index] - 30) as u8)),
+                39 => self.style.fg = Some(THEME_WHITE),
+                40..=47 => self.style = self.style.bg(Color::Indexed((params[index] - 40) as u8)),
+                49 => self.style.bg = Some(THEME_PANEL),
+                90..=97 => {
+                    self.style = self
+                        .style
+                        .fg(Color::Indexed((params[index] - 90 + 8) as u8));
+                }
+                100..=107 => {
+                    self.style = self
+                        .style
+                        .bg(Color::Indexed((params[index] - 100 + 8) as u8));
+                }
+                38 | 48 => {
+                    if index + 2 < params.len()
+                        && params[index + 1] == 5
+                        && let Ok(color) = u8::try_from(params[index + 2])
+                    {
+                        if params[index] == 38 {
+                            self.style = self.style.fg(Color::Indexed(color));
+                        } else {
+                            self.style = self.style.bg(Color::Indexed(color));
+                        }
+                        index += 2;
+                    } else if index + 4 < params.len() && params[index + 1] == 2 {
+                        let red = u8::try_from(params[index + 2]);
+                        let green = u8::try_from(params[index + 3]);
+                        let blue = u8::try_from(params[index + 4]);
+                        if let (Ok(red), Ok(green), Ok(blue)) = (red, green, blue) {
+                            if params[index] == 38 {
+                                self.style = self.style.fg(Color::Rgb(red, green, blue));
+                            } else {
+                                self.style = self.style.bg(Color::Rgb(red, green, blue));
+                            }
+                            index += 4;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            index += 1;
         }
         self.cursor_home = false;
     }
@@ -8437,7 +8521,7 @@ fn render_history(task: &TaskRuntime, area: Rect, buffer: &mut Buffer) {
             };
             buffer[(area.x + column as u16, area.y + row)]
                 .set_symbol(symbol)
-                .set_style(pane_style());
+                .set_style(line.style_at(column));
         }
     }
 }
@@ -8912,6 +8996,14 @@ fn replace_char(value: &mut String, index: usize, character: char) {
     value.replace_range(start..end, character.encode_utf8(&mut [0_u8; 4]));
 }
 
+fn replace_style(styles: &mut Vec<Style>, index: usize, style: Style) {
+    if index < styles.len() {
+        styles[index] = style;
+    } else {
+        styles.push(style);
+    }
+}
+
 fn truncate_chars(value: &mut String, len: usize) {
     let index = byte_index_for_char(value, len);
     value.truncate(index);
@@ -8955,6 +9047,22 @@ fn csi_param(value: &str, index: usize, default: usize) -> usize {
             }
         })
         .unwrap_or(default)
+}
+
+fn csi_params(value: &str) -> Vec<usize> {
+    if value.is_empty() {
+        return vec![0];
+    }
+    value
+        .split(';')
+        .map(|param| {
+            if param.is_empty() {
+                0
+            } else {
+                param.parse().unwrap_or(usize::MAX)
+            }
+        })
+        .collect()
 }
 
 fn search_needle(query: &str) -> Option<String> {
@@ -9301,6 +9409,60 @@ fn sanitize_filename(value: &str) -> String {
     } else {
         trimmed.chars().take(64).collect()
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ClipboardWrite {
+    system: bool,
+    terminal: bool,
+}
+
+impl ClipboardWrite {
+    fn system_or_terminal(self) -> bool {
+        self.system || self.terminal
+    }
+}
+
+fn write_clipboard(text: &str, allow_osc52: bool) -> ClipboardWrite {
+    ClipboardWrite {
+        system: write_system_clipboard(text).is_ok(),
+        terminal: allow_osc52 && write_osc52_clipboard(text).is_ok(),
+    }
+}
+
+#[cfg(test)]
+fn write_system_clipboard(_text: &str) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn write_system_clipboard(text: &str) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use arboard::SetExtLinux;
+
+        let mut clipboard =
+            arboard::Clipboard::new().map_err(|error| io::Error::other(error.to_string()))?;
+        return clipboard
+            .set()
+            .wait_until(Instant::now() + SYSTEM_CLIPBOARD_WAIT)
+            .text(text.to_owned())
+            .map_err(|error| io::Error::other(error.to_string()));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        write_system_clipboard_once(text)
+    }
+}
+
+#[cfg(all(not(test), not(target_os = "linux")))]
+fn write_system_clipboard_once(text: &str) -> io::Result<()> {
+    let mut clipboard =
+        arboard::Clipboard::new().map_err(|error| io::Error::other(error.to_string()))?;
+    clipboard
+        .set_text(text.to_owned())
+        .map_err(|error| io::Error::other(error.to_string()))
 }
 
 #[cfg(test)]
@@ -10777,6 +10939,28 @@ mod tests {
 
         assert_eq!(buffer_line(&buffer, 0, 20).trim_end(), "green row");
         assert_eq!(buffer[(0, 0)].fg, Color::Indexed(2));
+    }
+
+    #[test]
+    fn deep_scrollback_keeps_terminal_parser_colors() {
+        let mut task = TaskRuntime::new(test_task("web"), PathBuf::from("."));
+        task.resize(24, 4);
+        task.process_output(b"\x1b[31mred oldest\x1b[0m\r\n");
+        for line in 1..12 {
+            task.process_output(format!("plain {line}\r\n").as_bytes());
+        }
+
+        assert!(task.terminal_scrollback_len > usize::from(task.pty_size.rows));
+        task.scroll_to_top();
+        assert!(task.scroll_offset > usize::from(task.pty_size.rows));
+        assert!(!task.renders_with_terminal_parser(4));
+
+        let area = Rect::new(0, 0, 24, 4);
+        let mut buffer = Buffer::empty(area);
+        render_history(&task, area, &mut buffer);
+
+        assert_eq!(buffer_line(&buffer, 0, 24).trim_end(), "red oldest");
+        assert_eq!(buffer[(0, 0)].fg, Color::Indexed(1));
     }
 
     #[test]
