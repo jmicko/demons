@@ -1118,7 +1118,7 @@ impl App {
             KeyCode::Char('?') => self.open_menu(MenuTab::Help),
             KeyCode::Char('f') => self.fullscreen = !self.fullscreen,
             KeyCode::Char('/') => self.start_search(),
-            KeyCode::Char('y') => self.copy_focused_visible(),
+            KeyCode::Char('y') => self.copy_selection_or_notice(),
             KeyCode::Char('Y') => self.copy_focused_history(),
             KeyCode::Char('S') => self.save_focused_history()?,
             KeyCode::Char('r') => self.request_restart(self.focus),
@@ -2826,7 +2826,7 @@ impl App {
             FooterAction::SearchNewer => self.submit_search(SearchDirection::Newer),
             FooterAction::SearchNextPane => self.cycle_search_pane(1),
             FooterAction::SearchDone => self.cancel_search(),
-            FooterAction::CopyVisible => self.copy_focused_visible(),
+            FooterAction::CopySelection => self.copy_selection_or_notice(),
             FooterAction::CopyHistory => self.copy_focused_history(),
             FooterAction::SaveHistory => self.save_focused_history()?,
             FooterAction::ShowMenu => self.open_menu(MenuTab::Help),
@@ -3299,21 +3299,9 @@ impl App {
         true
     }
 
-    fn copy_focused_visible(&mut self) {
-        let Some(text) = self
-            .visible_pane_text(self.focus)
-            .filter(|text| !text.is_empty())
-        else {
-            self.set_notice("Focused pane has no visible text.".to_owned());
-            return;
-        };
-        self.clipboard = text.clone();
-        let copied = write_clipboard(&text, true);
-        let chars = text.chars().count();
-        if copied.system_or_terminal() {
-            self.set_notice(format!("Copied {chars} visible characters."));
-        } else {
-            self.set_notice(format!("Copied {chars} visible characters internally."));
+    fn copy_selection_or_notice(&mut self) {
+        if !self.copy_selection() {
+            self.set_notice("No selection to copy.".to_owned());
         }
     }
 
@@ -3384,6 +3372,7 @@ impl App {
         Ok(())
     }
 
+    #[cfg(test)]
     fn visible_pane_text(&self, index: usize) -> Option<String> {
         let task = self.tasks.get(index)?;
         let area = self.task_output_rect(index)?;
@@ -3576,10 +3565,14 @@ impl App {
                             .unwrap_or_else(|| "no tasks configured".to_owned()),
                     ),
                     footer_status("drag select"),
-                    footer_status("right-click copy"),
+                    footer_status("Ctrl+Shift+C copy"),
                 ],
             ),
-            AppMode::Command => ("❄ COMMAND ❄", THEME_COMMAND, command_footer_items()),
+            AppMode::Command => (
+                "❄ COMMAND ❄",
+                THEME_COMMAND,
+                command_footer_items(self.selected_text().is_some()),
+            ),
             AppMode::Search => ("❄ SEARCH ❄", THEME_GOLD, search_placeholder_footer_items()),
         }
     }
@@ -9150,7 +9143,7 @@ enum FooterAction {
     SearchNewer,
     SearchNextPane,
     SearchDone,
-    CopyVisible,
+    CopySelection,
     CopyHistory,
     SaveHistory,
     ShowMenu,
@@ -9173,11 +9166,11 @@ fn footer_status(label: impl Into<String>) -> FooterItem {
     )
 }
 
-fn command_footer_items() -> Vec<FooterItem> {
-    [
+fn command_footer_items(has_selection: bool) -> Vec<FooterItem> {
+    let mut items = [
         ("f fullscreen", FooterAction::ToggleFullscreen),
         ("/ search", FooterAction::StartSearch),
-        ("y copy", FooterAction::CopyVisible),
+        ("y copy", FooterAction::CopySelection),
         ("Y copy all", FooterAction::CopyHistory),
         ("S save", FooterAction::SaveHistory),
         ("r restart", FooterAction::RestartFocused),
@@ -9189,7 +9182,11 @@ fn command_footer_items() -> Vec<FooterItem> {
     .into_iter()
     .enumerate()
     .map(|(index, (label, action))| footer_command_button(label, action, index))
-    .collect()
+    .collect::<Vec<_>>();
+    if !has_selection && let Some(item) = items.get_mut(2) {
+        *item = footer_disabled_button("y copy", 2);
+    }
+    items
 }
 
 fn search_footer_items(search: &SearchState) -> Vec<FooterItem> {
@@ -9228,6 +9225,15 @@ fn footer_command_button(
 ) -> FooterItem {
     let style = footer_palette_for_index(index);
     FooterItem::new(format!(" {} ", label.into()), Some(action), style)
+}
+
+fn footer_disabled_button(label: impl Into<String>, index: usize) -> FooterItem {
+    let base = footer_palette_for_index(index);
+    FooterItem::new(
+        format!(" {} ", label.into()),
+        None,
+        footer_style(THEME_HOLLY, base.bg, THEME_HOLLY, base.bg),
+    )
 }
 
 fn footer_palette_for_index(index: usize) -> FooterItemStyle {
@@ -10093,14 +10099,11 @@ mod tests {
 
     #[test]
     fn command_footer_splits_paired_actions_into_buttons() {
-        let items = command_footer_items();
+        let items = command_footer_items(true);
 
-        assert!(
-            items
-                .iter()
-                .any(|item| item.text == " y copy "
-                    && item.action == Some(FooterAction::CopyVisible))
-        );
+        assert!(items.iter().any(
+            |item| item.text == " y copy " && item.action == Some(FooterAction::CopySelection)
+        ));
         assert!(
             items.iter().any(|item| item.text == " Y copy all "
                 && item.action == Some(FooterAction::CopyHistory))
@@ -10118,7 +10121,7 @@ mod tests {
 
     #[test]
     fn command_footer_uses_alternating_button_contrast() {
-        let items = command_footer_items();
+        let items = command_footer_items(true);
 
         assert_eq!(items[0].style.fg, THEME_BLACK);
         assert_eq!(items[1].style.fg, THEME_WHITE);
@@ -10327,7 +10330,19 @@ mod tests {
     }
 
     #[test]
-    fn footer_copy_buttons_click_visible_and_full_history_actions() {
+    fn command_footer_disables_copy_button_without_selection() {
+        let items = command_footer_items(false);
+        let copy = items
+            .iter()
+            .find(|item| item.text == " y copy ")
+            .expect("copy item");
+
+        assert_eq!(copy.action, None);
+        assert_eq!(copy.style.fg, THEME_HOLLY);
+    }
+
+    #[test]
+    fn footer_copy_buttons_click_selection_and_full_history_actions() {
         let mut app = test_app();
         app.mode = AppMode::Input;
         app.update_layout(Rect::new(0, 0, 100, 8));
@@ -10336,14 +10351,29 @@ mod tests {
             app.tasks[0].process_output(format!("line {line}\n").as_bytes());
         }
         app.tasks[0].scroll_up(10);
+        app.selection = Some(Selection {
+            pane: 0,
+            anchor: SelectionPoint { line: 6, column: 0 },
+            cursor: SelectionPoint { line: 6, column: 5 },
+            granularity: SelectionGranularity::Character,
+            origin: None,
+            history_backed: true,
+            parser_anchor: None,
+            parser_cursor: None,
+            parser_origin: None,
+            dragging: false,
+            dragged: true,
+            last_mouse: None,
+            last_scroll: Instant::now(),
+        });
 
         let mut buffer = Buffer::empty(Rect::new(0, 0, 120, 2));
-        let items = command_footer_items();
+        let items = command_footer_items(true);
         app.footer_hits = render_footer_items(&items, Rect::new(0, 0, 120, 2), &mut buffer, None);
-        let copy_visible = app
+        let copy_selection = app
             .footer_hits
             .iter()
-            .find(|hit| hit.action == FooterAction::CopyVisible)
+            .find(|hit| hit.action == FooterAction::CopySelection)
             .unwrap()
             .rect;
         let copy_history = app
@@ -10355,13 +10385,12 @@ mod tests {
 
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
-            column: copy_visible.x,
-            row: copy_visible.y,
+            column: copy_selection.x,
+            row: copy_selection.y,
             modifiers: KeyModifiers::NONE,
         })
         .unwrap();
-        assert!(app.clipboard.contains("line 6"));
-        assert!(!app.clipboard.contains("line 19"));
+        assert_eq!(app.clipboard, "line 6");
 
         app.clipboard.clear();
         app.handle_mouse(MouseEvent {
@@ -10385,7 +10414,7 @@ mod tests {
         }
 
         let mut buffer = Buffer::empty(Rect::new(0, 0, 120, 2));
-        let items = command_footer_items();
+        let items = command_footer_items(false);
         app.footer_hits = render_footer_items(&items, Rect::new(0, 0, 120, 2), &mut buffer, None);
         let restart = app
             .footer_hits
@@ -10892,20 +10921,35 @@ mod tests {
     }
 
     #[test]
-    fn command_mode_y_copies_focused_visible_screen() {
+    fn command_mode_y_copies_selection() {
         let mut app = test_app();
         app.update_layout(Rect::new(0, 0, 100, 20));
         app.mode = AppMode::Command;
         app.tasks[0].process_output(b"hello\x1b[1GXY");
+        app.selection = Some(Selection {
+            pane: 0,
+            anchor: SelectionPoint { line: 0, column: 0 },
+            cursor: SelectionPoint { line: 0, column: 1 },
+            granularity: SelectionGranularity::Character,
+            origin: None,
+            history_backed: false,
+            parser_anchor: Some(SelectionPoint { line: 0, column: 0 }),
+            parser_cursor: Some(SelectionPoint { line: 0, column: 1 }),
+            parser_origin: None,
+            dragging: false,
+            dragged: true,
+            last_mouse: None,
+            last_scroll: Instant::now(),
+        });
 
         app.handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE))
             .unwrap();
 
-        assert_eq!(app.clipboard, "XYllo");
+        assert_eq!(app.clipboard, "XY");
     }
 
     #[test]
-    fn command_mode_y_copies_scrolled_history_window() {
+    fn command_mode_y_without_selection_shows_notice() {
         let mut app = test_app();
         app.mode = AppMode::Input;
         app.update_layout(Rect::new(0, 0, 100, 8));
@@ -10918,9 +10962,12 @@ mod tests {
         app.handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE))
             .unwrap();
 
-        assert!(app.clipboard.contains("line 6"));
-        assert!(app.clipboard.contains("line 10"));
-        assert!(!app.clipboard.contains("line 19"));
+        assert!(app.clipboard.is_empty());
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|notice| notice.text == "No selection to copy.")
+        );
     }
 
     #[test]
