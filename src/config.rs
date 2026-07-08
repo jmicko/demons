@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 pub const CONFIG_FILE: &str = "demons.toml";
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 pub const DEFAULT_MULTI_CLICK_MS: u64 = 500;
 pub const MIN_MULTI_CLICK_MS: u64 = 150;
 pub const MAX_MULTI_CLICK_MS: u64 = 1000;
@@ -26,6 +26,8 @@ pub struct Config {
     #[serde(default)]
     #[serde(rename = "task")]
     pub tasks: Vec<Task>,
+    #[serde(default, rename = "terminal", skip_serializing_if = "Vec::is_empty")]
+    pub terminals: Vec<TerminalPane>,
 }
 
 impl Default for Config {
@@ -34,6 +36,7 @@ impl Default for Config {
             schema_version: CURRENT_SCHEMA_VERSION,
             settings: Settings::default(),
             tasks: Vec::new(),
+            terminals: Vec::new(),
         }
     }
 }
@@ -165,6 +168,16 @@ impl TaskCommand {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalPane {
+    pub name: String,
+    #[serde(default = "default_cwd")]
+    pub cwd: PathBuf,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct LoadedConfig {
     pub path: PathBuf,
@@ -216,6 +229,17 @@ pub enum ConfigProblemLocation {
         index: usize,
         field: Option<ConfigTaskField>,
     },
+    Terminal {
+        index: usize,
+        field: Option<ConfigTerminalField>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigTerminalField {
+    Name,
+    Cwd,
+    Env,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -314,6 +338,14 @@ impl LoadedConfig {
             self.root.join(&task.cwd)
         }
     }
+
+    pub fn terminal_cwd(&self, terminal: &TerminalPane) -> PathBuf {
+        if terminal.cwd.is_absolute() {
+            terminal.cwd.clone()
+        } else {
+            self.root.join(&terminal.cwd)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -337,7 +369,7 @@ fn parse_file_with_metadata(path: &Path) -> Result<ParsedConfig> {
 
 fn parse_source(source: &str, path: &Path) -> Result<ParsedConfig> {
     let schema = detect_schema_version(source, path)?;
-    if schema.version != CURRENT_SCHEMA_VERSION {
+    if schema.version > CURRENT_SCHEMA_VERSION {
         bail!(
             "{} uses config schema_version {}, but this demons release supports schema_version {}",
             path.display(),
@@ -345,11 +377,15 @@ fn parse_source(source: &str, path: &Path) -> Result<ParsedConfig> {
             CURRENT_SCHEMA_VERSION
         );
     }
-    let config = toml::from_str(source)
+    let mut config: Config = toml::from_str(source)
         .with_context(|| format!("failed to parse config {}", path.display()))?;
+    let needs_normalization = schema.was_missing || schema.version < CURRENT_SCHEMA_VERSION;
+    if needs_normalization {
+        config.schema_version = CURRENT_SCHEMA_VERSION;
+    }
     Ok(ParsedConfig {
         config,
-        needs_normalization: schema.was_missing,
+        needs_normalization,
         warnings: Vec::new(),
         problems: Vec::new(),
     })
@@ -390,7 +426,7 @@ fn recover_config_source(
     let recovered_source = recover_missing_assignment_values(source);
     let recovery_source = recovered_source.as_deref().unwrap_or(source);
     let schema = detect_schema_version(recovery_source, path)?;
-    if schema.version != CURRENT_SCHEMA_VERSION {
+    if schema.version > CURRENT_SCHEMA_VERSION {
         bail!(
             "{} uses config schema_version {}, but this demons release supports schema_version {}",
             path.display(),
@@ -415,7 +451,7 @@ fn recover_config_source(
     warn_unknown_keys(
         "root",
         root.keys().map(String::as_str),
-        &["schema_version", "settings", "task"],
+        &["schema_version", "settings", "task", "terminal"],
         ConfigProblemLocation::Root,
         &mut warnings,
         &mut problems,
@@ -423,12 +459,14 @@ fn recover_config_source(
 
     let settings = recover_settings(root.get("settings"), &mut warnings, &mut problems);
     let mut recovered = recover_tasks(root.get("task"), &mut warnings, &mut problems);
+    let terminals = recover_terminals(root.get("terminal"), &mut warnings, &mut problems);
     scrub_recovered_dependencies(&mut recovered, &mut warnings, &mut problems);
 
     let config = Config {
         schema_version: CURRENT_SCHEMA_VERSION,
         settings,
         tasks: recovered.into_iter().map(|task| task.task).collect(),
+        terminals,
     };
     problems.extend(config_blocking_problems(&config, path));
 
@@ -711,6 +749,264 @@ fn recover_tasks(
             Vec::new()
         }
     }
+}
+
+fn recover_terminals(
+    value: Option<&toml::Value>,
+    warnings: &mut Vec<String>,
+    problems: &mut Vec<ConfigProblem>,
+) -> Vec<TerminalPane> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    let mut used_names = HashSet::new();
+    match value {
+        toml::Value::Array(terminals) => terminals
+            .iter()
+            .enumerate()
+            .filter_map(|(index, terminal)| {
+                recover_terminal(index, terminal, &mut used_names, warnings, problems)
+            })
+            .collect(),
+        toml::Value::Table(_) => {
+            push_recovery_warning(
+                warnings,
+                problems,
+                ConfigProblemLocation::Tasks,
+                "Recovered [terminal] as a single terminal; use [[terminal]] for terminal arrays."
+                    .to_owned(),
+            );
+            recover_terminal(0, value, &mut used_names, warnings, problems)
+                .into_iter()
+                .collect()
+        }
+        _ => {
+            push_recovery_warning(
+                warnings,
+                problems,
+                ConfigProblemLocation::Tasks,
+                "Ignored terminal entries because terminal was not an array of tables.".to_owned(),
+            );
+            Vec::new()
+        }
+    }
+}
+
+fn recover_terminal(
+    index: usize,
+    value: &toml::Value,
+    used_names: &mut HashSet<String>,
+    warnings: &mut Vec<String>,
+    problems: &mut Vec<ConfigProblem>,
+) -> Option<TerminalPane> {
+    let Some(table) = value.as_table() else {
+        push_recovery_warning(
+            warnings,
+            problems,
+            ConfigProblemLocation::Tasks,
+            format!(
+                "Ignored terminal #{} because it was not a table.",
+                index + 1
+            ),
+        );
+        return None;
+    };
+    let label = format!("terminal #{}", index + 1);
+    warn_unknown_keys(
+        &label,
+        table.keys().map(String::as_str),
+        &["name", "cwd", "env"],
+        ConfigProblemLocation::Terminal { index, field: None },
+        warnings,
+        problems,
+    );
+    let name = recover_terminal_name(index, table.get("name"), used_names, warnings, problems);
+    let cwd = recover_terminal_cwd(&name, table.get("cwd"), warnings, problems, index);
+    let env = recover_terminal_env(&name, table.get("env"), warnings, problems, index);
+    Some(TerminalPane { name, cwd, env })
+}
+
+fn recover_terminal_name(
+    index: usize,
+    value: Option<&toml::Value>,
+    used_names: &mut HashSet<String>,
+    warnings: &mut Vec<String>,
+    problems: &mut Vec<ConfigProblem>,
+) -> String {
+    let fallback = || {
+        if index == 0 {
+            "terminal".to_owned()
+        } else {
+            format!("terminal{}", index + 1)
+        }
+    };
+    let candidate = match value.and_then(toml::Value::as_str) {
+        Some(name) => {
+            let trimmed = name.trim();
+            if trimmed != name {
+                push_recovery_warning(
+                    warnings,
+                    problems,
+                    ConfigProblemLocation::Terminal {
+                        index,
+                        field: Some(ConfigTerminalField::Name),
+                    },
+                    format!("Trimmed whitespace from terminal name {name:?}."),
+                );
+            }
+            if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
+                push_recovery_warning(
+                    warnings,
+                    problems,
+                    ConfigProblemLocation::Terminal {
+                        index,
+                        field: Some(ConfigTerminalField::Name),
+                    },
+                    format!("Replaced invalid terminal name {name:?}."),
+                );
+                fallback()
+            } else {
+                trimmed.to_owned()
+            }
+        }
+        None => {
+            push_recovery_warning(
+                warnings,
+                problems,
+                ConfigProblemLocation::Terminal {
+                    index,
+                    field: Some(ConfigTerminalField::Name),
+                },
+                format!("Filled missing terminal #{} name.", index + 1),
+            );
+            fallback()
+        }
+    };
+    unique_recovered_terminal_name(candidate, used_names, warnings, problems, index)
+}
+
+fn unique_recovered_terminal_name(
+    candidate: String,
+    used_names: &mut HashSet<String>,
+    warnings: &mut Vec<String>,
+    problems: &mut Vec<ConfigProblem>,
+    index: usize,
+) -> String {
+    if used_names.insert(candidate.clone()) {
+        return candidate;
+    }
+    for suffix in 2.. {
+        let renamed = format!("{candidate}{suffix}");
+        if used_names.insert(renamed.clone()) {
+            push_recovery_warning(
+                warnings,
+                problems,
+                ConfigProblemLocation::Terminal {
+                    index,
+                    field: Some(ConfigTerminalField::Name),
+                },
+                format!("Renamed duplicate terminal {candidate:?} to {renamed:?}."),
+            );
+            return renamed;
+        }
+    }
+    unreachable!("unbounded suffix search always returns");
+}
+
+fn recover_terminal_cwd(
+    terminal_name: &str,
+    value: Option<&toml::Value>,
+    warnings: &mut Vec<String>,
+    problems: &mut Vec<ConfigProblem>,
+    index: usize,
+) -> PathBuf {
+    match value.and_then(toml::Value::as_str) {
+        Some(cwd) => PathBuf::from(cwd),
+        None if value.is_some() => {
+            push_recovery_warning(
+                warnings,
+                problems,
+                ConfigProblemLocation::Terminal {
+                    index,
+                    field: Some(ConfigTerminalField::Cwd),
+                },
+                format!(
+                    "Reset cwd for terminal {terminal_name:?} to \".\" because it was not a string."
+                ),
+            );
+            PathBuf::from(".")
+        }
+        None => PathBuf::from("."),
+    }
+}
+
+fn recover_terminal_env(
+    terminal_name: &str,
+    value: Option<&toml::Value>,
+    warnings: &mut Vec<String>,
+    problems: &mut Vec<ConfigProblem>,
+    index: usize,
+) -> BTreeMap<String, String> {
+    let Some(value) = value else {
+        return BTreeMap::new();
+    };
+    let Some(table) = value.as_table() else {
+        push_recovery_warning(
+            warnings,
+            problems,
+            ConfigProblemLocation::Terminal {
+                index,
+                field: Some(ConfigTerminalField::Env),
+            },
+            format!("Ignored env for terminal {terminal_name:?} because it was not a table."),
+        );
+        return BTreeMap::new();
+    };
+    let mut env = BTreeMap::new();
+    for (key, value) in table {
+        if key.is_empty() || key.contains(['=', '\0']) || key.contains(char::is_whitespace) {
+            push_recovery_warning(
+                warnings,
+                problems,
+                ConfigProblemLocation::Terminal {
+                    index,
+                    field: Some(ConfigTerminalField::Env),
+                },
+                format!("Ignored invalid env key {key:?} for terminal {terminal_name:?}."),
+            );
+            continue;
+        }
+        let Some(value) = value.as_str() else {
+            push_recovery_warning(
+                warnings,
+                problems,
+                ConfigProblemLocation::Terminal {
+                    index,
+                    field: Some(ConfigTerminalField::Env),
+                },
+                format!(
+                    "Ignored env key {key:?} for terminal {terminal_name:?}; value was not a string."
+                ),
+            );
+            continue;
+        };
+        if value.contains('\0') {
+            push_recovery_warning(
+                warnings,
+                problems,
+                ConfigProblemLocation::Terminal {
+                    index,
+                    field: Some(ConfigTerminalField::Env),
+                },
+                format!(
+                    "Ignored env key {key:?} for terminal {terminal_name:?}; value contained a NUL byte."
+                ),
+            );
+            continue;
+        }
+        env.insert(key.clone(), value.to_owned());
+    }
+    env
 }
 
 fn recover_task(
@@ -1209,7 +1505,9 @@ fn repair_config_for_configurator(
     }
 
     repair_task_names(config, warnings, problems);
+    repair_terminal_names(config, warnings, problems);
     repair_task_env(config, warnings, problems);
+    repair_terminal_env(config, warnings, problems);
     repair_task_dependencies(config, warnings, problems);
     repair_reserved_task_fields(config, warnings, problems);
     problems.extend(config_blocking_problems(config, path));
@@ -1279,6 +1577,82 @@ fn repair_task_env(
                         field: Some(ConfigTaskField::Env),
                     },
                     format!("Ignored invalid env key {key:?} for task {task_name:?}."),
+                );
+            }
+            keep
+        });
+    }
+}
+
+fn repair_terminal_names(
+    config: &mut Config,
+    warnings: &mut Vec<String>,
+    problems: &mut Vec<ConfigProblem>,
+) {
+    let mut used_names = config
+        .tasks
+        .iter()
+        .map(|task| task.name.clone())
+        .collect::<HashSet<_>>();
+    for (index, terminal) in config.terminals.iter_mut().enumerate() {
+        let original = terminal.name.clone();
+        let trimmed = original.trim();
+        let candidate = if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
+            push_recovery_warning(
+                warnings,
+                problems,
+                ConfigProblemLocation::Terminal {
+                    index,
+                    field: Some(ConfigTerminalField::Name),
+                },
+                format!("Replaced invalid terminal name {original:?}."),
+            );
+            if index == 0 {
+                "terminal".to_owned()
+            } else {
+                format!("terminal{}", index + 1)
+            }
+        } else {
+            if trimmed != original {
+                push_recovery_warning(
+                    warnings,
+                    problems,
+                    ConfigProblemLocation::Terminal {
+                        index,
+                        field: Some(ConfigTerminalField::Name),
+                    },
+                    format!("Trimmed whitespace from terminal name {original:?}."),
+                );
+            }
+            trimmed.to_owned()
+        };
+        let repaired =
+            unique_recovered_terminal_name(candidate, &mut used_names, warnings, problems, index);
+        terminal.name = repaired;
+    }
+}
+
+fn repair_terminal_env(
+    config: &mut Config,
+    warnings: &mut Vec<String>,
+    problems: &mut Vec<ConfigProblem>,
+) {
+    for (index, terminal) in config.terminals.iter_mut().enumerate() {
+        let terminal_name = terminal.name.clone();
+        terminal.env.retain(|key, value| {
+            let keep = !key.is_empty()
+                && !key.contains(['=', '\0'])
+                && !key.contains(char::is_whitespace)
+                && !value.contains('\0');
+            if !keep {
+                push_recovery_warning(
+                    warnings,
+                    problems,
+                    ConfigProblemLocation::Terminal {
+                        index,
+                        field: Some(ConfigTerminalField::Env),
+                    },
+                    format!("Ignored invalid env key {key:?} for terminal {terminal_name:?}."),
                 );
             }
             keep
@@ -1370,11 +1744,11 @@ pub fn config_blocking_problems(config: &Config, path: &Path) -> Vec<ConfigProbl
             ),
         ));
     }
-    if config.tasks.is_empty() {
+    if config.tasks.is_empty() && config.terminals.is_empty() {
         can_check_cycles = false;
         problems.push(ConfigProblem::error(
             ConfigProblemLocation::Tasks,
-            "At least one task is required.",
+            "At least one task or terminal is required.",
         ));
     }
     if config.settings.logging {
@@ -1520,6 +1894,57 @@ pub fn config_blocking_problems(config: &Config, path: &Path) -> Vec<ConfigProbl
         }
     }
 
+    for (index, terminal) in config.terminals.iter().enumerate() {
+        if terminal.name.trim().is_empty() {
+            problems.push(terminal_problem(
+                index,
+                ConfigTerminalField::Name,
+                "Terminal name is required.",
+            ));
+        } else if terminal.name.trim() != terminal.name
+            || terminal.name.chars().any(char::is_control)
+        {
+            problems.push(terminal_problem(
+                index,
+                ConfigTerminalField::Name,
+                "Terminal name cannot have leading/trailing whitespace or control characters.",
+            ));
+        } else if !names.insert(terminal.name.as_str()) {
+            problems.push(terminal_problem(
+                index,
+                ConfigTerminalField::Name,
+                format!("Duplicate pane name {:?}.", terminal.name),
+            ));
+        }
+
+        let cwd = if terminal.cwd.is_absolute() {
+            terminal.cwd.clone()
+        } else {
+            root.join(&terminal.cwd)
+        };
+        if !cwd.is_dir() {
+            problems.push(terminal_problem(
+                index,
+                ConfigTerminalField::Cwd,
+                format!("Working directory is not a directory: {}.", cwd.display()),
+            ));
+        }
+
+        for (key, value) in &terminal.env {
+            if key.is_empty()
+                || key.contains(['=', '\0'])
+                || key.contains(char::is_whitespace)
+                || value.contains('\0')
+            {
+                problems.push(terminal_problem(
+                    index,
+                    ConfigTerminalField::Env,
+                    format!("Environment entry {key:?} is invalid."),
+                ));
+            }
+        }
+    }
+
     if can_check_cycles && let Err(error) = reject_dependency_cycles(config, &name_to_index, path) {
         problems.push(ConfigProblem::error(
             ConfigProblemLocation::Tasks,
@@ -1539,6 +1964,20 @@ fn task_problem(index: usize, field: ConfigTaskField, message: impl Into<String>
     )
 }
 
+fn terminal_problem(
+    index: usize,
+    field: ConfigTerminalField,
+    message: impl Into<String>,
+) -> ConfigProblem {
+    ConfigProblem::error(
+        ConfigProblemLocation::Terminal {
+            index,
+            field: Some(field),
+        },
+        message,
+    )
+}
+
 pub fn validate_for_path(config: &Config, path: &Path) -> Result<()> {
     if config.schema_version != CURRENT_SCHEMA_VERSION {
         bail!(
@@ -1548,8 +1987,11 @@ pub fn validate_for_path(config: &Config, path: &Path) -> Result<()> {
             CURRENT_SCHEMA_VERSION
         );
     }
-    if config.tasks.is_empty() {
-        bail!("{} must define at least one [[task]]", path.display());
+    if config.tasks.is_empty() && config.terminals.is_empty() {
+        bail!(
+            "{} must define at least one [[task]] or [[terminal]]",
+            path.display()
+        );
     }
     if config.settings.logging {
         bail!(
@@ -1687,6 +2129,54 @@ pub fn validate_for_path(config: &Config, path: &Path) -> Result<()> {
                     dependency
                 );
             }
+        }
+    }
+    for (index, terminal) in config.terminals.iter().enumerate() {
+        let label = format!("terminal #{}", index + 1);
+        if terminal.name.trim().is_empty() {
+            bail!("{}: {label} has an empty name", path.display());
+        }
+        if terminal.name.trim() != terminal.name || terminal.name.chars().any(char::is_control) {
+            bail!(
+                "{}: terminal name {:?} has leading/trailing whitespace or control characters",
+                path.display(),
+                terminal.name
+            );
+        }
+        if !names.insert(terminal.name.as_str()) {
+            bail!(
+                "{}: duplicate pane name {:?}",
+                path.display(),
+                terminal.name
+            );
+        }
+        for (key, value) in &terminal.env {
+            if key.is_empty()
+                || key.contains(['=', '\0'])
+                || key.contains(char::is_whitespace)
+                || value.contains('\0')
+            {
+                bail!(
+                    "{}: terminal {:?} has an invalid environment entry for key {:?}",
+                    path.display(),
+                    terminal.name,
+                    key
+                );
+            }
+        }
+
+        let cwd = if terminal.cwd.is_absolute() {
+            terminal.cwd.clone()
+        } else {
+            root.join(&terminal.cwd)
+        };
+        if !cwd.is_dir() {
+            bail!(
+                "{}: cwd for terminal {:?} is not a directory: {}",
+                path.display(),
+                terminal.name,
+                cwd.display()
+            );
         }
     }
     reject_dependency_cycles(config, &name_to_index, path)?;
@@ -1889,7 +2379,7 @@ mod tests {
 
         assert_eq!(loaded.config.schema_version, CURRENT_SCHEMA_VERSION);
         let saved = fs::read_to_string(path).unwrap();
-        assert!(saved.contains("schema_version = 1"));
+        assert!(saved.contains("schema_version = 2"));
         assert!(saved.contains("[settings]"));
         assert!(saved.contains("layout = \"grid\""));
         assert!(saved.contains("leader = \"alt-j\""));
@@ -1909,7 +2399,7 @@ mod tests {
 
         let error = LoadedConfig::load(path.clone()).unwrap_err().to_string();
 
-        assert!(error.contains("must define at least one [[task]]"));
+        assert!(error.contains("must define at least one [[task]] or [[terminal]]"));
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }
 
@@ -1933,7 +2423,7 @@ mod tests {
         assert!(
             fs::read_to_string(path)
                 .unwrap()
-                .contains("schema_version = 1")
+                .contains("schema_version = 2")
         );
     }
 
@@ -2083,7 +2573,7 @@ mod tests {
         fs::write(
             &path,
             r#"
-                schema_version = 2
+                schema_version = 3
                 future_setting = true
             "#,
         )
@@ -2093,7 +2583,7 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert!(error.contains("uses config schema_version 2"));
+        assert!(error.contains("uses config schema_version 3"));
     }
 
     #[test]
@@ -2179,10 +2669,10 @@ mod tests {
     }
 
     #[test]
-    fn load_does_not_rewrite_already_versioned_config() {
+    fn load_does_not_rewrite_current_version_config() {
         let temp = tempdir().unwrap();
         let path = temp.path().join(CONFIG_FILE);
-        let original = r#"schema_version = 1
+        let original = r#"schema_version = 2
 
 [[task]]
 name = "server"
@@ -2202,7 +2692,7 @@ command = "echo ok"
         fs::write(
             &path,
             r#"
-                schema_version = 2
+                schema_version = 3
                 future_setting = true
             "#,
         )
@@ -2210,8 +2700,8 @@ command = "echo ok"
 
         let error = parse_file(&path).unwrap_err().to_string();
 
-        assert!(error.contains("uses config schema_version 2"));
-        assert!(error.contains("supports schema_version 1"));
+        assert!(error.contains("uses config schema_version 3"));
+        assert!(error.contains("supports schema_version 2"));
     }
 
     #[test]
@@ -2312,6 +2802,39 @@ command = "echo ok"
         )
         .unwrap();
         assert!(validate_for_path(&duplicate, &path).is_err());
+    }
+
+    #[test]
+    fn validates_terminal_only_config_and_shared_pane_names() {
+        let temp = tempdir().unwrap();
+        fs::create_dir(temp.path().join("scratch")).unwrap();
+        let path = temp.path().join(CONFIG_FILE);
+        let terminal_only: Config = toml::from_str(
+            r#"
+                [[terminal]]
+                name = "scratch"
+                cwd = "scratch"
+            "#,
+        )
+        .unwrap();
+        validate_for_path(&terminal_only, &path).unwrap();
+
+        let duplicate: Config = toml::from_str(
+            r#"
+                [[task]]
+                name = "scratch"
+                command = "echo task"
+
+                [[terminal]]
+                name = "scratch"
+                cwd = "."
+            "#,
+        )
+        .unwrap();
+        let error = validate_for_path(&duplicate, &path)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("duplicate pane name"));
     }
 
     #[test]

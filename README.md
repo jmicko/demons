@@ -72,7 +72,7 @@ then starts them after you fix red problems and save.
 Or create `demons.toml` yourself:
 
 ```toml
-schema_version = 1
+schema_version = 2
 
 [settings]
 layout = "grid"
@@ -96,6 +96,10 @@ depends_on = []
 
 [task.env]
 BROWSER = "none"
+
+[[terminal]]
+name = "scratch"
+cwd = "."
 ```
 
 Then run:
@@ -176,7 +180,7 @@ can save or discard that change. `Alt+Backtick` is available for one-hand use,
 but some desktops use it for window switching, so it is not the default.
 
 ```toml
-schema_version = 1
+schema_version = 2
 
 [settings]
 leader = "alt-backtick" # also: "tab", "ctrl-b", "ctrl-q", "ctrl-\\"
@@ -206,7 +210,7 @@ while true; do date; sleep 1; done
 String commands run through `$SHELL -c` (falling back to `/bin/sh`):
 
 ```toml
-schema_version = 1
+schema_version = 2
 
 [[task]]
 name = "api"
@@ -220,7 +224,7 @@ depends_on = []
 Array commands execute directly, without shell parsing:
 
 ```toml
-schema_version = 1
+schema_version = 2
 
 [[task]]
 name = "api"
@@ -238,7 +242,7 @@ a task also restarts its dependents. While a task is waiting for a delayed
 start, the pane body shows the countdown to launch.
 
 ```toml
-schema_version = 1
+schema_version = 2
 
 [[task]]
 name = "server"
@@ -258,15 +262,28 @@ start_delay = "3s"
 [task.env]
 ```
 
-Task names must be unique. Working directories are resolved relative to the
-directory containing the config file. Unknown keys and invalid directories are
-reported before any task starts. Saving task-list changes from the runtime menu
-applies them in the current app session; added, removed, or renamed tasks cause
-the task set to restart in place rather than requiring a Demons restart.
+Use `[[terminal]]` for a regular shell pane that starts alongside tasks:
+
+```toml
+schema_version = 2
+
+[[terminal]]
+name = "scratch"
+cwd = "."
+```
+
+Task and terminal names share one namespace. Working directories are resolved
+relative to the directory containing the config file. Unknown keys and invalid
+directories are reported before any task starts. Saving task-list changes from
+the runtime menu applies them in the current app session; added, removed, or
+renamed panes restart in place rather than requiring a Demons restart. The
+command footer also has `t terminal` for adding a temporary shell pane that is
+not written to the config.
 
 `schema_version` is the Demons config schema version, not the Demons app or
-crate version. Existing unversioned configs are treated as schema version 1 and
-are normalized after they successfully validate.
+crate version. Existing unversioned configs are treated as the current schema
+and are normalized after they successfully validate. Schema version 1 configs
+load as v2 and gain terminal support when they are next saved.
 
 `logging`, `watch`, `run_on_change`, and `repeat` are reserved schema fields.
 Demons rejects reserved task fields when set, and rejects `logging = true`, so

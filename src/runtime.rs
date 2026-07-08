@@ -42,8 +42,9 @@ use vt100::{MouseProtocolEncoding, MouseProtocolMode, Parser};
 use crate::{
     config::{
         ConfigProblem, ConfigProblemLocation, ConfigProblemSeverity, ConfigSettingField,
-        ConfigTaskField, Leader, LoadedConfig, MAX_MULTI_CLICK_MS, MIN_MULTI_CLICK_MS,
-        MULTI_CLICK_STEP_MS, Task, TaskCommand, config_blocking_problems, parse_start_delay,
+        ConfigTaskField, ConfigTerminalField, Leader, LoadedConfig, MAX_MULTI_CLICK_MS,
+        MIN_MULTI_CLICK_MS, MULTI_CLICK_STEP_MS, Task, TaskCommand, TerminalPane,
+        config_blocking_problems, parse_start_delay,
     },
     layout::{Grid, choose_grid, grid_rects, pane_rects},
 };
@@ -601,16 +602,22 @@ impl App {
         quit_when_menu_closes: bool,
         start_after_config_save: bool,
     ) -> Self {
-        let tasks = loaded
+        let mut tasks = loaded
             .config
             .tasks
             .iter()
             .cloned()
             .map(|task| {
                 let cwd = loaded.task_cwd(&task);
-                TaskRuntime::new(task, cwd)
+                TaskRuntime::new_task(task, cwd)
             })
-            .collect();
+            .collect::<Vec<_>>();
+        tasks.extend(loaded.config.terminals.iter().cloned().enumerate().map(
+            |(index, terminal)| {
+                let cwd = loaded.terminal_cwd(&terminal);
+                TaskRuntime::new_config_terminal(index, terminal, cwd)
+            },
+        ));
         let (dependency_indexes, dependent_indexes) = dependency_graph(&loaded.config.tasks);
         let scene_seed = app_scene_seed(&loaded);
         let scene_override = dev_scene_kind_override();
@@ -1121,6 +1128,7 @@ impl App {
             KeyCode::Char('y') => self.copy_selection_or_notice(),
             KeyCode::Char('Y') => self.copy_focused_history(),
             KeyCode::Char('S') => self.save_focused_history()?,
+            KeyCode::Char('t') => self.add_session_terminal(),
             KeyCode::Char('r') => self.request_restart(self.focus),
             KeyCode::Char('R') => self.request_restart_all(),
             KeyCode::Char('q') => return Ok(self.request_quit()),
@@ -1373,6 +1381,7 @@ impl App {
         menu.tab = MenuTab::ALL[next];
         menu.cursor = 0;
         menu.task_detail = None;
+        menu.terminal_detail = None;
         menu.dependency_task = None;
         menu.env_task = None;
         menu.env_detail_key = None;
@@ -1391,7 +1400,10 @@ impl App {
         }
         if let Some(menu) = self.menu.as_mut() {
             menu.cursor = (menu.cursor as isize + delta).rem_euclid(count as isize) as usize;
-            if menu.tab == MenuTab::Tasks && menu.task_detail.is_none() {
+            if menu.tab == MenuTab::Tasks
+                && menu.task_detail.is_none()
+                && menu.terminal_detail.is_none()
+            {
                 menu.task_list_cursor = menu.cursor;
             }
         }
@@ -1464,10 +1476,22 @@ impl App {
                         .copied()
                         .map(MenuAction::TaskField);
                 }
+                if menu.terminal_detail.is_some() {
+                    return terminal_detail_fields()
+                        .get(menu.cursor)
+                        .copied()
+                        .map(MenuAction::TerminalField);
+                }
                 if menu.cursor < menu.draft.tasks.len() {
                     Some(MenuAction::OpenTask(menu.cursor))
-                } else {
+                } else if menu.cursor < menu.draft.tasks.len() + menu.draft.terminals.len() {
+                    Some(MenuAction::OpenTerminal(
+                        menu.cursor - menu.draft.tasks.len(),
+                    ))
+                } else if menu.cursor == menu.draft.tasks.len() + menu.draft.terminals.len() {
                     Some(MenuAction::AddTask)
+                } else {
+                    Some(MenuAction::AddTerminal)
                 }
             }
             MenuTab::Settings => match menu.cursor {
@@ -1495,6 +1519,7 @@ impl App {
                     menu.tab = tab;
                     menu.cursor = 0;
                     menu.task_detail = None;
+                    menu.terminal_detail = None;
                     menu.dependency_task = None;
                     menu.env_task = None;
                     menu.env_detail_key = None;
@@ -1509,6 +1534,20 @@ impl App {
                 {
                     menu.task_list_cursor = index;
                     menu.task_detail = Some(index);
+                    menu.terminal_detail = None;
+                    menu.cursor = 0;
+                    menu.env_task = None;
+                    menu.env_detail_key = None;
+                    menu.env_cursor = 0;
+                }
+            }
+            MenuAction::OpenTerminal(index) => {
+                if let Some(menu) = self.menu.as_mut()
+                    && index < menu.draft.terminals.len()
+                {
+                    menu.task_list_cursor = menu.draft.tasks.len() + index;
+                    menu.task_detail = None;
+                    menu.terminal_detail = Some(index);
                     menu.cursor = 0;
                     menu.env_task = None;
                     menu.env_detail_key = None;
@@ -1516,7 +1555,9 @@ impl App {
                 }
             }
             MenuAction::AddTask => self.add_menu_task(),
+            MenuAction::AddTerminal => self.add_menu_terminal(),
             MenuAction::TaskField(field) => self.activate_task_field(field),
+            MenuAction::TerminalField(field) => self.activate_terminal_field(field),
             MenuAction::ToggleDependency(candidate) => self.toggle_dependency(candidate),
             MenuAction::OpenEnvEntry(index) => self.open_env_entry(index),
             MenuAction::AddEnvVar => self.start_new_env_var(),
@@ -1560,16 +1601,19 @@ impl App {
                 menu.tab = MenuTab::Settings;
                 menu.cursor = 0;
                 menu.task_detail = None;
+                menu.terminal_detail = None;
             }
             ConfigProblemLocation::Setting(field) => {
                 menu.tab = MenuTab::Settings;
                 menu.cursor = setting_cursor(field);
                 menu.task_detail = None;
+                menu.terminal_detail = None;
             }
             ConfigProblemLocation::Tasks => {
                 menu.tab = MenuTab::Tasks;
                 menu.task_detail = None;
-                menu.cursor = task_list_cursor(menu).min(menu.draft.tasks.len());
+                menu.terminal_detail = None;
+                menu.cursor = task_list_cursor(menu).min(task_list_count(menu).saturating_sub(1));
                 menu.task_list_cursor = menu.cursor;
             }
             ConfigProblemLocation::Task { index, field } => {
@@ -1582,11 +1626,30 @@ impl App {
                     return;
                 }
                 menu.task_detail = Some(task_index);
+                menu.terminal_detail = None;
                 menu.task_list_cursor = task_index;
                 menu.cursor = field
                     .and_then(config_task_field_cursor)
                     .unwrap_or(0)
                     .min(task_detail_fields().len().saturating_sub(1));
+            }
+            ConfigProblemLocation::Terminal { index, field } => {
+                menu.tab = MenuTab::Tasks;
+                let terminal_index = index.min(menu.draft.terminals.len().saturating_sub(1));
+                if menu.draft.terminals.is_empty() {
+                    menu.task_detail = None;
+                    menu.terminal_detail = None;
+                    menu.cursor = 0;
+                    menu.task_list_cursor = 0;
+                    return;
+                }
+                menu.task_detail = None;
+                menu.terminal_detail = Some(terminal_index);
+                menu.task_list_cursor = menu.draft.tasks.len() + terminal_index;
+                menu.cursor = field
+                    .and_then(config_terminal_field_cursor)
+                    .unwrap_or(0)
+                    .min(terminal_detail_fields().len().saturating_sub(1));
             }
         }
     }
@@ -1633,6 +1696,11 @@ impl App {
             menu.cursor = task_list_cursor(menu);
             return Action::Continue;
         }
+        if menu.terminal_detail.is_some() {
+            menu.terminal_detail = None;
+            menu.cursor = task_list_cursor(menu);
+            return Action::Continue;
+        }
         if menu.dirty() {
             menu.tab = MenuTab::Exit;
             menu.cursor = 0;
@@ -1666,6 +1734,24 @@ impl App {
         let index = menu.draft.tasks.len() - 1;
         menu.task_list_cursor = index;
         menu.task_detail = Some(index);
+        menu.terminal_detail = None;
+        menu.cursor = 0;
+    }
+
+    fn add_menu_terminal(&mut self) {
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        let name = unique_terminal_name(&menu.draft, "terminal");
+        menu.draft.terminals.push(TerminalPane {
+            name,
+            cwd: PathBuf::from("."),
+            env: BTreeMap::new(),
+        });
+        let index = menu.draft.terminals.len() - 1;
+        menu.task_list_cursor = menu.draft.tasks.len() + index;
+        menu.task_detail = None;
+        menu.terminal_detail = Some(index);
         menu.cursor = 0;
     }
 
@@ -1703,6 +1789,25 @@ impl App {
         }
     }
 
+    fn activate_terminal_field(&mut self, field: TerminalField) {
+        let Some(menu) = self.menu.as_ref() else {
+            return;
+        };
+        let Some(terminal) = menu.terminal_detail else {
+            return;
+        };
+        match field {
+            TerminalField::Name | TerminalField::Cwd => self.start_terminal_edit(terminal, field),
+            TerminalField::Delete => self.delete_menu_terminal(terminal),
+            TerminalField::Back => {
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.terminal_detail = None;
+                    menu.cursor = task_list_cursor(menu);
+                }
+            }
+        }
+    }
+
     fn start_menu_edit(&mut self, task_index: usize, field: TaskField) {
         let Some(menu) = self.menu.as_mut() else {
             return;
@@ -1720,6 +1825,28 @@ impl App {
         menu.edit = Some(MenuEdit {
             target: MenuEditTarget::TaskField {
                 task: task_index,
+                field,
+            },
+            cursor: char_count(&value),
+            value,
+        });
+    }
+
+    fn start_terminal_edit(&mut self, terminal_index: usize, field: TerminalField) {
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        let Some(terminal) = menu.draft.terminals.get(terminal_index) else {
+            return;
+        };
+        let value = match field {
+            TerminalField::Name => terminal.name.clone(),
+            TerminalField::Cwd => terminal.cwd.to_string_lossy().into_owned(),
+            _ => return,
+        };
+        menu.edit = Some(MenuEdit {
+            target: MenuEditTarget::TerminalField {
+                terminal: terminal_index,
                 field,
             },
             cursor: char_count(&value),
@@ -1779,6 +1906,22 @@ impl App {
                     _ => {}
                 }
             }
+            MenuEditTarget::TerminalField { terminal, field } => {
+                let value = edit.value.trim().to_owned();
+                let Some(terminal) = menu.draft.terminals.get_mut(*terminal) else {
+                    return Ok(());
+                };
+                match field {
+                    TerminalField::Name => {
+                        if value.is_empty() {
+                            anyhow::bail!("terminal name cannot be empty");
+                        }
+                        terminal.name = value;
+                    }
+                    TerminalField::Cwd => terminal.cwd = validate_menu_cwd(&root, &value)?,
+                    TerminalField::Delete | TerminalField::Back => {}
+                }
+            }
             MenuEditTarget::EnvKey { task, original_key } => {
                 let key = edit.value.trim().to_owned();
                 validate_env_key(&key)?;
@@ -1826,6 +1969,9 @@ impl App {
                 MenuEditTarget::TaskField {
                     field: TaskField::Cwd,
                     ..
+                } | MenuEditTarget::TerminalField {
+                    field: TerminalField::Cwd,
+                    ..
                 }
             )
             .then(|| (edit.value.clone(), edit.cursor))
@@ -1872,6 +2018,23 @@ impl App {
             0
         } else {
             task_index.min(menu.draft.tasks.len() - 1)
+        };
+        menu.task_list_cursor = menu.cursor;
+    }
+
+    fn delete_menu_terminal(&mut self, terminal_index: usize) {
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        if terminal_index >= menu.draft.terminals.len() {
+            return;
+        }
+        menu.draft.terminals.remove(terminal_index);
+        menu.terminal_detail = None;
+        menu.cursor = if menu.draft.terminals.is_empty() {
+            menu.draft.tasks.len().saturating_sub(1)
+        } else {
+            menu.draft.tasks.len() + terminal_index.min(menu.draft.terminals.len() - 1)
         };
         menu.task_list_cursor = menu.cursor;
     }
@@ -2173,18 +2336,31 @@ impl App {
                 .tasks
                 .iter()
                 .zip(&new.tasks)
+                .all(|(old, new)| old.name == new.name)
+            && old.terminals.len() == new.terminals.len()
+            && old
+                .terminals
+                .iter()
+                .zip(&new.terminals)
                 .all(|(old, new)| old.name == new.name);
 
         if same_runtime_shape {
-            let changed = old
+            let changed_tasks = old
                 .tasks
                 .iter()
                 .zip(&new.tasks)
                 .enumerate()
                 .filter_map(|(index, (old, new))| (old != new).then_some(index))
                 .collect::<Vec<_>>();
+            let changed_terminals = old
+                .terminals
+                .iter()
+                .zip(&new.terminals)
+                .enumerate()
+                .filter_map(|(index, (old, new))| (old != new).then_some(index))
+                .collect::<Vec<_>>();
             self.loaded.config = new;
-            for index in 0..self.tasks.len() {
+            for index in 0..self.loaded.config.tasks.len() {
                 let task = self.loaded.config.tasks[index].clone();
                 self.tasks[index].cwd = self.loaded.task_cwd(&task);
                 self.tasks[index].start_delay = task
@@ -2193,15 +2369,31 @@ impl App {
                     .and_then(|delay| parse_start_delay(delay).ok())
                     .unwrap_or_default();
                 self.tasks[index].task = task;
+                self.tasks[index].kind = RuntimePaneKind::Task;
+            }
+            let terminal_offset = self.loaded.config.tasks.len();
+            for (index, terminal) in self.loaded.config.terminals.iter().cloned().enumerate() {
+                let runtime_index = terminal_offset + index;
+                if let Some(runtime) = self.tasks.get_mut(runtime_index) {
+                    runtime.cwd = self.loaded.terminal_cwd(&terminal);
+                    runtime.start_delay = Duration::ZERO;
+                    runtime.task = terminal_runtime_task(terminal);
+                    runtime.kind = RuntimePaneKind::ConfigTerminal(index);
+                }
             }
             self.rebuild_dependency_graph_from_runtime();
             match restart {
                 RestartMode::All => self.request_restart_all(),
                 RestartMode::Affected => {
                     let mut indexes = Vec::new();
-                    for index in changed {
+                    for index in changed_tasks {
                         indexes.extend(self.restart_closure(index));
                     }
+                    indexes.extend(
+                        changed_terminals
+                            .into_iter()
+                            .map(|index| terminal_offset + index),
+                    );
                     indexes.sort_unstable();
                     indexes.dedup();
                     self.request_restart_set(&indexes);
@@ -2276,20 +2468,27 @@ impl App {
             .cloned()
             .map(|task| {
                 let cwd = self.loaded.task_cwd(&task);
-                TaskRuntime::new(task, cwd)
+                TaskRuntime::new_task(task, cwd)
             })
             .collect();
+        self.tasks.extend(
+            self.loaded
+                .config
+                .terminals
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(index, terminal)| {
+                    let cwd = self.loaded.terminal_cwd(&terminal);
+                    TaskRuntime::new_config_terminal(index, terminal, cwd)
+                }),
+        );
         self.focus = self.focus.min(self.tasks.len().saturating_sub(1));
         self.rebuild_dependency_graph_from_runtime();
     }
 
     fn rebuild_dependency_graph_from_runtime(&mut self) {
-        let tasks = self
-            .tasks
-            .iter()
-            .map(|runtime| runtime.task.clone())
-            .collect::<Vec<_>>();
-        let (dependency_indexes, dependent_indexes) = dependency_graph(&tasks);
+        let (dependency_indexes, dependent_indexes) = dependency_graph(&self.loaded.config.tasks);
         self.dependency_indexes = dependency_indexes;
         self.dependent_indexes = dependent_indexes;
     }
@@ -2829,6 +3028,7 @@ impl App {
             FooterAction::CopySelection => self.copy_selection_or_notice(),
             FooterAction::CopyHistory => self.copy_focused_history(),
             FooterAction::SaveHistory => self.save_focused_history()?,
+            FooterAction::AddTerminal => self.add_session_terminal(),
             FooterAction::ShowMenu => self.open_menu(MenuTab::Help),
             FooterAction::RestartFocused => self.request_restart(self.focus),
             FooterAction::RestartAll => self.request_restart_all(),
@@ -2841,6 +3041,25 @@ impl App {
             FooterAction::Quit => return Ok(self.request_quit()),
         }
         Ok(Action::Continue)
+    }
+
+    fn add_session_terminal(&mut self) {
+        let name = unique_runtime_pane_name(&self.tasks, "terminal");
+        let terminal = TerminalPane {
+            name: name.clone(),
+            cwd: PathBuf::from("."),
+            env: BTreeMap::new(),
+        };
+        let cwd = self.loaded.terminal_cwd(&terminal);
+        let index = self.tasks.len();
+        self.tasks
+            .push(TaskRuntime::new_session_terminal(terminal, cwd));
+        self.focus = index;
+        if let Some(task) = self.tasks.get_mut(index) {
+            task.start_requested = true;
+        }
+        self.tick_dependency_starts(Instant::now());
+        self.set_notice(format!("Added session terminal {name}."));
     }
 
     fn toggle_mode(&mut self) {
@@ -3926,6 +4145,7 @@ impl App {
 
 struct TaskRuntime {
     task: Task,
+    kind: RuntimePaneKind,
     cwd: PathBuf,
     parser: Parser,
     master: Option<Box<dyn MasterPty + Send>>,
@@ -3944,6 +4164,13 @@ struct TaskRuntime {
     history: TextHistory,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RuntimePaneKind {
+    Task,
+    ConfigTerminal(usize),
+    SessionTerminal,
+}
+
 impl TaskRuntime {
     fn new(task: Task, cwd: PathBuf) -> Self {
         let pty_size = PtySize {
@@ -3959,6 +4186,7 @@ impl TaskRuntime {
             .unwrap_or_default();
         Self {
             task,
+            kind: RuntimePaneKind::Task,
             cwd,
             parser: Parser::new(pty_size.rows, pty_size.cols, SCROLLBACK_LINES),
             master: None,
@@ -3976,6 +4204,22 @@ impl TaskRuntime {
             terminal_scrollback_len: 0,
             history: TextHistory::new(pty_size.cols, pty_size.rows, SCROLLBACK_LINES),
         }
+    }
+
+    fn new_task(task: Task, cwd: PathBuf) -> Self {
+        Self::new(task, cwd)
+    }
+
+    fn new_config_terminal(index: usize, terminal: TerminalPane, cwd: PathBuf) -> Self {
+        let mut runtime = Self::new(terminal_runtime_task(terminal), cwd);
+        runtime.kind = RuntimePaneKind::ConfigTerminal(index);
+        runtime
+    }
+
+    fn new_session_terminal(terminal: TerminalPane, cwd: PathBuf) -> Self {
+        let mut runtime = Self::new(terminal_runtime_task(terminal), cwd);
+        runtime.kind = RuntimePaneKind::SessionTerminal;
+        runtime
     }
 
     fn spawn(
@@ -4077,6 +4321,12 @@ impl TaskRuntime {
     }
 
     fn command_builder(&self) -> CommandBuilder {
+        if !matches!(self.kind, RuntimePaneKind::Task) {
+            let shell = env::var_os("SHELL")
+                .filter(|shell| !shell.is_empty())
+                .unwrap_or_else(|| "/bin/sh".into());
+            return CommandBuilder::new(shell);
+        }
         match &self.task.command {
             TaskCommand::Shell(command) => {
                 let shell = env::var_os("SHELL")
@@ -4920,6 +5170,7 @@ struct MenuState {
     cursor: usize,
     task_list_cursor: usize,
     task_detail: Option<usize>,
+    terminal_detail: Option<usize>,
     dependency_task: Option<usize>,
     dependency_cursor: usize,
     env_task: Option<usize>,
@@ -4947,6 +5198,7 @@ impl MenuState {
             cursor: 0,
             task_list_cursor: 0,
             task_detail: None,
+            terminal_detail: None,
             dependency_task: None,
             dependency_cursor: 0,
             env_task: None,
@@ -4980,6 +5232,10 @@ enum MenuEditTarget {
     TaskField {
         task: usize,
         field: TaskField,
+    },
+    TerminalField {
+        terminal: usize,
+        field: TerminalField,
     },
     EnvKey {
         task: usize,
@@ -5035,6 +5291,14 @@ enum TaskField {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalField {
+    Name,
+    Cwd,
+    Delete,
+    Back,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MenuExitAction {
     SaveAffected,
     SaveAll,
@@ -5062,8 +5326,11 @@ enum MenuAction {
     Tab(MenuTab),
     Close,
     OpenTask(usize),
+    OpenTerminal(usize),
     AddTask,
+    AddTerminal,
     TaskField(TaskField),
+    TerminalField(TerminalField),
     ToggleDependency(usize),
     OpenEnvEntry(usize),
     AddEnvVar,
@@ -5274,6 +5541,20 @@ fn registry_insert(registry: &ProcessRegistry, pid: u32) {
 fn registry_remove(registry: &ProcessRegistry, pid: u32) {
     if let Ok(mut pids) = registry.lock() {
         pids.remove(&pid);
+    }
+}
+
+fn terminal_runtime_task(terminal: TerminalPane) -> Task {
+    Task {
+        name: terminal.name,
+        command: TaskCommand::Shell("shell".to_owned()),
+        cwd: terminal.cwd,
+        env: terminal.env,
+        depends_on: Vec::new(),
+        start_delay: None,
+        watch: None,
+        run_on_change: None,
+        repeat: None,
     }
 }
 
@@ -5498,6 +5779,10 @@ fn render_menu_tasks(
         render_menu_task_detail(area, buffer, menu, task_index, hover_position);
         return;
     }
+    if let Some(terminal_index) = menu.terminal_detail {
+        render_menu_terminal_detail(area, buffer, menu, terminal_index, hover_position);
+        return;
+    }
     render_text(
         buffer,
         Rect::new(area.x, area.y, area.width, 1),
@@ -5505,7 +5790,7 @@ fn render_menu_tasks(
         menu_heading_style(),
     );
     let rows = area.height.saturating_sub(1);
-    let count = menu.draft.tasks.len() + 1;
+    let count = task_list_count(menu);
     let start = scroll_start(menu.cursor, count, usize::from(rows));
     let problems = menu_problems(menu);
     for row in 0..rows {
@@ -5519,10 +5804,25 @@ fn render_menu_tasks(
                 MenuAction::OpenTask(index),
                 badges,
             )
-        } else if index == menu.draft.tasks.len() {
+        } else if index < menu.draft.tasks.len() + menu.draft.terminals.len() {
+            let terminal_index = index - menu.draft.tasks.len();
+            let terminal = &menu.draft.terminals[terminal_index];
+            let badges = terminal_problem_badges(&problems, terminal_index);
+            (
+                format!("{}  terminal", terminal.name),
+                MenuAction::OpenTerminal(terminal_index),
+                badges,
+            )
+        } else if index == menu.draft.tasks.len() + menu.draft.terminals.len() {
             (
                 "+ Add task".to_owned(),
                 MenuAction::AddTask,
+                ProblemBadges::default(),
+            )
+        } else if index == menu.draft.tasks.len() + menu.draft.terminals.len() + 1 {
+            (
+                "+ Add terminal".to_owned(),
+                MenuAction::AddTerminal,
                 ProblemBadges::default(),
             )
         } else {
@@ -5538,6 +5838,46 @@ fn render_menu_tasks(
             &text,
             selected,
             Some(action),
+            &mut menu.hits,
+            hover_position,
+        );
+        render_problem_badges(buffer, rect, badges, row_bg_color(selected, hovered));
+    }
+}
+
+fn render_menu_terminal_detail(
+    area: Rect,
+    buffer: &mut Buffer,
+    menu: &mut MenuState,
+    terminal_index: usize,
+    hover_position: Option<(u16, u16)>,
+) {
+    let Some(terminal) = menu.draft.terminals.get(terminal_index) else {
+        return;
+    };
+    render_text(
+        buffer,
+        Rect::new(area.x, area.y, area.width, 1),
+        &format!("Terminal: {}", terminal.name),
+        menu_heading_style(),
+    );
+    let fields = terminal_detail_fields();
+    let problems = menu_problems(menu);
+    for (row, field) in fields.iter().enumerate() {
+        if row + 1 >= usize::from(area.height) {
+            break;
+        }
+        let badges = terminal_field_problem_badges(&problems, terminal_index, *field);
+        let text = text_with_problem_badges(&terminal_field_text(terminal, *field), badges);
+        let rect = Rect::new(area.x, area.y + row as u16 + 1, area.width, 1);
+        let selected = row == menu.cursor;
+        let hovered = hover_position.is_some_and(|(x, y)| contains(rect, x, y));
+        render_menu_row(
+            buffer,
+            rect,
+            &text,
+            selected,
+            Some(MenuAction::TerminalField(*field)),
             &mut menu.hits,
             hover_position,
         );
@@ -6300,7 +6640,8 @@ fn menu_item_count(menu: &MenuState, exit_mode: MenuExitMode) -> usize {
         MenuTab::Help => 0,
         MenuTab::Tasks if menu.env_task.is_some() => env_item_count(menu),
         MenuTab::Tasks if menu.task_detail.is_some() => task_detail_fields().len(),
-        MenuTab::Tasks => menu.draft.tasks.len() + 1,
+        MenuTab::Tasks if menu.terminal_detail.is_some() => terminal_detail_fields().len(),
+        MenuTab::Tasks => task_list_count(menu),
         MenuTab::Settings => 4,
         MenuTab::Exit => exit_actions(exit_mode).len() + menu_problems(menu).len(),
     }
@@ -6333,6 +6674,9 @@ fn warning_still_applies(menu: &MenuState, problem: &ConfigProblem) -> bool {
         ConfigProblemLocation::Settings | ConfigProblemLocation::Tasks => true,
         ConfigProblemLocation::Setting(field) => setting_value_unchanged(menu, *field),
         ConfigProblemLocation::Task { index, field } => task_value_unchanged(menu, *index, *field),
+        ConfigProblemLocation::Terminal { index, field } => {
+            terminal_value_unchanged(menu, *index, *field)
+        }
     }
 }
 
@@ -6374,6 +6718,25 @@ fn task_value_unchanged(menu: &MenuState, index: usize, field: Option<ConfigTask
     }
 }
 
+fn terminal_value_unchanged(
+    menu: &MenuState,
+    index: usize,
+    field: Option<ConfigTerminalField>,
+) -> bool {
+    let Some(current) = menu.draft.terminals.get(index) else {
+        return false;
+    };
+    let Some(original) = menu.original.terminals.get(index) else {
+        return false;
+    };
+    match field {
+        Some(ConfigTerminalField::Name) => current.name == original.name,
+        Some(ConfigTerminalField::Cwd) => current.cwd == original.cwd,
+        Some(ConfigTerminalField::Env) => current.env == original.env,
+        None => current == original,
+    }
+}
+
 fn tab_problem_badges(problems: &[ConfigProblem], tab: MenuTab) -> ProblemBadges {
     let mut badges = ProblemBadges::default();
     for problem in problems {
@@ -6383,9 +6746,12 @@ fn tab_problem_badges(problems: &[ConfigProblem], tab: MenuTab) -> ProblemBadges
                 ConfigProblemLocation::Settings | ConfigProblemLocation::Setting(_),
                 MenuTab::Settings,
             ) => true,
-            (ConfigProblemLocation::Tasks | ConfigProblemLocation::Task { .. }, MenuTab::Tasks) => {
-                true
-            }
+            (
+                ConfigProblemLocation::Tasks
+                | ConfigProblemLocation::Task { .. }
+                | ConfigProblemLocation::Terminal { .. },
+                MenuTab::Tasks,
+            ) => true,
             (ConfigProblemLocation::Root, _) => false,
             _ => false,
         };
@@ -6408,6 +6774,18 @@ fn task_problem_badges(problems: &[ConfigProblem], task_index: usize) -> Problem
     badges
 }
 
+fn terminal_problem_badges(problems: &[ConfigProblem], terminal_index: usize) -> ProblemBadges {
+    let mut badges = ProblemBadges::default();
+    for problem in problems {
+        if let ConfigProblemLocation::Terminal { index, .. } = &problem.location
+            && *index == terminal_index
+        {
+            badges.add(problem.severity);
+        }
+    }
+    badges
+}
+
 fn task_field_problem_badges(
     problems: &[ConfigProblem],
     task_index: usize,
@@ -6423,6 +6801,29 @@ fn task_field_problem_badges(
             field: Some(problem_field),
         } = &problem.location
             && *index == task_index
+            && *problem_field == config_field
+        {
+            badges.add(problem.severity);
+        }
+    }
+    badges
+}
+
+fn terminal_field_problem_badges(
+    problems: &[ConfigProblem],
+    terminal_index: usize,
+    field: TerminalField,
+) -> ProblemBadges {
+    let Some(config_field) = terminal_field_to_config_field(field) else {
+        return ProblemBadges::default();
+    };
+    let mut badges = ProblemBadges::default();
+    for problem in problems {
+        if let ConfigProblemLocation::Terminal {
+            index,
+            field: Some(problem_field),
+        } = &problem.location
+            && *index == terminal_index
             && *problem_field == config_field
         {
             badges.add(problem.severity);
@@ -6478,11 +6879,26 @@ fn problem_location_label(location: &ConfigProblemLocation) -> String {
             Some(field) => format!("Task #{} > {}", index + 1, config_task_field_label(*field)),
             None => format!("Task #{}", index + 1),
         },
+        ConfigProblemLocation::Terminal { index, field } => match field {
+            Some(field) => {
+                format!(
+                    "Terminal #{} > {}",
+                    index + 1,
+                    config_terminal_field_label(*field)
+                )
+            }
+            None => format!("Terminal #{}", index + 1),
+        },
     }
 }
 
+fn task_list_count(menu: &MenuState) -> usize {
+    menu.draft.tasks.len() + menu.draft.terminals.len() + 2
+}
+
 fn task_list_cursor(menu: &MenuState) -> usize {
-    menu.task_list_cursor.min(menu.draft.tasks.len())
+    menu.task_list_cursor
+        .min(task_list_count(menu).saturating_sub(1))
 }
 
 fn env_item_count(menu: &MenuState) -> usize {
@@ -6529,6 +6945,15 @@ fn task_detail_fields() -> &'static [TaskField] {
     ]
 }
 
+fn terminal_detail_fields() -> &'static [TerminalField] {
+    &[
+        TerminalField::Name,
+        TerminalField::Cwd,
+        TerminalField::Delete,
+        TerminalField::Back,
+    ]
+}
+
 fn task_field_text(task: &Task, field: TaskField) -> String {
     match field {
         TaskField::Name => format!("Name: {}", task.name),
@@ -6564,9 +6989,28 @@ fn task_field_name(field: TaskField) -> &'static str {
     }
 }
 
+fn terminal_field_text(terminal: &TerminalPane, field: TerminalField) -> String {
+    match field {
+        TerminalField::Name => format!("Name: {}", terminal.name),
+        TerminalField::Cwd => format!("Working directory: {}", terminal.cwd.display()),
+        TerminalField::Delete => "Delete terminal".to_owned(),
+        TerminalField::Back => "Back to task list".to_owned(),
+    }
+}
+
+fn terminal_field_name(field: TerminalField) -> &'static str {
+    match field {
+        TerminalField::Name => "name",
+        TerminalField::Cwd => "working directory",
+        TerminalField::Delete => "delete",
+        TerminalField::Back => "back",
+    }
+}
+
 fn menu_edit_title(edit: &MenuEdit) -> &'static str {
     match &edit.target {
         MenuEditTarget::TaskField { field, .. } => task_field_name(*field),
+        MenuEditTarget::TerminalField { field, .. } => terminal_field_name(*field),
         MenuEditTarget::EnvKey { .. } => "environment key",
         MenuEditTarget::EnvValue { .. } => "environment value",
     }
@@ -6588,6 +7032,20 @@ fn config_task_field_cursor(field: ConfigTaskField) -> Option<usize> {
     task_detail_fields()
         .iter()
         .position(|candidate| task_field_to_config_field(*candidate) == Some(field))
+}
+
+fn terminal_field_to_config_field(field: TerminalField) -> Option<ConfigTerminalField> {
+    match field {
+        TerminalField::Name => Some(ConfigTerminalField::Name),
+        TerminalField::Cwd => Some(ConfigTerminalField::Cwd),
+        TerminalField::Delete | TerminalField::Back => None,
+    }
+}
+
+fn config_terminal_field_cursor(field: ConfigTerminalField) -> Option<usize> {
+    terminal_detail_fields()
+        .iter()
+        .position(|candidate| terminal_field_to_config_field(*candidate) == Some(field))
 }
 
 fn setting_cursor(field: ConfigSettingField) -> usize {
@@ -6616,6 +7074,14 @@ fn config_task_field_label(field: ConfigTaskField) -> &'static str {
         ConfigTaskField::Env => "environment",
         ConfigTaskField::Dependencies => "dependencies",
         ConfigTaskField::StartDelay => "start delay",
+    }
+}
+
+fn config_terminal_field_label(field: ConfigTerminalField) -> &'static str {
+    match field {
+        ConfigTerminalField::Name => "name",
+        ConfigTerminalField::Cwd => "working directory",
+        ConfigTerminalField::Env => "environment",
     }
 }
 
@@ -6725,16 +7191,62 @@ fn all_leaders() -> &'static [Leader] {
 }
 
 fn unique_task_name(config: &crate::config::Config, base: &str) -> String {
-    if !config.tasks.iter().any(|task| task.name == base) {
+    if !config.tasks.iter().any(|task| task.name == base)
+        && !config
+            .terminals
+            .iter()
+            .any(|terminal| terminal.name == base)
+    {
         return base.to_owned();
     }
     for number in 2..1000 {
         let candidate = format!("{base}{number}");
-        if !config.tasks.iter().any(|task| task.name == candidate) {
+        if !config.tasks.iter().any(|task| task.name == candidate)
+            && !config
+                .terminals
+                .iter()
+                .any(|terminal| terminal.name == candidate)
+        {
             return candidate;
         }
     }
-    format!("{base}{}", config.tasks.len() + 1)
+    format!("{base}{}", config.tasks.len() + config.terminals.len() + 1)
+}
+
+fn unique_terminal_name(config: &crate::config::Config, base: &str) -> String {
+    if !config.tasks.iter().any(|task| task.name == base)
+        && !config
+            .terminals
+            .iter()
+            .any(|terminal| terminal.name == base)
+    {
+        return base.to_owned();
+    }
+    for number in 2..1000 {
+        let candidate = format!("{base}{number}");
+        if !config.tasks.iter().any(|task| task.name == candidate)
+            && !config
+                .terminals
+                .iter()
+                .any(|terminal| terminal.name == candidate)
+        {
+            return candidate;
+        }
+    }
+    format!("{base}{}", config.tasks.len() + config.terminals.len() + 1)
+}
+
+fn unique_runtime_pane_name(tasks: &[TaskRuntime], base: &str) -> String {
+    if !tasks.iter().any(|task| task.task.name == base) {
+        return base.to_owned();
+    }
+    for number in 2..1000 {
+        let candidate = format!("{base}{number}");
+        if !tasks.iter().any(|task| task.task.name == candidate) {
+            return candidate;
+        }
+    }
+    format!("{base}{}", tasks.len() + 1)
 }
 
 fn scrub_missing_dependencies(config: &mut crate::config::Config) {
@@ -9146,6 +9658,7 @@ enum FooterAction {
     CopySelection,
     CopyHistory,
     SaveHistory,
+    AddTerminal,
     ShowMenu,
     RestartFocused,
     RestartAll,
@@ -9173,6 +9686,7 @@ fn command_footer_items(has_selection: bool) -> Vec<FooterItem> {
         ("y copy", FooterAction::CopySelection),
         ("Y copy all", FooterAction::CopyHistory),
         ("S save", FooterAction::SaveHistory),
+        ("t terminal", FooterAction::AddTerminal),
         ("r restart", FooterAction::RestartFocused),
         ("R restart all", FooterAction::RestartAll),
         ("c clear", FooterAction::ClearFocused),
@@ -12311,6 +12825,45 @@ mod tests {
     }
 
     #[test]
+    fn configured_terminals_become_runtime_panes_after_tasks() {
+        let loaded = LoadedConfig {
+            path: PathBuf::from("/tmp/demons.toml"),
+            root: PathBuf::from("/tmp"),
+            config: Config {
+                schema_version: crate::config::CURRENT_SCHEMA_VERSION,
+                settings: Settings::default(),
+                tasks: vec![test_task("server")],
+                terminals: vec![TerminalPane {
+                    name: "scratch".to_owned(),
+                    cwd: PathBuf::from("."),
+                    env: BTreeMap::new(),
+                }],
+            },
+            config_warnings: Vec::new(),
+            config_problems: Vec::new(),
+            created_from_missing_file: false,
+        };
+        let (tx, rx) = mpsc::sync_channel(8);
+        let app = App::new(
+            loaded,
+            tx,
+            rx,
+            Arc::new(Mutex::new(HashSet::new())),
+            false,
+            false,
+        );
+
+        assert_eq!(app.tasks.len(), 2);
+        assert!(matches!(app.tasks[0].kind, RuntimePaneKind::Task));
+        assert!(matches!(
+            app.tasks[1].kind,
+            RuntimePaneKind::ConfigTerminal(0)
+        ));
+        assert_eq!(app.tasks[1].task.name, "scratch");
+        assert_eq!(app.tasks[1].cwd, PathBuf::from("/tmp"));
+    }
+
+    #[test]
     fn restart_order_starts_dependencies_before_dependents() {
         let mut web = test_task("web");
         web.depends_on = vec!["server".to_owned()];
@@ -12467,6 +13020,29 @@ mod tests {
     }
 
     #[test]
+    fn menu_add_terminal_and_save_writes_config_in_configure_mode() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join(CONFIG_FILE);
+        let mut app = test_app_with_tasks(vec![test_task("server")]);
+        app.loaded.path = path.clone();
+        app.loaded.root = temp.path().to_path_buf();
+        app.quit_when_menu_closes = true;
+        app.open_menu(MenuTab::Tasks);
+
+        app.apply_menu_action(MenuAction::AddTerminal).unwrap();
+        assert_eq!(app.menu.as_ref().unwrap().draft.terminals.len(), 1);
+        assert_eq!(app.menu.as_ref().unwrap().terminal_detail, Some(0));
+
+        app.apply_menu_action(MenuAction::Exit(MenuExitAction::SaveOnly))
+            .unwrap();
+
+        let saved = fs::read_to_string(path).unwrap();
+        assert!(saved.contains("[[terminal]]"));
+        assert!(saved.contains("name = \"terminal\""));
+        assert!(saved.contains("cwd = \".\""));
+    }
+
+    #[test]
     fn cwd_edit_validates_directory_before_apply() {
         let temp = tempdir().unwrap();
         std::fs::create_dir(temp.path().join("web")).unwrap();
@@ -12591,7 +13167,7 @@ mod tests {
         assert!(
             menu_problems(app.menu.as_ref().unwrap())
                 .iter()
-                .any(|problem| problem.message == "At least one task is required.")
+                .any(|problem| problem.message == "At least one task or terminal is required.")
         );
 
         let mut buffer = Buffer::empty(Rect::new(0, 0, 120, 40));
@@ -13323,6 +13899,7 @@ mod tests {
                 schema_version: crate::config::CURRENT_SCHEMA_VERSION,
                 settings: Settings::default(),
                 tasks,
+                terminals: Vec::new(),
             },
             config_warnings: Vec::new(),
             config_problems: Vec::new(),

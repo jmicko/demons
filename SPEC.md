@@ -48,9 +48,9 @@ Demons is intentionally minimal: it is **not** a session manager, a process supe
 
 ```toml
 # Config schema version, separate from the Demons app/crate version.
-# Current unversioned configs are treated as schema_version = 1 and are
-# normalized after they successfully validate.
-schema_version = 1
+# Current unversioned configs are treated as the current schema and are
+# normalized after they successfully validate. Schema v1 configs migrate to v2.
+schema_version = 2
 
 # Optional. Demons-level settings.
 [settings]
@@ -62,7 +62,7 @@ layout = "grid"
 leader = "alt-j"
 # Double/triple-click selection threshold in milliseconds.
 multi_click_ms = 500
-# Reserved for v2. It must remain false in v1.
+# Reserved for a future release. It must remain false.
 logging = false
 
 # Tasks. One [[task]] per pane.
@@ -88,17 +88,23 @@ start_delay = "3s"
 # run_on_change = ["src/**/*.rs"]
 # Optional. Restart the task at this interval. (Implemented in v2.)
 # repeat = "1s"
+
+# Optional. Regular shell panes. These start the user's $SHELL directly.
+[[terminal]]
+name = "scratch"
+cwd = "."
+env = { RUST_LOG = "debug" }
 ```
 
 Validation rules (enforced at startup, fail loudly):
 
-- `schema_version` must be `1` for this release. Missing `schema_version` is
-  treated as `1` for compatibility with existing configs.
-- At least one `[[task]]` is required.
-- `name` is required and unique per file.
+- `schema_version` must be `2` for this release. Missing `schema_version` is
+  treated as the current schema for compatibility with existing configs.
+  Schema version 1 is migrated to version 2.
+- At least one `[[task]]` or `[[terminal]]` is required.
+- Task and terminal `name` values are required and unique per file.
 - `command` is required and non-empty.
 - `cwd` must be a directory on disk at startup.
-- No two `[[task]]` blocks may share the same `name`.
 - `depends_on` entries must name existing tasks, cannot include the task
   itself, and cannot form dependency cycles.
 - `start_delay` must be a non-negative integer with an optional unit of `ms`,
@@ -106,7 +112,7 @@ Validation rules (enforced at startup, fail loudly):
 - `settings.multi_click_ms` must be between 150 and 1000 milliseconds.
 - Unknown keys are an error (no silent ignoring — the configurator owns the schema).
 - Reserved v2 fields are parseable so future files have a stable schema, but
-  v1 rejects `logging = true` and any task that sets `watch`,
+  v2 rejects `logging = true` and any task that sets `watch`,
   `run_on_change`, or `repeat`. Reserved behavior is never silently ignored.
 
 ### 4.3 Configurator
@@ -332,7 +338,7 @@ For each task:
 ## 9. Example `demons.toml`
 
 ```toml
-schema_version = 1
+schema_version = 2
 
 [settings]
 layout = "grid"
@@ -364,6 +370,10 @@ cwd = "."
 depends_on = []
 
 [task.env]
+
+[[terminal]]
+name = "scratch"
+cwd = "."
 ```
 
 ## 10. Open questions (low priority)
