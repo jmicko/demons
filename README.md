@@ -317,4 +317,4 @@ make release-check
 ```
 
 See [RELEASING.md](RELEASING.md) for the version bump and publish checklist.
-See [SPEC.md](SPEC.md) for the v1 behavior and product boundaries.
+See [SPEC.md](SPEC.md) for the current behavior and product boundaries.

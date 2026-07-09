@@ -2421,7 +2421,7 @@ impl App {
             task.kill_deadline = None;
             if let Some(pid) = task.pid {
                 task.status = TaskStatus::Stopping;
-                signal_process_group(pid, libc::SIGTERM).ok();
+                task.signal_graceful_stop(pid).ok();
             }
         }
 
@@ -3840,7 +3840,7 @@ impl App {
                 self.tasks[index].kill_deadline = Some(now + RESTART_GRACE);
                 self.tasks[index].status = TaskStatus::Restarting;
                 self.tasks[index].message("\r\n\x1b[33m[demons] restarting...\x1b[0m\r\n");
-                if signal_process_group(pid, libc::SIGTERM).is_err() {
+                if self.tasks[index].signal_graceful_stop(pid).is_err() {
                     self.tasks[index].kill_deadline = Some(now);
                 }
             }
@@ -4111,7 +4111,7 @@ impl App {
         for task in &mut self.tasks {
             task.restart_requested = false;
             if let Some(pid) = task.pid {
-                signal_process_group(pid, libc::SIGTERM).ok();
+                task.signal_graceful_stop(pid).ok();
             }
         }
 
@@ -4343,6 +4343,17 @@ impl TaskRuntime {
                 builder
             }
         }
+    }
+
+    fn graceful_stop_signal(&self) -> libc::c_int {
+        match self.kind {
+            RuntimePaneKind::Task => libc::SIGTERM,
+            RuntimePaneKind::ConfigTerminal(_) | RuntimePaneKind::SessionTerminal => libc::SIGHUP,
+        }
+    }
+
+    fn signal_graceful_stop(&self, pid: u32) -> io::Result<()> {
+        signal_process_group(pid, self.graceful_stop_signal())
     }
 
     fn resize(&mut self, columns: u16, rows: u16) {
@@ -7957,7 +7968,7 @@ fn render_frozen_lake(area: Rect, lake_y: u16, seed: u64, buffer: &mut Buffer) {
                 u64::from(row) << 32 | u64::from(column),
                 0x1ce_5ca7e_u64,
             );
-            let diagonal = (u64::from(column) * 3 + u64::from(row) + seed % 17) % 23 == 0;
+            let diagonal = (u64::from(column) * 3 + u64::from(row) + seed % 17).is_multiple_of(23);
             let ice = if row > 0 && column > snow_width && diagonal && value % 5 < 2 {
                 THEME_ICE
             } else {
@@ -9963,11 +9974,11 @@ fn write_system_clipboard(text: &str) -> io::Result<()> {
 
         let mut clipboard =
             arboard::Clipboard::new().map_err(|error| io::Error::other(error.to_string()))?;
-        return clipboard
+        clipboard
             .set()
             .wait_until(Instant::now() + SYSTEM_CLIPBOARD_WAIT)
             .text(text.to_owned())
-            .map_err(|error| io::Error::other(error.to_string()));
+            .map_err(|error| io::Error::other(error.to_string()))
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -12861,6 +12872,22 @@ mod tests {
         ));
         assert_eq!(app.tasks[1].task.name, "scratch");
         assert_eq!(app.tasks[1].cwd, PathBuf::from("/tmp"));
+    }
+
+    #[test]
+    fn terminal_panes_use_sighup_for_graceful_shutdown() {
+        let task = TaskRuntime::new_task(test_task("task"), PathBuf::from("."));
+        let terminal = TaskRuntime::new_session_terminal(
+            TerminalPane {
+                name: "terminal".to_owned(),
+                cwd: PathBuf::from("."),
+                env: BTreeMap::new(),
+            },
+            PathBuf::from("."),
+        );
+
+        assert_eq!(task.graceful_stop_signal(), libc::SIGTERM);
+        assert_eq!(terminal.graceful_stop_signal(), libc::SIGHUP);
     }
 
     #[test]

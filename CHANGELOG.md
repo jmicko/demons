@@ -4,8 +4,10 @@ All notable user-facing changes should be recorded here before a release.
 
 ## Unreleased
 
-- Added `schema_version = 1` to `demons.toml`; unversioned valid configs are
-  normalized automatically after validation.
+- Added config schema v2 with persistent `[[terminal]]` shell panes, plus a
+  session-only `t terminal` command for ad-hoc shells.
+- Changed unversioned and schema v1 configs to migrate to schema v2 after
+  validation.
 - Changed `demons init` and interactive startup to recover parseable broken
   configs into an editable draft with red blocking problem markers, gold
   recovery markers, and an Exit-tab problem list.
