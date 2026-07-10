@@ -631,6 +631,7 @@ struct PendingControlWait {
     query: Option<String>,
     status: Option<String>,
     after_cursor: u64,
+    observed_tail: Option<(u64, String)>,
     deadline: Instant,
     reply: SyncSender<ControlResponse>,
 }
@@ -983,6 +984,7 @@ impl App {
         };
         let start = requested.max(history.first_index).min(end);
         let page_end = start.saturating_add(limit).min(end);
+        let live_cursor = history_live_cursor(history);
         let lines = (start..page_end)
             .filter_map(|line| {
                 history
@@ -994,8 +996,16 @@ impl App {
             output: OutputPage {
                 pane_id: pane_id.to_owned(),
                 first_line: start,
-                next_cursor: control::encode_cursor(instance_id, pane_id, page_end),
-                end_cursor: control::encode_cursor(instance_id, pane_id, end),
+                next_cursor: control::encode_cursor(
+                    instance_id,
+                    pane_id,
+                    if page_end == end {
+                        live_cursor
+                    } else {
+                        page_end
+                    },
+                ),
+                end_cursor: control::encode_cursor(instance_id, pane_id, live_cursor),
                 truncated_before_cursor: requested < history.first_index,
                 lines,
             },
@@ -1133,6 +1143,7 @@ impl App {
             query: query.map(|query| query.to_ascii_lowercase()),
             status,
             after_cursor,
+            observed_tail: None,
             deadline: Instant::now() + timeout,
             reply,
         });
@@ -1147,7 +1158,7 @@ impl App {
         let mut resolved = false;
         let mut remaining = Vec::new();
         let pending = std::mem::take(&mut self.pending_control_waits);
-        for wait in pending {
+        for mut wait in pending {
             let Some(index) = self.control_pane_index(&wait.pane_id) else {
                 wait.reply
                     .try_send(ControlResponse::error("not_found", "pane no longer exists"))
@@ -1163,18 +1174,31 @@ impl App {
                 .is_some_and(|wanted| control_status_matches(wanted, &status));
             let line_match = wait.query.as_deref().and_then(|query| {
                 (wait.after_cursor.max(task.history.first_index)..task.history.line_count()).find(
-                    |line| {
-                        task.history
-                            .line(*line)
-                            .is_some_and(|line| line.text.to_ascii_lowercase().contains(query))
+                    |line_index| {
+                        task.history.line(*line_index).is_some_and(|line| {
+                            newly_matches_observed_tail(
+                                *line_index,
+                                &line.text.to_ascii_lowercase(),
+                                query,
+                                wait.observed_tail.as_ref(),
+                            )
+                        })
                     },
                 )
             });
+            if line_match.is_none() && wait.query.is_some() {
+                let tail = history_live_cursor(&task.history);
+                wait.after_cursor = tail;
+                wait.observed_tail = task
+                    .history
+                    .line(tail)
+                    .map(|line| (tail, line.text.to_ascii_lowercase()));
+            }
             if status_match || line_match.is_some() || now >= wait.deadline {
                 let cursor = control::encode_cursor(
                     self.control_instance_id(),
                     &wait.pane_id,
-                    task.history.line_count(),
+                    history_live_cursor(&task.history),
                 );
                 wait.reply
                     .try_send(ControlResponse::Wait {
@@ -5866,6 +5890,25 @@ fn control_status_matches(wanted: &str, current: &str) -> bool {
         "stopped" => matches!(current, "exited" | "failed" | "not_started"),
         other => current == other,
     }
+}
+
+fn history_live_cursor(history: &TextHistory) -> u64 {
+    history.line_count().saturating_sub(1)
+}
+
+fn newly_matches_observed_tail(
+    line_index: u64,
+    text: &str,
+    query: &str,
+    observed_tail: Option<&(u64, String)>,
+) -> bool {
+    let Some((observed_index, observed_text)) = observed_tail else {
+        return text.contains(query);
+    };
+    if line_index != *observed_index {
+        return text.contains(query);
+    }
+    text.match_indices(query).count() > observed_text.match_indices(query).count()
 }
 
 fn validate_control_query(query: &str) -> std::result::Result<(), &'static str> {
@@ -16595,6 +16638,56 @@ mod tests {
         ));
         assert_eq!(app.pending_control_waits.len(), MAX_PENDING_CONTROL_WAITS);
         drop(receivers);
+    }
+
+    #[test]
+    fn control_wait_searches_each_existing_line_only_once() {
+        let mut app = test_app();
+        for index in 0..100 {
+            app.tasks[0].process_output(format!("old line {index}\r\n").as_bytes());
+        }
+        let old_cursor = control::encode_cursor(app.control_instance_id(), "one", 0);
+        let (reply, receiver) = mpsc::sync_channel(1);
+
+        app.start_control_wait(
+            "one".to_owned(),
+            Some("new needle".to_owned()),
+            None,
+            Some(old_cursor),
+            60_000,
+            reply,
+        );
+
+        assert_eq!(app.pending_control_waits.len(), 1);
+        assert_eq!(
+            app.pending_control_waits[0].after_cursor,
+            history_live_cursor(&app.tasks[0].history)
+        );
+
+        app.tasks[0].process_output(b"new needle\r\n");
+        assert!(app.resolve_control_waits());
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            ControlResponse::Wait { result } if result.matched && !result.timed_out
+        ));
+    }
+
+    #[test]
+    fn control_output_cursor_does_not_skip_the_mutable_tail_line() {
+        let mut app = test_app();
+        app.tasks[0].process_output(b"before\r\n");
+        let ControlResponse::Output { output } = app.control_read_output("one", None, 100) else {
+            panic!("expected output response");
+        };
+
+        app.tasks[0].process_output(b"after cursor\r\n");
+        let ControlResponse::Output { output } =
+            app.control_read_output("one", Some(output.end_cursor), 100)
+        else {
+            panic!("expected output response");
+        };
+
+        assert!(output.lines.iter().any(|line| line == "after cursor"));
     }
 
     #[test]
