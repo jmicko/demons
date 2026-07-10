@@ -103,7 +103,7 @@ pub fn uninstall(project_root: &Path) -> Result<CodexConfigChange> {
 
 fn edit(project_root: &Path, server: Option<(&str, &Path)>) -> Result<CodexConfigChange> {
     let path = project_config_path(project_root);
-    validate_config_target(&path, true)?;
+    validate_config_target(&path, server.is_some())?;
     let previous = match fs::read(&path) {
         Ok(contents) => Some(contents),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -309,6 +309,14 @@ mod tests {
         assert!(uninstall(temp.path()).unwrap().changed());
         assert!(!path.exists());
         assert_eq!(inspect(temp.path()), IntegrationStatus::Missing);
+    }
+
+    #[test]
+    fn uninstall_without_a_registration_does_not_create_codex_files() {
+        let temp = tempdir().unwrap();
+
+        assert!(!uninstall(temp.path()).unwrap().changed());
+        assert!(!temp.path().join(".codex").exists());
     }
 
     #[test]
