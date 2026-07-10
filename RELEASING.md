@@ -41,13 +41,14 @@ Before publishing from a machine for the first time:
 3. Move the relevant `CHANGELOG.md` entries from `Unreleased` to the target
    version and date, then use those notes for the GitHub release draft.
 4. Run `make release-check`.
-5. Run a crates.io publish dry run after the version bump:
+5. Run `cargo audit` and review both vulnerabilities and maintenance warnings.
+6. Run a crates.io publish dry run after the version bump:
 
    ```sh
    cargo publish --dry-run --locked
    ```
 
-6. Do a short manual TUI smoke test:
+7. Do a short manual TUI smoke test:
 
    - Run `demons init` in a temporary directory, add a task, save, and verify
      the generated `demons.toml`.
@@ -70,38 +71,38 @@ Before publishing from a machine for the first time:
    - Quit with two `q` or `Ctrl+C` confirmations and verify no child process
      groups remain.
 
-7. Inspect the package contents if anything about packaging changed:
+8. Inspect the package contents if anything about packaging changed:
 
    ```sh
    cargo package --locked --allow-dirty --list
    ```
 
-8. Commit the version bump:
+9. Commit the version bump:
 
    ```sh
    git commit -am "chore(release): v<version>"
    ```
 
-9. Tag the commit:
+10. Tag the commit:
 
    ```sh
    git tag -a "v<version>" -m "v<version>"
    ```
 
-10. Push the release commit and tag:
+11. Push the release commit and tag:
 
    ```sh
    git push origin HEAD
    git push origin "v<version>"
    ```
 
-11. Publish the exact pushed source:
+12. Publish the exact pushed source:
 
    ```sh
    cargo publish --locked
    ```
 
-12. Verify installation from crates.io after the index updates:
+13. Verify installation from crates.io after the index updates:
 
     ```sh
     cargo install demons --version <version> --locked

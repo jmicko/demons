@@ -12,8 +12,14 @@ All notable user-facing changes should be recorded here before a release.
 - Added MCP tools for bounded pane history, literal search, output/status waits,
   pane status, task control, visible agent command panes, explicit input, and
   synthetic PNG captures of the current terminal layout.
+- Fixed incremental MCP reads and waits so output written into the terminal's
+  mutable tail line is not skipped and old history is not repeatedly scanned.
+- Reduced idle MCP adapter overhead, bounded concurrent local clients, and made
+  fragmented control frames survive read timeouts without losing alignment.
 - Marked MCP mutations for Codex approval handling and restricted local control
   sockets and discovery metadata to the current user.
+- Changed MCP uninstall to remove an otherwise empty managed Codex config and
+  avoid creating `.codex` when no registration exists.
 
 ## 0.3.0 - 2026-07-09
 
