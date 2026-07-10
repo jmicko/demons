@@ -155,13 +155,13 @@ impl FontVariants {
             .context("system monospace font has no family name")?;
         let regular = font_from_database(&database, regular_id)?;
         let bold = query_family_font(&database, &family, Weight::BOLD, FontStyle::Normal)
-            .unwrap_or_else(|| clone_font_from_database(&database, regular_id));
+            .unwrap_or_else(|| regular.clone());
         let italic = query_family_font(&database, &family, Weight::NORMAL, FontStyle::Italic)
             .or_else(|| query_family_font(&database, &family, Weight::NORMAL, FontStyle::Oblique))
-            .unwrap_or_else(|| clone_font_from_database(&database, regular_id));
+            .unwrap_or_else(|| regular.clone());
         let bold_italic = query_family_font(&database, &family, Weight::BOLD, FontStyle::Italic)
             .or_else(|| query_family_font(&database, &family, Weight::BOLD, FontStyle::Oblique))
-            .unwrap_or_else(|| clone_font_from_database(&database, regular_id));
+            .unwrap_or_else(|| regular.clone());
         Ok((
             Self {
                 regular,
@@ -208,10 +208,6 @@ fn query_family_font(
         style,
     })?;
     font_from_database(database, id).ok()
-}
-
-fn clone_font_from_database(database: &Database, id: fontdb::ID) -> Font {
-    font_from_database(database, id).expect("font disappeared from system database")
 }
 
 fn font_from_database(database: &Database, id: fontdb::ID) -> Result<Font> {
