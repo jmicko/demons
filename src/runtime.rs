@@ -64,7 +64,7 @@ const MODE_BUTTON_WIDTH: u16 = 13;
 const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(45);
 const SCENE_FRAME_INTERVAL: Duration = Duration::from_millis(350);
 const NOTICE_DURATION: Duration = Duration::from_secs(6);
-#[cfg(not(test))]
+#[cfg(all(not(test), target_os = "linux"))]
 const SYSTEM_CLIPBOARD_WAIT: Duration = Duration::from_millis(150);
 const MAX_OSC52_BYTES: usize = 512 * 1024;
 const BRACKETED_PASTE_START: &str = "\x1b[200~";
