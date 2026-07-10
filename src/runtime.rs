@@ -1157,6 +1157,7 @@ impl App {
             KeyCode::Char('Y') => self.copy_focused_history(),
             KeyCode::Char('S') => self.save_focused_history()?,
             KeyCode::Char('t') => self.add_session_terminal(),
+            KeyCode::Char('x') => self.close_focused_session_terminal(),
             KeyCode::Char('r') => self.request_restart(self.focus),
             KeyCode::Char('R') => self.request_restart_all(),
             KeyCode::Char('q') => return Ok(self.request_quit()),
@@ -1244,7 +1245,7 @@ impl App {
         if self
             .menu
             .as_ref()
-            .is_some_and(|menu| menu.env_task.is_some())
+            .is_some_and(|menu| menu.env_owner.is_some())
         {
             return self.handle_menu_env_key(key);
         }
@@ -1411,7 +1412,7 @@ impl App {
         menu.task_detail = None;
         menu.terminal_detail = None;
         menu.dependency_task = None;
-        menu.env_task = None;
+        menu.env_owner = None;
         menu.env_detail_key = None;
         menu.env_cursor = 0;
     }
@@ -1495,7 +1496,7 @@ impl App {
         match menu.tab {
             MenuTab::Help => None,
             MenuTab::Tasks => {
-                if menu.env_task.is_some() {
+                if menu.env_owner.is_some() {
                     return selected_env_action(menu);
                 }
                 if menu.task_detail.is_some() {
@@ -1549,7 +1550,7 @@ impl App {
                     menu.task_detail = None;
                     menu.terminal_detail = None;
                     menu.dependency_task = None;
-                    menu.env_task = None;
+                    menu.env_owner = None;
                     menu.env_detail_key = None;
                     menu.env_cursor = 0;
                     menu.leader_picker = false;
@@ -1564,7 +1565,7 @@ impl App {
                     menu.task_detail = Some(index);
                     menu.terminal_detail = None;
                     menu.cursor = 0;
-                    menu.env_task = None;
+                    menu.env_owner = None;
                     menu.env_detail_key = None;
                     menu.env_cursor = 0;
                 }
@@ -1577,7 +1578,7 @@ impl App {
                     menu.task_detail = None;
                     menu.terminal_detail = Some(index);
                     menu.cursor = 0;
-                    menu.env_task = None;
+                    menu.env_owner = None;
                     menu.env_detail_key = None;
                     menu.env_cursor = 0;
                 }
@@ -1616,7 +1617,7 @@ impl App {
         };
         menu.edit = None;
         menu.dependency_task = None;
-        menu.env_task = None;
+        menu.env_owner = None;
         menu.env_detail_key = None;
         menu.env_cursor = 0;
         menu.leader_picker = false;
@@ -1708,10 +1709,16 @@ impl App {
             menu.env_cursor = 0;
             return Action::Continue;
         }
-        if menu.env_task.is_some() {
-            menu.env_task = None;
+        if let Some(owner) = menu.env_owner.take() {
             menu.env_cursor = 0;
-            menu.cursor = config_task_field_cursor(ConfigTaskField::Env).unwrap_or(menu.cursor);
+            menu.cursor = match owner {
+                EnvOwner::Task(_) => {
+                    config_task_field_cursor(ConfigTaskField::Env).unwrap_or(menu.cursor)
+                }
+                EnvOwner::Terminal(_) => {
+                    config_terminal_field_cursor(ConfigTerminalField::Env).unwrap_or(menu.cursor)
+                }
+            };
             return Action::Continue;
         }
         if menu.leader_picker {
@@ -1796,7 +1803,7 @@ impl App {
             }
             TaskField::Env => {
                 if let Some(menu) = self.menu.as_mut() {
-                    menu.env_task = Some(task);
+                    menu.env_owner = Some(EnvOwner::Task(task));
                     menu.env_detail_key = None;
                     menu.env_cursor = 0;
                 }
@@ -1826,6 +1833,13 @@ impl App {
         };
         match field {
             TerminalField::Name | TerminalField::Cwd => self.start_terminal_edit(terminal, field),
+            TerminalField::Env => {
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.env_owner = Some(EnvOwner::Terminal(terminal));
+                    menu.env_detail_key = None;
+                    menu.env_cursor = 0;
+                }
+            }
             TerminalField::Delete => self.delete_menu_terminal(terminal),
             TerminalField::Back => {
                 if let Some(menu) = self.menu.as_mut() {
@@ -1947,13 +1961,16 @@ impl App {
                         terminal.name = value;
                     }
                     TerminalField::Cwd => terminal.cwd = validate_menu_cwd(&root, &value)?,
-                    TerminalField::Delete | TerminalField::Back => {}
+                    TerminalField::Env | TerminalField::Delete | TerminalField::Back => {}
                 }
             }
-            MenuEditTarget::EnvKey { task, original_key } => {
+            MenuEditTarget::EnvKey {
+                owner,
+                original_key,
+            } => {
                 let key = edit.value.trim().to_owned();
                 validate_env_key(&key)?;
-                let Some(task_config) = menu.draft.tasks.get_mut(*task) else {
+                let Some(env) = menu_env_mut(menu, *owner) else {
                     return Ok(());
                 };
                 if original_key
@@ -1963,26 +1980,26 @@ impl App {
                     menu.env_detail_key = Some(key);
                     return Ok(());
                 }
-                if task_config.env.contains_key(&key) {
+                if env.contains_key(&key) {
                     anyhow::bail!("environment key {key:?} already exists");
                 }
                 let value = original_key
                     .as_ref()
-                    .and_then(|original| task_config.env.remove(original))
+                    .and_then(|original| env.remove(original))
                     .unwrap_or_default();
-                task_config.env.insert(key.clone(), value);
+                env.insert(key.clone(), value);
                 menu.env_detail_key = Some(key);
                 menu.env_cursor = 1;
             }
-            MenuEditTarget::EnvValue { task, key } => {
+            MenuEditTarget::EnvValue { owner, key } => {
                 validate_env_value(&edit.value)?;
-                let Some(task_config) = menu.draft.tasks.get_mut(*task) else {
+                let Some(env) = menu_env_mut(menu, *owner) else {
                     return Ok(());
                 };
-                if !task_config.env.contains_key(key) {
+                if !env.contains_key(key) {
                     anyhow::bail!("environment key {key:?} no longer exists");
                 }
-                task_config.env.insert(key.clone(), edit.value.clone());
+                env.insert(key.clone(), edit.value.clone());
             }
         }
         Ok(())
@@ -2039,7 +2056,7 @@ impl App {
             task.depends_on.retain(|dependency| dependency != &name);
         }
         menu.task_detail = None;
-        menu.env_task = None;
+        menu.env_owner = None;
         menu.env_detail_key = None;
         menu.env_cursor = 0;
         menu.cursor = if menu.draft.tasks.is_empty() {
@@ -2111,14 +2128,11 @@ impl App {
         let Some(menu) = self.menu.as_mut() else {
             return;
         };
-        let Some(task) = menu.env_task else {
+        let Some(owner) = menu.env_owner else {
             return;
         };
-        let Some(key) = menu
-            .draft
-            .tasks
-            .get(task)
-            .and_then(|task| env_keys(task).get(entry_index).cloned())
+        let Some(key) =
+            menu_env(menu, owner).and_then(|env| env_keys(env).get(entry_index).cloned())
         else {
             return;
         };
@@ -2130,16 +2144,16 @@ impl App {
         let Some(menu) = self.menu.as_mut() else {
             return;
         };
-        let Some(task) = menu.env_task else {
+        let Some(owner) = menu.env_owner else {
             return;
         };
-        let Some(task_config) = menu.draft.tasks.get(task) else {
+        let Some(env) = menu_env(menu, owner) else {
             return;
         };
-        let key = unique_env_key(&task_config.env);
+        let key = unique_env_key(env);
         menu.edit = Some(MenuEdit {
             target: MenuEditTarget::EnvKey {
-                task,
+                owner,
                 original_key: None,
             },
             cursor: char_count(&key),
@@ -2151,30 +2165,30 @@ impl App {
         let Some(menu) = self.menu.as_mut() else {
             return;
         };
-        let Some(task) = menu.env_task else {
+        let Some(owner) = menu.env_owner else {
             return;
         };
         let Some(key) = menu.env_detail_key.clone() else {
             return;
         };
-        let Some(task_config) = menu.draft.tasks.get(task) else {
+        let Some(env) = menu_env(menu, owner) else {
             return;
         };
-        if !task_config.env.contains_key(&key) {
+        if !env.contains_key(&key) {
             menu.env_detail_key = None;
             menu.env_cursor = 0;
             return;
         }
         let value = match field {
             EnvField::Key => key.clone(),
-            EnvField::Value => task_config.env.get(&key).cloned().unwrap_or_default(),
+            EnvField::Value => env.get(&key).cloned().unwrap_or_default(),
         };
         let target = match field {
             EnvField::Key => MenuEditTarget::EnvKey {
-                task,
+                owner,
                 original_key: Some(key),
             },
-            EnvField::Value => MenuEditTarget::EnvValue { task, key },
+            EnvField::Value => MenuEditTarget::EnvValue { owner, key },
         };
         menu.edit = Some(MenuEdit {
             target,
@@ -2187,14 +2201,14 @@ impl App {
         let Some(menu) = self.menu.as_mut() else {
             return;
         };
-        let Some(task) = menu.env_task else {
+        let Some(owner) = menu.env_owner else {
             return;
         };
         let Some(key) = menu.env_detail_key.clone() else {
             return;
         };
-        if let Some(task_config) = menu.draft.tasks.get_mut(task) {
-            task_config.env.remove(&key);
+        if let Some(env) = menu_env_mut(menu, owner) {
+            env.remove(&key);
         }
         menu.env_detail_key = None;
         menu.env_cursor = 0;
@@ -2207,10 +2221,16 @@ impl App {
         if menu.env_detail_key.is_some() {
             menu.env_detail_key = None;
             menu.env_cursor = 0;
-        } else {
-            menu.env_task = None;
+        } else if let Some(owner) = menu.env_owner.take() {
             menu.env_cursor = 0;
-            menu.cursor = config_task_field_cursor(ConfigTaskField::Env).unwrap_or(menu.cursor);
+            menu.cursor = match owner {
+                EnvOwner::Task(_) => {
+                    config_task_field_cursor(ConfigTaskField::Env).unwrap_or(menu.cursor)
+                }
+                EnvOwner::Terminal(_) => {
+                    config_terminal_field_cursor(ConfigTerminalField::Env).unwrap_or(menu.cursor)
+                }
+            };
         }
     }
 
@@ -3108,7 +3128,7 @@ impl App {
                 } else if self
                     .menu
                     .as_ref()
-                    .is_some_and(|menu| menu.env_task.is_some())
+                    .is_some_and(|menu| menu.env_owner.is_some())
                 {
                     self.move_menu_env_cursor(-1);
                 } else if self.menu.as_ref().is_some_and(|menu| menu.leader_picker) {
@@ -3128,7 +3148,7 @@ impl App {
                 } else if self
                     .menu
                     .as_ref()
-                    .is_some_and(|menu| menu.env_task.is_some())
+                    .is_some_and(|menu| menu.env_owner.is_some())
                 {
                     self.move_menu_env_cursor(1);
                 } else if self.menu.as_ref().is_some_and(|menu| menu.leader_picker) {
@@ -3175,6 +3195,7 @@ impl App {
             FooterAction::CopyHistory => self.copy_focused_history(),
             FooterAction::SaveHistory => self.save_focused_history()?,
             FooterAction::AddTerminal => self.add_session_terminal(),
+            FooterAction::CloseSessionTerminal => self.close_focused_session_terminal(),
             FooterAction::ShowMenu => self.open_menu(MenuTab::Help),
             FooterAction::RestartFocused => self.request_restart(self.focus),
             FooterAction::RestartAll => self.request_restart_all(),
@@ -3206,6 +3227,43 @@ impl App {
         }
         self.tick_dependency_starts(Instant::now());
         self.set_notice(format!("Added session terminal {name}."));
+    }
+
+    fn close_focused_session_terminal(&mut self) {
+        let index = self.focus;
+        let Some(runtime) = self.tasks.get(index) else {
+            return;
+        };
+        if !matches!(runtime.kind, RuntimePaneKind::SessionTerminal) {
+            self.set_notice("Only session terminals can be closed with x.".to_owned());
+            return;
+        }
+        let name = runtime.task.name.clone();
+
+        self.stop_runtime_indexes(&[index]);
+        self.tasks.remove(index);
+        self.focus = index.min(self.tasks.len().saturating_sub(1));
+        if self.tasks.is_empty() {
+            self.fullscreen = false;
+        }
+        if let Some(selection) = self.selection.as_mut() {
+            if selection.pane == index {
+                self.selection = None;
+            } else if selection.pane > index {
+                selection.pane -= 1;
+            }
+        }
+        if let Some(search) = self.search.as_mut() {
+            if search.pane == index {
+                self.search = None;
+                self.mode = AppMode::Command;
+            } else if search.pane > index {
+                search.pane -= 1;
+            }
+        }
+        self.last_click = None;
+        self.countdown_snapshot.clear();
+        self.set_notice(format!("Closed session terminal {name}."));
     }
 
     fn toggle_mode(&mut self) {
@@ -3991,7 +4049,12 @@ impl App {
             AppMode::Command => (
                 "❄ COMMAND ❄",
                 THEME_COMMAND,
-                command_footer_items(self.selected_text().is_some()),
+                command_footer_items(
+                    self.selected_text().is_some(),
+                    self.tasks.get(self.focus).is_some_and(|runtime| {
+                        matches!(runtime.kind, RuntimePaneKind::SessionTerminal)
+                    }),
+                ),
             ),
             AppMode::Search => ("❄ SEARCH ❄", THEME_GOLD, search_placeholder_footer_items()),
         }
@@ -5817,7 +5880,7 @@ struct MenuState {
     terminal_detail: Option<usize>,
     dependency_task: Option<usize>,
     dependency_cursor: usize,
-    env_task: Option<usize>,
+    env_owner: Option<EnvOwner>,
     env_detail_key: Option<String>,
     env_cursor: usize,
     leader_picker: bool,
@@ -5845,7 +5908,7 @@ impl MenuState {
             terminal_detail: None,
             dependency_task: None,
             dependency_cursor: 0,
-            env_task: None,
+            env_owner: None,
             env_detail_key: None,
             env_cursor: 0,
             leader_picker: false,
@@ -5882,13 +5945,19 @@ enum MenuEditTarget {
         field: TerminalField,
     },
     EnvKey {
-        task: usize,
+        owner: EnvOwner,
         original_key: Option<String>,
     },
     EnvValue {
-        task: usize,
+        owner: EnvOwner,
         key: String,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EnvOwner {
+    Task(usize),
+    Terminal(usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5938,6 +6007,7 @@ enum TaskField {
 enum TerminalField {
     Name,
     Cwd,
+    Env,
     Delete,
     Back,
 }
@@ -6347,8 +6417,8 @@ fn render_menu(
         render_menu_dependencies(body, buffer, menu, task, hover_position);
         return;
     }
-    if let Some(task) = menu.env_task {
-        render_menu_env(body, buffer, menu, task, hover_position);
+    if let Some(owner) = menu.env_owner {
+        render_menu_env(body, buffer, menu, owner, hover_position);
         return;
     }
     if menu.leader_picker {
@@ -6381,6 +6451,8 @@ fn render_menu_help(area: Rect, buffer: &mut Buffer, leader: &str) {
         "/                      Search focused pane".to_owned(),
         "Enter / Shift-Enter    Previous / next search match".to_owned(),
         "Tab / Shift-Tab        Change searched pane while searching".to_owned(),
+        "t                      Add a terminal for this session".to_owned(),
+        "x                      Close the focused session terminal".to_owned(),
         "r                      Restart focused task and dependents".to_owned(),
         "R                      Restart every task".to_owned(),
         "c                      Clear focused pane".to_owned(),
@@ -6627,13 +6699,13 @@ fn render_menu_env(
     area: Rect,
     buffer: &mut Buffer,
     menu: &mut MenuState,
-    task_index: usize,
+    owner: EnvOwner,
     hover_position: Option<(u16, u16)>,
 ) {
     if menu.env_detail_key.is_some() {
-        render_menu_env_detail(area, buffer, menu, task_index, hover_position);
+        render_menu_env_detail(area, buffer, menu, owner, hover_position);
     } else {
-        render_menu_env_list(area, buffer, menu, task_index, hover_position);
+        render_menu_env_list(area, buffer, menu, owner, hover_position);
     }
 }
 
@@ -6641,37 +6713,44 @@ fn render_menu_env_list(
     area: Rect,
     buffer: &mut Buffer,
     menu: &mut MenuState,
-    task_index: usize,
+    owner: EnvOwner,
     hover_position: Option<(u16, u16)>,
 ) {
-    let Some(task) = menu.draft.tasks.get(task_index) else {
+    let Some(owner_name) = menu_env_owner_name(menu, owner).map(str::to_owned) else {
+        return;
+    };
+    let Some(env) = menu_env(menu, owner).cloned() else {
         return;
     };
     render_text(
         buffer,
         Rect::new(area.x, area.y, area.width, 1),
-        &format!("Environment for {}", task.name),
+        &format!("Environment for {owner_name}"),
         menu_heading_style(),
     );
 
     let rows = area.height.saturating_sub(1);
-    let count = task.env.len() + 2;
+    let count = env.len() + 2;
     let start = scroll_start(menu.env_cursor, count, usize::from(rows));
+    let keys = env_keys(&env);
     for row in 0..rows {
         let index = start + usize::from(row);
         let rect = Rect::new(area.x, area.y + row + 1, area.width, 1);
         let (text, action) = if index == 0 {
             ("+ Add variable".to_owned(), MenuAction::AddEnvVar)
-        } else if index <= task.env.len() {
-            let keys = env_keys(task);
+        } else if index <= env.len() {
             let key = &keys[index - 1];
-            let value = task.env.get(key).map(String::as_str).unwrap_or_default();
+            let value = env.get(key).map(String::as_str).unwrap_or_default();
             (
                 format!("{key} = {}", display_env_value(value)),
                 MenuAction::OpenEnvEntry(index - 1),
             )
-        } else if index == task.env.len() + 1 {
-            ("Back to task".to_owned(), MenuAction::BackEnv)
+        } else if index == env.len() + 1 {
+            let label = match owner {
+                EnvOwner::Task(_) => "Back to task",
+                EnvOwner::Terminal(_) => "Back to terminal",
+            };
+            (label.to_owned(), MenuAction::BackEnv)
         } else {
             break;
         };
@@ -6691,16 +6770,13 @@ fn render_menu_env_detail(
     area: Rect,
     buffer: &mut Buffer,
     menu: &mut MenuState,
-    task_index: usize,
+    owner: EnvOwner,
     hover_position: Option<(u16, u16)>,
 ) {
     let Some(key) = menu.env_detail_key.clone() else {
         return;
     };
-    let Some(task) = menu.draft.tasks.get(task_index) else {
-        return;
-    };
-    let Some(value) = task.env.get(&key) else {
+    let Some(value) = menu_env(menu, owner).and_then(|env| env.get(&key)).cloned() else {
         return;
     };
     render_text(
@@ -6713,7 +6789,7 @@ fn render_menu_env_detail(
     let rows = [
         (format!("Key: {key}"), MenuAction::EnvField(EnvField::Key)),
         (
-            format!("Value: {}", display_env_value(value)),
+            format!("Value: {}", display_env_value(&value)),
             MenuAction::EnvField(EnvField::Value),
         ),
         ("Delete variable".to_owned(), MenuAction::DeleteEnvVar),
@@ -7282,7 +7358,7 @@ fn inset_rect(rect: Rect, horizontal: u16, vertical: u16) -> Rect {
 fn menu_item_count(menu: &MenuState, exit_mode: MenuExitMode) -> usize {
     match menu.tab {
         MenuTab::Help => 0,
-        MenuTab::Tasks if menu.env_task.is_some() => env_item_count(menu),
+        MenuTab::Tasks if menu.env_owner.is_some() => env_item_count(menu),
         MenuTab::Tasks if menu.task_detail.is_some() => task_detail_fields().len(),
         MenuTab::Tasks if menu.terminal_detail.is_some() => terminal_detail_fields().len(),
         MenuTab::Tasks => task_list_count(menu),
@@ -7549,9 +7625,9 @@ fn env_item_count(menu: &MenuState) -> usize {
     if menu.env_detail_key.is_some() {
         4
     } else {
-        menu.env_task
-            .and_then(|task| menu.draft.tasks.get(task))
-            .map(|task| task.env.len() + 2)
+        menu.env_owner
+            .and_then(|owner| menu_env(menu, owner))
+            .map(|env| env.len() + 2)
             .unwrap_or(0)
     }
 }
@@ -7566,8 +7642,8 @@ fn selected_env_action(menu: &MenuState) -> Option<MenuAction> {
             _ => None,
         };
     }
-    let task = menu.env_task?;
-    let env_len = menu.draft.tasks.get(task)?.env.len();
+    let owner = menu.env_owner?;
+    let env_len = menu_env(menu, owner)?.len();
     match menu.env_cursor {
         0 => Some(MenuAction::AddEnvVar),
         cursor if cursor <= env_len => Some(MenuAction::OpenEnvEntry(cursor - 1)),
@@ -7593,6 +7669,7 @@ fn terminal_detail_fields() -> &'static [TerminalField] {
     &[
         TerminalField::Name,
         TerminalField::Cwd,
+        TerminalField::Env,
         TerminalField::Delete,
         TerminalField::Back,
     ]
@@ -7637,6 +7714,7 @@ fn terminal_field_text(terminal: &TerminalPane, field: TerminalField) -> String 
     match field {
         TerminalField::Name => format!("Name: {}", terminal.name),
         TerminalField::Cwd => format!("Working directory: {}", terminal.cwd.display()),
+        TerminalField::Env => format!("Environment: {}", env_summary(&terminal.env)),
         TerminalField::Delete => "Delete terminal".to_owned(),
         TerminalField::Back => "Back to task list".to_owned(),
     }
@@ -7646,6 +7724,7 @@ fn terminal_field_name(field: TerminalField) -> &'static str {
     match field {
         TerminalField::Name => "name",
         TerminalField::Cwd => "working directory",
+        TerminalField::Env => "environment",
         TerminalField::Delete => "delete",
         TerminalField::Back => "back",
     }
@@ -7682,6 +7761,7 @@ fn terminal_field_to_config_field(field: TerminalField) -> Option<ConfigTerminal
     match field {
         TerminalField::Name => Some(ConfigTerminalField::Name),
         TerminalField::Cwd => Some(ConfigTerminalField::Cwd),
+        TerminalField::Env => Some(ConfigTerminalField::Env),
         TerminalField::Delete | TerminalField::Back => None,
     }
 }
@@ -7918,12 +7998,45 @@ fn env_summary(env: &BTreeMap<String, String>) -> String {
     }
 }
 
+fn menu_env(menu: &MenuState, owner: EnvOwner) -> Option<&BTreeMap<String, String>> {
+    match owner {
+        EnvOwner::Task(index) => menu.draft.tasks.get(index).map(|task| &task.env),
+        EnvOwner::Terminal(index) => menu
+            .draft
+            .terminals
+            .get(index)
+            .map(|terminal| &terminal.env),
+    }
+}
+
+fn menu_env_mut(menu: &mut MenuState, owner: EnvOwner) -> Option<&mut BTreeMap<String, String>> {
+    match owner {
+        EnvOwner::Task(index) => menu.draft.tasks.get_mut(index).map(|task| &mut task.env),
+        EnvOwner::Terminal(index) => menu
+            .draft
+            .terminals
+            .get_mut(index)
+            .map(|terminal| &mut terminal.env),
+    }
+}
+
+fn menu_env_owner_name(menu: &MenuState, owner: EnvOwner) -> Option<&str> {
+    match owner {
+        EnvOwner::Task(index) => menu.draft.tasks.get(index).map(|task| task.name.as_str()),
+        EnvOwner::Terminal(index) => menu
+            .draft
+            .terminals
+            .get(index)
+            .map(|terminal| terminal.name.as_str()),
+    }
+}
+
 fn display_env_value(value: &str) -> &str {
     if value.is_empty() { "(empty)" } else { value }
 }
 
-fn env_keys(task: &Task) -> Vec<String> {
-    task.env.keys().cloned().collect()
+fn env_keys(env: &BTreeMap<String, String>) -> Vec<String> {
+    env.keys().cloned().collect()
 }
 
 fn unique_env_key(env: &BTreeMap<String, String>) -> String {
@@ -10272,6 +10385,7 @@ enum FooterAction {
     CopyHistory,
     SaveHistory,
     AddTerminal,
+    CloseSessionTerminal,
     ShowMenu,
     RestartFocused,
     RestartAll,
@@ -10292,28 +10406,36 @@ fn footer_status(label: impl Into<String>) -> FooterItem {
     )
 }
 
-fn command_footer_items(has_selection: bool) -> Vec<FooterItem> {
-    let mut items = [
+fn command_footer_items(has_selection: bool, can_close_session_terminal: bool) -> Vec<FooterItem> {
+    let mut commands = vec![
         ("f fullscreen", FooterAction::ToggleFullscreen),
         ("/ search", FooterAction::StartSearch),
         ("y copy", FooterAction::CopySelection),
         ("Y copy all", FooterAction::CopyHistory),
         ("S save", FooterAction::SaveHistory),
         ("t terminal", FooterAction::AddTerminal),
+    ];
+    if can_close_session_terminal {
+        commands.push(("x close", FooterAction::CloseSessionTerminal));
+    }
+    commands.extend([
         ("r restart", FooterAction::RestartFocused),
         ("R restart all", FooterAction::RestartAll),
         ("c clear", FooterAction::ClearFocused),
         ("q quit", FooterAction::Quit),
         ("? menu", FooterAction::ShowMenu),
-    ]
-    .into_iter()
-    .enumerate()
-    .map(|(index, (label, action))| footer_command_button(label, action, index))
-    .collect::<Vec<_>>();
-    if !has_selection && let Some(item) = items.get_mut(2) {
-        *item = footer_disabled_button("y copy", 2);
-    }
-    items
+    ]);
+    commands
+        .into_iter()
+        .enumerate()
+        .map(|(index, (label, action))| {
+            if action == FooterAction::CopySelection && !has_selection {
+                footer_disabled_button(label, index)
+            } else {
+                footer_command_button(label, action, index)
+            }
+        })
+        .collect()
 }
 
 fn search_footer_items(search: &SearchState) -> Vec<FooterItem> {
@@ -11282,7 +11404,7 @@ mod tests {
 
     #[test]
     fn command_footer_splits_paired_actions_into_buttons() {
-        let items = command_footer_items(true);
+        let items = command_footer_items(true, false);
 
         assert!(items.iter().any(
             |item| item.text == " y copy " && item.action == Some(FooterAction::CopySelection)
@@ -11303,8 +11425,23 @@ mod tests {
     }
 
     #[test]
+    fn command_footer_only_offers_close_for_session_terminals() {
+        let regular = command_footer_items(false, false);
+        let session = command_footer_items(false, true);
+
+        assert!(
+            regular
+                .iter()
+                .all(|item| item.action != Some(FooterAction::CloseSessionTerminal))
+        );
+        assert!(session.iter().any(|item| {
+            item.text == " x close " && item.action == Some(FooterAction::CloseSessionTerminal)
+        }));
+    }
+
+    #[test]
     fn command_footer_uses_alternating_button_contrast() {
-        let items = command_footer_items(true);
+        let items = command_footer_items(true, false);
 
         assert_eq!(items[0].style.fg, THEME_BLACK);
         assert_eq!(items[1].style.fg, THEME_WHITE);
@@ -11596,7 +11733,7 @@ mod tests {
 
     #[test]
     fn command_footer_disables_copy_button_without_selection() {
-        let items = command_footer_items(false);
+        let items = command_footer_items(false, false);
         let copy = items
             .iter()
             .find(|item| item.text == " y copy ")
@@ -11633,7 +11770,7 @@ mod tests {
         });
 
         let mut buffer = Buffer::empty(Rect::new(0, 0, 120, 2));
-        let items = command_footer_items(true);
+        let items = command_footer_items(true, false);
         app.footer_hits = render_footer_items(&items, Rect::new(0, 0, 120, 2), &mut buffer, None);
         let copy_selection = app
             .footer_hits
@@ -11679,7 +11816,7 @@ mod tests {
         }
 
         let mut buffer = Buffer::empty(Rect::new(0, 0, 120, 2));
-        let items = command_footer_items(false);
+        let items = command_footer_items(false, false);
         app.footer_hits = render_footer_items(&items, Rect::new(0, 0, 120, 2), &mut buffer, None);
         let restart = app
             .footer_hits
@@ -13951,6 +14088,82 @@ mod tests {
     }
 
     #[test]
+    fn closing_session_terminal_preserves_configured_panes_and_remaps_selection() {
+        let mut app = test_app();
+        app.loaded.config.terminals.push(TerminalPane {
+            name: "configured".to_owned(),
+            cwd: PathBuf::from("."),
+            env: BTreeMap::new(),
+        });
+        app.tasks.push(TaskRuntime::new_config_terminal(
+            0,
+            app.loaded.config.terminals[0].clone(),
+            PathBuf::from("."),
+        ));
+        for name in ["scratch-one", "scratch-two"] {
+            app.tasks.push(TaskRuntime::new_session_terminal(
+                TerminalPane {
+                    name: name.to_owned(),
+                    cwd: PathBuf::from("."),
+                    env: BTreeMap::new(),
+                },
+                PathBuf::from("."),
+            ));
+        }
+        app.focus = 3;
+        app.selection = Some(Selection {
+            pane: 4,
+            anchor: SelectionPoint { line: 0, column: 0 },
+            cursor: SelectionPoint { line: 0, column: 0 },
+            granularity: SelectionGranularity::Character,
+            origin: None,
+            history_backed: true,
+            parser_anchor: None,
+            parser_cursor: None,
+            parser_origin: None,
+            dragging: false,
+            dragged: true,
+            last_mouse: None,
+            last_scroll: Instant::now(),
+        });
+
+        app.close_focused_session_terminal();
+
+        assert_eq!(app.tasks.len(), 4);
+        assert_eq!(app.loaded.config.terminals.len(), 1);
+        assert!(matches!(
+            app.tasks[2].kind,
+            RuntimePaneKind::ConfigTerminal(0)
+        ));
+        assert_eq!(app.tasks[3].task.name, "scratch-two");
+        assert!(matches!(
+            app.tasks[3].kind,
+            RuntimePaneKind::SessionTerminal
+        ));
+        assert_eq!(app.focus, 3);
+        assert_eq!(
+            app.selection.as_ref().map(|selection| selection.pane),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn close_key_does_not_remove_configured_panes() {
+        let mut app = test_app();
+        let original_count = app.tasks.len();
+
+        app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(app.tasks.len(), original_count);
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|notice| notice.text.contains("Only session terminals"))
+        );
+    }
+
+    #[test]
     fn restart_order_starts_dependencies_before_dependents() {
         let mut web = test_task("web");
         web.depends_on = vec!["server".to_owned()];
@@ -14754,7 +14967,10 @@ mod tests {
         app.apply_menu_action(MenuAction::OpenTask(0)).unwrap();
         app.apply_menu_action(MenuAction::TaskField(TaskField::Env))
             .unwrap();
-        assert_eq!(app.menu.as_ref().unwrap().env_task, Some(0));
+        assert_eq!(
+            app.menu.as_ref().unwrap().env_owner,
+            Some(EnvOwner::Task(0))
+        );
 
         app.apply_menu_action(MenuAction::AddEnvVar).unwrap();
         {
@@ -14785,6 +15001,44 @@ mod tests {
                 .env
                 .get("API_TOKEN"),
             Some(&"alpha, beta = ok".to_owned())
+        );
+    }
+
+    #[test]
+    fn env_editor_updates_persistent_terminal_variables() {
+        let mut app = test_app();
+        app.open_menu(MenuTab::Tasks);
+        app.apply_menu_action(MenuAction::AddTerminal).unwrap();
+        app.apply_menu_action(MenuAction::TerminalField(TerminalField::Env))
+            .unwrap();
+        assert_eq!(
+            app.menu.as_ref().unwrap().env_owner,
+            Some(EnvOwner::Terminal(0))
+        );
+
+        app.apply_menu_action(MenuAction::AddEnvVar).unwrap();
+        {
+            let edit = app.menu.as_mut().unwrap().edit.as_mut().unwrap();
+            edit.value = "TERM_PROFILE".to_owned();
+            edit.cursor = char_count(&edit.value);
+        }
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        app.apply_menu_action(MenuAction::EnvField(EnvField::Value))
+            .unwrap();
+        {
+            let edit = app.menu.as_mut().unwrap().edit.as_mut().unwrap();
+            edit.value = "development".to_owned();
+            edit.cursor = char_count(&edit.value);
+        }
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(
+            app.menu.as_ref().unwrap().draft.terminals[0]
+                .env
+                .get("TERM_PROFILE"),
+            Some(&"development".to_owned())
         );
     }
 

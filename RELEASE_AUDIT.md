@@ -99,13 +99,19 @@ relevant broader checks pass.
     rewriting the source. Numeric future versions still hard-fail. Focused and
     full-suite tests cover both sides of the boundary.
 
-- [ ] **8. Complete terminal-pane management.**
+- [x] **8. Complete terminal-pane management.**
   - Severity: medium.
   - Evidence: persistent terminal `env` is supported by the schema but cannot be
     edited in the configurator. Session-only terminals cannot be closed
     individually and do not appear in the Tasks menu.
   - Required: expose persistent terminal environment editing and provide a clear
     close/remove workflow for session terminals.
+  - Completed: task and persistent-terminal environment settings now share the
+    same structured editor. A focused session terminal exposes `x close` in the
+    command footer and accepts the same key, while configured panes remain
+    protected. Unit tests cover config edits, contextual controls, pane removal,
+    focus, and selection remapping. A live TUI pass confirmed the ephemeral shell
+    process exited without disturbing the configured task.
 
 ## Hardening and Polish
 
