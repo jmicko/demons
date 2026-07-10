@@ -88,12 +88,16 @@ relevant broader checks pass.
     boundary; a live 700-line test retained colors and Unicode at line 1,
     copied a deep multi-page selection, and shut down without descendants.
 
-- [ ] **7. Recover malformed current-schema declarations without losing data.**
+- [x] **7. Recover malformed current-schema declarations without losing data.**
   - Severity: medium.
   - Evidence: `0`, string-valued, and bare `schema_version` declarations can
     bypass field salvage or force a fresh draft.
   - Required: recover invalid current/legacy declarations with a warning while
     continuing to reject valid numeric future schema versions.
+  - Completed: zero, negative, boolean, string-valued, and bare declarations
+    now produce a gold root warning and preserve recoverable tasks without
+    rewriting the source. Numeric future versions still hard-fail. Focused and
+    full-suite tests cover both sides of the boundary.
 
 - [ ] **8. Complete terminal-pane management.**
   - Severity: medium.
@@ -135,6 +139,15 @@ relevant broader checks pass.
     v0.1.
   - Required: make README, specification, in-app Help, examples, changelog, and
     release instructions agree with implemented 0.3.0 behavior.
+
+- [x] **13. Stabilize detached-terminal hangup detection.**
+  - Severity: low; discovered while running the item 7 full suite.
+  - Evidence: polling a pipe with an empty event mask did not reliably surface
+    `POLLHUP`, making both the regression and terminal-detach path timing
+    dependent.
+  - Completed: attachment probes now request `POLLIN` while still checking
+    `POLLHUP`, `POLLERR`, and `POLLNVAL`. The regression passed 50 consecutive
+    runs before the full suite and clippy were rerun.
 
 ## Final Verification
 

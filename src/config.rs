@@ -425,21 +425,12 @@ fn recover_config_source(
 ) -> Result<ParsedConfig> {
     let recovered_source = recover_missing_assignment_values(source);
     let recovery_source = recovered_source.as_deref().unwrap_or(source);
-    let schema = detect_schema_version(recovery_source, path)?;
-    if schema.version > CURRENT_SCHEMA_VERSION {
-        bail!(
-            "{} uses config schema_version {}, but this demons release supports schema_version {}",
-            path.display(),
-            schema.version,
-            CURRENT_SCHEMA_VERSION
-        );
-    }
-
     let value = toml::from_str::<toml::Value>(recovery_source)
         .with_context(|| format!("failed to parse config {}", path.display()))?;
     let root = value
         .as_table()
         .context("parsed TOML document was not a table")?;
+    let schema_warning = recoverable_schema_warning(root.get("schema_version"), path)?;
     let mut warnings = Vec::new();
     let mut problems = Vec::new();
     push_recovery_warning(
@@ -448,6 +439,14 @@ fn recover_config_source(
         ConfigProblemLocation::Root,
         "Recovered config after a parse or schema mismatch.".to_owned(),
     );
+    if let Some(warning) = schema_warning {
+        push_recovery_warning(
+            &mut warnings,
+            &mut problems,
+            ConfigProblemLocation::Root,
+            warning,
+        );
+    }
     warn_unknown_keys(
         "root",
         root.keys().map(String::as_str),
@@ -476,6 +475,29 @@ fn recover_config_source(
         warnings,
         problems,
     })
+}
+
+fn recoverable_schema_warning(value: Option<&toml::Value>, path: &Path) -> Result<Option<String>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if let Some(version) = value.as_integer() {
+        if version > i64::from(CURRENT_SCHEMA_VERSION) {
+            bail!(
+                "{} uses config schema_version {}, but this demons release supports schema_version {}",
+                path.display(),
+                version,
+                CURRENT_SCHEMA_VERSION
+            );
+        }
+        if version >= 1 {
+            return Ok(None);
+        }
+    }
+
+    Ok(Some(format!(
+        "Recovered invalid schema_version as schema_version {CURRENT_SCHEMA_VERSION}."
+    )))
 }
 
 fn fresh_config_after_unrecoverable_toml(path: &Path, error: anyhow::Error) -> ParsedConfig {
@@ -2584,6 +2606,37 @@ mod tests {
             .to_string();
 
         assert!(error.contains("uses config schema_version 3"));
+    }
+
+    #[test]
+    fn unvalidated_load_salvages_malformed_schema_declarations_without_rewrite() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join(CONFIG_FILE);
+        for declaration in [
+            "schema_version = 0",
+            "schema_version = -1",
+            "schema_version = \"2\"",
+            "schema_version = \"3\"",
+            "schema_version = true",
+            "schema_version =",
+        ] {
+            let original =
+                format!("{declaration}\n\n[[task]]\nname = \"server\"\ncommand = \"echo ok\"\n");
+            fs::write(&path, &original).unwrap();
+
+            let loaded = LoadedConfig::load_unvalidated_or_default(path.clone()).unwrap();
+
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+            assert_eq!(loaded.config.schema_version, CURRENT_SCHEMA_VERSION);
+            assert_eq!(loaded.config.tasks.len(), 1);
+            assert_eq!(loaded.config.tasks[0].name, "server");
+            assert!(loaded.config_problems.iter().any(|problem| {
+                problem.severity == ConfigProblemSeverity::Warning
+                    && matches!(problem.location, ConfigProblemLocation::Root)
+                    && problem.message.contains("Recovered invalid schema_version")
+            }));
+            validate_for_path(&loaded.config, &path).unwrap();
+        }
     }
 
     #[test]

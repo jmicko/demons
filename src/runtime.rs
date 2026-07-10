@@ -482,7 +482,7 @@ fn terminal_fd_attached(fd: libc::c_int) -> bool {
 
     let mut poll_fd = libc::pollfd {
         fd,
-        events: 0,
+        events: libc::POLLIN,
         revents: 0,
     };
     let result = unsafe { libc::poll(&mut poll_fd, 1, 0) };
