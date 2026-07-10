@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -364,7 +363,7 @@ impl DemonsMcpServer {
                 });
                 Ok(CallToolResult::success(vec![
                     ContentBlock::text(metadata.to_string()),
-                    ContentBlock::image(BASE64.encode(capture.png), "image/png"),
+                    ContentBlock::image(capture.png_base64, "image/png"),
                 ]))
             }
             ControlResponse::Error { code, message } => {

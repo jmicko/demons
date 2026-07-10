@@ -617,7 +617,7 @@ struct App {
     control: Option<ControlRuntime>,
     pending_control_waits: Vec<PendingControlWait>,
     pending_captures: VecDeque<PendingCapture>,
-    capture_worker: CaptureWorker,
+    capture_worker: Option<CaptureWorker>,
     last_cursor_position: Option<(u16, u16)>,
 }
 
@@ -726,7 +726,7 @@ impl App {
             control: None,
             pending_control_waits: Vec::new(),
             pending_captures: VecDeque::new(),
-            capture_worker: CaptureWorker::start(),
+            capture_worker: None,
             last_cursor_position: None,
         }
     }
@@ -921,7 +921,11 @@ impl App {
                 self.reply_control(envelope.reply, response);
             }
             ControlRequest::CaptureTui { view } => {
-                if self.pending_captures.len() + self.capture_worker.pending() >= 4 {
+                let worker_pending = self
+                    .capture_worker
+                    .as_ref()
+                    .map_or(0, CaptureWorker::pending);
+                if self.pending_captures.len() + worker_pending >= 4 {
                     self.reply_control(
                         envelope.reply,
                         ControlResponse::error("busy", "four TUI captures are already pending"),
@@ -1677,7 +1681,23 @@ impl App {
                 (buffer, None)
             }
         };
-        if let Err(error) = self.capture_worker.submit(CaptureJob {
+        if self.capture_worker.is_none() {
+            match CaptureWorker::start() {
+                Ok(worker) => self.capture_worker = Some(worker),
+                Err(error) => {
+                    pending
+                        .reply
+                        .try_send(ControlResponse::error("capture_failed", error.to_string()))
+                        .ok();
+                    return !self.pending_captures.is_empty();
+                }
+            }
+        }
+        let worker = self
+            .capture_worker
+            .as_ref()
+            .expect("capture worker was initialized");
+        if let Err(error) = worker.submit(CaptureJob {
             view: pending.view,
             buffer,
             cursor,
@@ -16521,6 +16541,13 @@ mod tests {
         assert!(text.contains("real process output"));
         assert!(!text.contains("worker"));
         assert!(!text.contains("COMMAND"));
+    }
+
+    #[test]
+    fn capture_worker_is_lazy_while_mcp_is_unused() {
+        let app = test_app();
+
+        assert!(app.capture_worker.is_none());
     }
 
     #[test]

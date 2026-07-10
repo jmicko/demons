@@ -118,7 +118,7 @@ pub struct CaptureResult {
     pub height: u32,
     pub font: String,
     pub missing_glyphs: usize,
-    pub png: Vec<u8>,
+    pub png_base64: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -360,7 +360,7 @@ fn connection_loop(
             Err(_) => break,
         };
         if matches!(request, ControlRequest::Ping) {
-            if write_frame(
+            if write_response_frame(
                 &mut stream,
                 &ControlResponse::Instance {
                     instance: info.clone(),
@@ -381,7 +381,7 @@ fn connection_loop(
             .is_err()
         {
             let response = ControlResponse::error("busy", "Demons control queue is full");
-            if write_frame(&mut stream, &response).is_err() {
+            if write_response_frame(&mut stream, &response).is_err() {
                 break;
             }
             continue;
@@ -398,7 +398,7 @@ fn connection_loop(
                 }
             }
         };
-        if write_frame(&mut stream, &response).is_err() {
+        if write_response_frame(&mut stream, &response).is_err() {
             break;
         }
     }
@@ -654,6 +654,20 @@ fn write_frame<T: Serialize>(stream: &mut UnixStream, value: &T) -> io::Result<(
     stream.flush()
 }
 
+fn write_response_frame(stream: &mut UnixStream, response: &ControlResponse) -> io::Result<()> {
+    match write_frame(stream, response) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => write_frame(
+            stream,
+            &ControlResponse::error(
+                "response_too_large",
+                "Demons could not return this response within the control frame limit",
+            ),
+        ),
+        Err(error) => Err(error),
+    }
+}
+
 fn read_frame<T: for<'de> Deserialize<'de>>(stream: &mut UnixStream) -> io::Result<Option<T>> {
     let mut length = [0_u8; 4];
     match stream.read_exact(&mut length) {
@@ -699,6 +713,30 @@ mod tests {
             write_frame(&mut left, &request).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
+    }
+
+    #[test]
+    fn oversized_responses_return_a_structured_error() {
+        let response = ControlResponse::Capture {
+            capture: CaptureResult {
+                view: CaptureView::Full,
+                columns: 1,
+                rows: 1,
+                width: 1,
+                height: 1,
+                font: "test".to_owned(),
+                missing_glyphs: 0,
+                png_base64: "x".repeat(MAX_CONTROL_FRAME_BYTES),
+            },
+        };
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+
+        write_response_frame(&mut writer, &response).unwrap();
+
+        assert!(matches!(
+            read_frame::<ControlResponse>(&mut reader).unwrap().unwrap(),
+            ControlResponse::Error { code, .. } if code == "response_too_large"
+        ));
     }
 
     #[test]

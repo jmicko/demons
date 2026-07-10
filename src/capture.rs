@@ -9,6 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use fontdb::{Database, Family, Query, Stretch, Style as FontStyle, Weight};
 use fontdue::{Font, FontSettings};
 use ratatui::{
@@ -48,7 +49,7 @@ pub struct CaptureWorker {
 }
 
 impl CaptureWorker {
-    pub fn start() -> Self {
+    pub fn start() -> Result<Self> {
         let (tx, rx) = mpsc::sync_channel::<CaptureJob>(MAX_CAPTURE_JOBS);
         let active = Arc::new(AtomicUsize::new(0));
         let worker_active = Arc::clone(&active);
@@ -69,8 +70,8 @@ impl CaptureWorker {
                     worker_active.fetch_sub(1, Ordering::AcqRel);
                 }
             })
-            .expect("failed to start TUI capture worker");
-        Self { tx, active }
+            .context("failed to start TUI capture worker")?;
+        Ok(Self { tx, active })
     }
 
     pub fn pending(&self) -> usize {
@@ -335,7 +336,7 @@ fn render_png(
         height,
         font: fonts.name.clone(),
         missing_glyphs,
-        png,
+        png_base64: BASE64.encode(png),
     })
 }
 
@@ -554,7 +555,8 @@ mod tests {
         let fonts = FontSet::load().unwrap();
         let capture = render_png(&buffer, CaptureView::Full, Some((0, 0)), &fonts).unwrap();
         assert_eq!((capture.width, capture.height), (30, 40));
-        assert!(capture.png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        let png = BASE64.decode(capture.png_base64).unwrap();
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
     }
 
     #[test]
