@@ -16,7 +16,10 @@ use crate::control::{self, CaptureView, ControlRequest, ControlResponse, Instanc
 struct DemonsMcpServer {
     scope_id: String,
     config_path: PathBuf,
-    #[expect(dead_code, reason = "tool_handler macro accesses this router field")]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "tool_handler macro accesses this router field")
+    )]
     tool_router: ToolRouter<Self>,
 }
 
@@ -129,7 +132,8 @@ impl DemonsMcpServer {
     }
 
     #[tool(
-        description = "List running Demons instances bound to this configured project scope. Unrelated projects are never returned."
+        description = "List running Demons instances bound to this configured project scope. Unrelated projects are never returned.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     async fn list_instances(&self) -> Result<CallToolResult, McpError> {
         let scope = self.scope_id.clone();
@@ -143,7 +147,8 @@ impl DemonsMcpServer {
     }
 
     #[tool(
-        description = "List task, terminal, and agent command panes with status and output cursor metadata."
+        description = "List task, terminal, and agent command panes with status and output cursor metadata.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     async fn list_panes(
         &self,
@@ -154,7 +159,8 @@ impl DemonsMcpServer {
     }
 
     #[tool(
-        description = "Read bounded plain-text process history from one pane. This returns process output, not composed TUI decoration."
+        description = "Read bounded plain-text process history from one pane. This returns process output, not composed TUI decoration.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     async fn read_output(
         &self,
@@ -172,7 +178,8 @@ impl DemonsMcpServer {
     }
 
     #[tool(
-        description = "Search one pane's plain-text history for a literal case-insensitive string."
+        description = "Search one pane's plain-text history for a literal case-insensitive string.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     async fn search_output(
         &self,
@@ -191,7 +198,12 @@ impl DemonsMcpServer {
     }
 
     #[tool(
-        description = "Wait for new literal output or a pane status change without polling repeatedly."
+        description = "Wait for new literal output or a pane status change without polling repeatedly.",
+        annotations(
+            read_only_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn wait_for_output(
         &self,
@@ -210,7 +222,15 @@ impl DemonsMcpServer {
         .await
     }
 
-    #[tool(description = "Restart one configured task and its configured dependents.")]
+    #[tool(
+        description = "Restart one configured task and its configured dependents.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
     async fn restart_task(
         &self,
         Parameters(request): Parameters<PaneRequest>,
@@ -224,7 +244,15 @@ impl DemonsMcpServer {
         .await
     }
 
-    #[tool(description = "Restart all configured task panes using dependency order.")]
+    #[tool(
+        description = "Restart all configured task panes using dependency order.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
     async fn restart_all(
         &self,
         Parameters(request): Parameters<InstanceSelection>,
@@ -233,7 +261,15 @@ impl DemonsMcpServer {
             .await
     }
 
-    #[tool(description = "Send SIGINT to the process group running in one pane.")]
+    #[tool(
+        description = "Send SIGINT to the process group running in one pane.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
     async fn interrupt_pane(
         &self,
         Parameters(request): Parameters<PaneRequest>,
@@ -248,7 +284,13 @@ impl DemonsMcpServer {
     }
 
     #[tool(
-        description = "Send explicit text to an interactive pane, optionally followed by Enter."
+        description = "Send explicit text to an interactive pane, optionally followed by Enter.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
     )]
     async fn send_input(
         &self,
@@ -266,7 +308,13 @@ impl DemonsMcpServer {
     }
 
     #[tool(
-        description = "Run a shell command in a new visible, agent-owned Demons pane and return its pane identifier immediately."
+        description = "Run a shell command in a new visible, agent-owned Demons pane and return its pane identifier immediately.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
     )]
     async fn run_command(
         &self,
@@ -283,7 +331,14 @@ impl DemonsMcpServer {
         .await
     }
 
-    #[tool(description = "Wait for an agent-owned command pane to finish.")]
+    #[tool(
+        description = "Wait for an agent-owned command pane to finish.",
+        annotations(
+            read_only_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
     async fn wait_for_command(
         &self,
         Parameters(request): Parameters<WaitCommandRequest>,
@@ -299,7 +354,13 @@ impl DemonsMcpServer {
     }
 
     #[tool(
-        description = "Close an agent-owned command pane, terminating its process first when needed."
+        description = "Close an agent-owned command pane, terminating its process first when needed.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn close_command(
         &self,
@@ -315,7 +376,12 @@ impl DemonsMcpServer {
     }
 
     #[tool(
-        description = "Render the current Demons terminal grid as a PNG for visual layout diagnosis. Use read_output for process text."
+        description = "Render the current Demons terminal grid as a PNG for visual layout diagnosis. Use read_output for process text.",
+        annotations(
+            read_only_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn capture_tui(
         &self,
@@ -447,4 +513,50 @@ pub fn serve(scope_id: String, config_path: PathBuf) -> Result<()> {
         service.waiting().await.context("MCP server failed")?;
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    #[test]
+    fn every_mcp_tool_declares_read_only_behavior() {
+        let server = DemonsMcpServer::new(
+            "5c031294-e447-46cf-9381-622869ec6f06".to_owned(),
+            PathBuf::from("/tmp/demons.toml"),
+        );
+        let expected = BTreeMap::from([
+            ("capture_tui", true),
+            ("close_command", false),
+            ("interrupt_pane", false),
+            ("list_instances", true),
+            ("list_panes", true),
+            ("read_output", true),
+            ("restart_all", false),
+            ("restart_task", false),
+            ("run_command", false),
+            ("search_output", true),
+            ("send_input", false),
+            ("wait_for_command", true),
+            ("wait_for_output", true),
+        ]);
+        let tools = server.tool_router.list_all();
+
+        assert_eq!(tools.len(), expected.len());
+        for tool in tools {
+            let read_only = tool
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.read_only_hint)
+                .unwrap_or_else(|| panic!("{} has no read-only annotation", tool.name));
+            assert_eq!(
+                Some(&read_only),
+                expected.get(tool.name.as_ref()),
+                "unexpected annotation for {}",
+                tool.name
+            );
+        }
+    }
 }
