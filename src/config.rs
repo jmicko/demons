@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -2214,19 +2214,21 @@ pub fn parse_start_delay(value: &str) -> Result<Duration> {
     let amount: u64 = number
         .parse()
         .with_context(|| format!("invalid delay amount {number:?}"))?;
-    if amount == 0 {
-        return Ok(Duration::ZERO);
-    }
-    let millis = match unit {
-        "" | "s" => amount.checked_mul(1000).context("delay is too large")?,
-        "ms" => amount,
-        "m" => amount.checked_mul(60_000).context("delay is too large")?,
-        "h" => amount
-            .checked_mul(3_600_000)
-            .context("delay is too large")?,
+    let millis_per_unit = match unit {
+        "" | "s" => 1_000,
+        "ms" => 1,
+        "m" => 60_000,
+        "h" => 3_600_000,
         _ => bail!("delay unit must be one of ms, s, m, h"),
     };
-    Ok(Duration::from_millis(millis))
+    let millis = amount
+        .checked_mul(millis_per_unit)
+        .context("delay is too large")?;
+    let duration = Duration::from_millis(millis);
+    Instant::now()
+        .checked_add(duration)
+        .context("delay is too large to schedule on this platform")?;
+    Ok(duration)
 }
 
 fn split_duration(value: &str) -> Result<(&str, &str)> {
@@ -2915,6 +2917,11 @@ command = "echo ok"
             Duration::from_millis(500)
         );
         assert_eq!(parse_start_delay("2").unwrap(), Duration::from_secs(2));
+        for value in ["0", "0ms", "0s", "0m", "0h"] {
+            assert_eq!(parse_start_delay(value).unwrap(), Duration::ZERO);
+        }
+        assert!(parse_start_delay("0anything").is_err());
+        assert!(parse_start_delay("18446744073709551615h").is_err());
     }
 
     #[test]

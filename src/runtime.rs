@@ -4218,7 +4218,16 @@ impl App {
             let deadline = match self.tasks[index].pending_start {
                 Some(deadline) => deadline,
                 None => {
-                    let deadline = now + self.tasks[index].start_delay;
+                    let Some(deadline) = now.checked_add(self.tasks[index].start_delay) else {
+                        self.tasks[index].start_requested = false;
+                        self.tasks[index].pending_start = None;
+                        self.tasks[index].status = TaskStatus::Failed;
+                        self.tasks[index].message(
+                            "\r\n\x1b[31m[demons] start delay is too large to schedule\x1b[0m\r\n",
+                        );
+                        changed = true;
+                        continue;
+                    };
                     self.tasks[index].pending_start = Some(deadline);
                     if self.tasks[index].start_delay > Duration::ZERO {
                         self.tasks[index].status = TaskStatus::Waiting;
@@ -14272,6 +14281,25 @@ mod tests {
             Some(now + Duration::from_secs(3))
         );
         assert!(app.tasks[1].pid.is_none());
+    }
+
+    #[test]
+    fn unschedulable_start_delay_fails_without_panicking() {
+        let mut app = test_app();
+        app.tasks[0].start_delay = Duration::MAX;
+        app.tasks[0].start_requested = true;
+
+        assert!(app.tick_dependency_starts(Instant::now()));
+
+        assert!(!app.tasks[0].start_requested);
+        assert!(app.tasks[0].pending_start.is_none());
+        assert_eq!(app.tasks[0].status, TaskStatus::Failed);
+        assert!(
+            app.tasks[0]
+                .history
+                .all_text()
+                .contains("start delay is too large to schedule")
+        );
     }
 
     #[test]

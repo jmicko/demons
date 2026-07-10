@@ -127,13 +127,18 @@ relevant broader checks pass.
     and report that OSC 52 was skipped. Boundary and large-selection regressions
     pass with the full suite and clippy.
 
-- [ ] **10. Tighten start-delay validation and scheduling.**
+- [x] **10. Tighten start-delay validation and scheduling.**
   - Severity: low.
   - Evidence: zero-valued delays return before unit validation, so values such
     as `0anything` are accepted. Very large durations may overflow `Instant`
     scheduling on some platforms.
   - Required: validate units regardless of amount and reject delays that cannot
     be safely scheduled.
+  - Completed: delay units are validated before zero is accepted, checked unit
+    conversion rejects arithmetic overflow, and parsed durations must fit the
+    platform's `Instant` range. Runtime scheduling uses `checked_add` as a final
+    guard and reports a pane failure instead of panicking. Focused boundary tests,
+    the full suite, and clippy pass.
 
 - [ ] **11. Clip every decorative scene to its assigned rectangle.**
   - Severity: low.
