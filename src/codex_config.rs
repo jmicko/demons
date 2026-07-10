@@ -152,7 +152,11 @@ fn edit(project_root: &Path, server: Option<(&str, &Path)>) -> Result<CodexConfi
         });
     }
     validate_config_target(&path, true)?;
-    fs::write(&path, output).with_context(|| format!("failed to write {}", path.display()))?;
+    if output.trim().is_empty() {
+        fs::remove_file(&path).with_context(|| format!("failed to remove {}", path.display()))?;
+    } else {
+        fs::write(&path, output).with_context(|| format!("failed to write {}", path.display()))?;
+    }
     Ok(CodexConfigChange {
         path,
         previous,
@@ -287,6 +291,24 @@ mod tests {
                 .unwrap()
                 .contains("model = \"gpt-test\"")
         );
+    }
+
+    #[test]
+    fn removing_the_only_managed_entry_removes_the_config_file() {
+        let temp = tempdir().unwrap();
+        let path = project_config_path(temp.path());
+        let demons_config = temp.path().join("demons.toml");
+
+        assert!(
+            install(temp.path(), &demons_config, SCOPE)
+                .unwrap()
+                .changed()
+        );
+        assert!(path.is_file());
+
+        assert!(uninstall(temp.path()).unwrap().changed());
+        assert!(!path.exists());
+        assert_eq!(inspect(temp.path()), IntegrationStatus::Missing);
     }
 
     #[test]
