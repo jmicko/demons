@@ -1,8 +1,11 @@
-# Demons — Specification (v0.1)
+# Demons - Specification (v0.3.0)
 
 ## 1. Overview
 
-Demons is a single-binary CLI for running a project's full set of long-running development commands side-by-side in one terminal, as a grid of panes each backed by a real PTY. Run `demons` from a project root and every command declared in `demons.toml` starts at once.
+Demons is a single-binary CLI for running a project's long-running development
+commands and optional shell panes side-by-side in one terminal. Every pane is
+backed by a real PTY. Run `demons` from a project root and every pane declared in
+`demons.toml` starts at once.
 
 Demons is intentionally minimal: it is **not** a session manager, a process supervisor, a build system, or a tmux replacement. It exists only while your dev session is active.
 
@@ -18,7 +21,7 @@ Demons is intentionally minimal: it is **not** a session manager, a process supe
 - Single static-ish binary, no runtime dependencies.
 - Unix-only (Linux + macOS). Windows is explicitly out of scope.
 
-## 3. Non-Goals (v1)
+## 3. Non-Goals
 
 - Session persistence / detach-reattach.
 - Production process supervision (no daemon, no health checks, no auto-restart loops).
@@ -26,9 +29,8 @@ Demons is intentionally minimal: it is **not** a session manager, a process supe
 - Build orchestration (use `make` / `just` / `cargo` for that).
 - Windows support.
 - Plugin or extension system.
-- File-watcher-based auto-restart (planned for v2; v1 has manual `r` restart only).
-- Themeable colors (planned for v2).
-- Automatic pane output logging to file (planned for v2). Manual scrollback
+- File-watcher-based auto-restart (manual `r` restart only).
+- Automatic pane output logging to file. Manual scrollback
   export is available with `S`.
 
 ## 4. Configuration
@@ -55,7 +57,7 @@ schema_version = 2
 # Optional. Demons-level settings.
 [settings]
 # Layout strategy. "grid" (default) picks the closest-to-square arrangement
-# based on terminal aspect ratio. v2 may add "tabs".
+# based on terminal aspect ratio. A future release may add "tabs".
 layout = "grid"
 # Leader key to toggle command mode.
 # Options: "alt-j" (default), "alt-backtick", "tab", "ctrl-b", "ctrl-q", "ctrl-\\".
@@ -81,12 +83,12 @@ depends_on = ["server"]
 # Optional. Delay after dependencies have started. Supports ms, s, m, and h.
 start_delay = "3s"
 # Optional. Glob patterns (relative to cwd) to watch. On change, the task
-# is killed and respawned. (Implemented in v2. Schema is reserved.)
+# is killed and respawned. Reserved; not implemented.
 # watch = ["src/**/*.rs", "Cargo.toml"]
 # Optional. Run mode "run-on-change" — task only runs when watched files
-# change, then exits. (Implemented in v2. Schema is reserved.)
+# change, then exits. Reserved; not implemented.
 # run_on_change = ["src/**/*.rs"]
-# Optional. Restart the task at this interval. (Implemented in v2.)
+# Optional. Restart the task at this interval. Reserved; not implemented.
 # repeat = "1s"
 
 # Optional. Regular shell panes. These start the user's $SHELL directly.
@@ -137,18 +139,21 @@ user saves. Unsupported future `schema_version` values remain hard errors.
 
 When regular `demons` startup finds recoverable config problems in an
 interactive terminal, it opens the configurator without starting tasks. Saving a
-valid config starts the task set in the same session. Saving task-list changes
-while tasks are already running applies them live; added, removed, or renamed
-tasks rebuild and restart the task set without restarting Demons.
+valid config starts the pane set in the same session. Saving task-list changes
+while panes are already running reconciles the draft with the active session:
+compatible panes retain their processes and scrollback, removed panes stop,
+added panes start, and the selected restart policy applies only where requested.
+Temporary session terminals are preserved.
 
 The runtime menu is opened with `?` in command mode or by clicking the footer's
 `? menu` button. The menu has top tabs:
 
 - **Help** — command reference.
-- **Tasks** — task list. Enter or click a task to edit name, command, cwd, env,
-  dependencies, and start delay. Environment variables use a nested key/value
-  list with add, key edit, value edit, and delete actions. Dependencies are
-  selected from a checkbox list of other tasks. Working-directory edits validate
+- **Tasks** - configured task and terminal list. Enter or click a task to edit
+  name, command, cwd, env, dependencies, and start delay. Persistent terminals
+  expose name, cwd, and env. Environment variables use a nested key/value list
+  with add, key edit, value edit, and delete actions. Dependencies are selected
+  from a checkbox list of other tasks. Working-directory edits validate
   immediately and support Tab completion for directories relative to the config
   file.
 - **Settings** — app-level settings that can apply immediately, such as the
@@ -174,7 +179,7 @@ demons --help                  # Show usage.
 demons --version               # Print version.
 ```
 
-Reserved for v2 (not in v1):
+Reserved for a future release:
 
 ```
 demons "cmd1" "cmd2"           # One-off multi-pane run, no config.
@@ -199,7 +204,8 @@ Calculated at startup and on terminal resize.
      plus `empty / N` as an empty-cell penalty. Pick the lowest score.
   5. Tile panes left-to-right, top-to-bottom, in declaration order. Empty cells in the last row are unused.
 - `N = 1` → `1×1` (full screen).
-- For `N > 9` in v1 we still grid them; a 10-pane grid is awkward, and that's fine for now. v2 may add a tabbed fallback.
+- For `N > 9` the current release still grids them. A future release may add a
+  tabbed fallback.
 - Fullscreen mode shows only the focused pane in the full pane area. Other
   tasks keep running and keep their last PTY size until grid mode is restored.
 
@@ -207,10 +213,11 @@ Calculated at startup and on terminal resize.
 
 Each pane has:
 
-- A 1-line header with: task name, status icon (`●` running, `✓` exited 0,
+- A 1-line header with: pane name, status icon (`●` running, `✓` exited 0,
   `✗` exited N, `⏸` not yet started, `⏱` waiting on dependencies or delay),
   and a clickable `[↻]` restart button on the right.
-- A scrollback buffer (default 10,000 lines; configurable in v2).
+- A scrollback buffer capped at 10,000 rows. A future release may make the cap
+  configurable.
 - A pane-local text selection buffer derived from task output, used for deep
   scrollback selection and clipboard copy.
 - Mouse selection supports drag selection, double-click word selection with
@@ -224,7 +231,8 @@ Each pane has:
 - A fixed-width button at the left of the footer displays and toggles the
   current mode.
 - Footer command buttons are clickable. Paired shortcuts such as `y` / `Y` and
-  `r` / `R` are rendered as separate buttons.
+  `r` / `R` are rendered as separate buttons. `x close` is shown only for a
+  focused temporary terminal pane.
 
 ### 6.3 Navigation
 
@@ -239,9 +247,9 @@ The configured leader key (default `Alt+J`) toggles between two modes.
   selects text and plain mouse events continue to go to the child.
 - Dragging above or below the selected pane scrolls that pane's history and
   never expands the selection into neighboring panes.
-- Right-click or `Ctrl+Shift+C`: copies the current selection. Copy uses OSC 52
-  for terminals that support clipboard writes and also stores an internal
-  Demons clipboard.
+- Right-click or `Ctrl+Shift+C`: copies the current selection to the internal
+  and system clipboards. Copies up to 512 KiB also use OSC 52 for compatible
+  host terminals.
 - `Ctrl+Shift+V`, middle-click, or right-click without a current selection:
   pastes the internal Demons clipboard into the selected pane in input mode.
 - `q` or `Ctrl+C` opens quit confirmation only when the focused pane can no
@@ -262,7 +270,7 @@ The configured leader key (default `Alt+J`) toggles between two modes.
   arrows and `h j k l` cycle the focused pane shown fullscreen.
 - `PageUp` / `PageDown`: scroll the focused pane history by one page.
 - `Home` / `End`: jump to the top or bottom of focused pane history.
-- `y`: copy the focused pane's visible text.
+- `y`: copy the current selection; no action is available without a selection.
 - `Y`: copy the focused pane's full scrollback.
 - `S`: save the focused pane's full scrollback to a temp log file and copy the
   file path.
@@ -270,12 +278,15 @@ The configured leader key (default `Alt+J`) toggles between two modes.
   match immediately, Enter moves to the previous match, Shift+Enter moves to
   the next match, Esc leaves search mode, and clicking another pane or pressing
   Tab/Shift+Tab retargets the active search.
+- `t`: add a temporary shell pane for the current session.
+- `x`: close the focused temporary shell pane. Configured panes cannot be
+  removed with this shortcut.
 - `r`: restart focused pane and its dependents.
 - `R`: restart all panes.
 - `c`: clear the focused pane and its scrollback.
 - `?`: open the menu.
 - `q` or `Ctrl+C`: show quit confirmation. Press `q` or `Ctrl+C` again to
-  quit (sends SIGTERM, waits 2s, then SIGKILL) or `Esc` to cancel.
+  start the shutdown sequence described below, or `Esc` to cancel.
 - Press the leader or click the footer mode button → return to input mode.
 - Clicking a pane selects it without leaving command mode.
 - Clicking a command footer button runs that button's visible action.
@@ -286,18 +297,21 @@ intercepted in input mode and cannot be sent to the child.
 
 ### 6.4 Process lifecycle
 
-For each task:
+For each pane:
 
-- Spawn the command in a new session / process group (so SIGTERM propagates to the whole tree, not just the immediate child).
-- Inherit parent env, then merge task-level `env` on top.
+- Spawn each command or shell in a new session / process group so lifecycle
+  signals reach the whole tree, not just the immediate child.
+- Inherit parent env, then merge the task or terminal `env` table on top.
 - Stream stdout + stderr into the pane's scrollback, interleaved.
 - Manual restart (`r` or click `[↻]`): kill the process group and any dependent
   task process groups, wait for exits, then respawn them in dependency order.
   Each dependent's `start_delay` starts after its dependencies have started.
 - While a task is waiting on `start_delay`, the pane body shows a countdown to
   launch.
-- v2: file-watch-driven restart, `run_on_change`, and `repeat` — schema reserved.
-- On demons quit: send SIGTERM to every process group, wait 2s, send SIGKILL to any that are still alive. Exit only when all children are reaped.
+- File-watch-driven restart, `run_on_change`, and `repeat` remain schema-reserved.
+- On Demons quit: send SIGTERM to task process groups and SIGHUP to shell pane
+  process groups, wait 2s, then send SIGKILL to any that are still alive. Exit
+  only when all children are reaped.
 - External `SIGINT`, `SIGTERM`, and `SIGHUP` signals trigger the same graceful
   shutdown path.
 - On panic in demons: a panic hook best-effort kills all child process groups before re-raising.
@@ -324,12 +338,10 @@ For each task:
 
 - Session persistence.
 - Detach / reattach.
-- File-watch-based auto-restart (v2).
-- `run_on_change` (v2).
-- `repeat`-interval tasks (v2).
-- Automatic pane output logging to file (v2). Manual scrollback export is
-  available in v1.
-- Themes / colors (v2).
+- File-watch-based auto-restart.
+- `run_on_change`.
+- `repeat`-interval tasks.
+- Automatic pane output logging to file. Manual scrollback export is available.
 - Distributed execution.
 - Windows.
 - Daemon / background mode.
@@ -382,6 +394,6 @@ cwd = "."
 - Should the clickable restart button be visible always, or only on mouse hover? Default: always visible.
 - Should the configurator offer a diff against the saved file before writing?
   Default: no, keep save flow direct.
-- Tabs for `N > 9` panes (v2).
-- The v1 footer is always visible when the terminal is tall enough to spare
+- Tabs for `N > 9` panes.
+- The footer is always visible when the terminal is tall enough to spare
   one row; discoverability is more important than reclaiming that row.

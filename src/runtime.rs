@@ -6468,15 +6468,15 @@ fn render_menu_help(area: Rect, buffer: &mut Buffer, leader: &str) {
         "double-click/drag      Select whole words".to_owned(),
         "triple-click/drag      Select whole lines".to_owned(),
         "right-click            Copy selection or paste".to_owned(),
-        "y / Y                  Copy visible text / full scrollback".to_owned(),
+        "y / Y                  Copy selection / full scrollback".to_owned(),
         "S                      Save full scrollback to a temp log".to_owned(),
         "/                      Search focused pane".to_owned(),
         "Enter / Shift-Enter    Previous / next search match".to_owned(),
         "Tab / Shift-Tab        Change searched pane while searching".to_owned(),
         "t                      Add a terminal for this session".to_owned(),
         "x                      Close the focused session terminal".to_owned(),
-        "r                      Restart focused task and dependents".to_owned(),
-        "R                      Restart every task".to_owned(),
+        "r                      Restart focused pane and dependents".to_owned(),
+        "R                      Restart every pane".to_owned(),
         "c                      Clear focused pane".to_owned(),
         "?                      Open this menu".to_owned(),
         "q or Ctrl-C            Close Demons with confirmation".to_owned(),
@@ -11351,6 +11351,20 @@ mod tests {
             .unwrap();
         assert!(app.menu.is_none());
         assert_eq!(app.mode, AppMode::Command);
+    }
+
+    #[test]
+    fn help_documents_current_copy_and_terminal_controls() {
+        let area = Rect::new(0, 0, 100, 40);
+        let mut buffer = Buffer::empty(area);
+
+        render_menu_help(area, &mut buffer, "Alt+J");
+
+        let text = buffer_text(&buffer, area);
+        assert!(text.contains("Copy selection / full scrollback"));
+        assert!(text.contains("Add a terminal for this session"));
+        assert!(text.contains("Close the focused session terminal"));
+        assert!(!text.contains("Copy visible text"));
     }
 
     #[test]

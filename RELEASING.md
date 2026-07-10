@@ -11,15 +11,15 @@ a minor release, and patch releases should be limited to fixes and documentation
 Update the crate version with:
 
 ```sh
-scripts/set-version.sh 0.2.0
+scripts/set-version.sh 0.3.0
 ```
 
 The script updates `Cargo.toml` and the root `demons` entry in `Cargo.lock`,
 then runs `cargo check --locked`.
 
-## First crates.io Publish
+## Crates.io Setup
 
-Before the first crates.io release:
+Before publishing from a machine for the first time:
 
 1. Log in with a crates.io API token:
 
@@ -35,7 +35,8 @@ Before the first crates.io release:
 
 ## Checklist
 
-1. Start from a clean working tree on the release branch.
+1. Start from a clean working tree on the branch intended for release. Confirm
+   its history and target branch before changing the version.
 2. Run `scripts/set-version.sh <version>`.
 3. Move the relevant `CHANGELOG.md` entries from `Unreleased` to the target
    version and date, then use those notes for the GitHub release draft.
@@ -54,8 +55,14 @@ Before the first crates.io release:
      discard a setting, and confirm the panes keep running.
    - Select and copy multi-line pane output with the mouse, including dragging
      beyond the top or bottom of the pane to scroll history.
+   - Add a temporary terminal with `t`, use it in input mode, then focus it in
+     command mode and close it with `x`. Confirm configured panes stay running.
+   - Add a persistent terminal and environment variable in the Tasks tab, save,
+     and confirm the shell receives that value.
    - Restart a task with a dependent task and confirm the dependent restarts
      after its configured delay.
+   - Quit with two `q` or `Ctrl+C` confirmations and verify no child process
+     groups remain.
 
 7. Inspect the package contents if anything about packaging changed:
 
@@ -75,17 +82,17 @@ Before the first crates.io release:
    git tag -a "v<version>" -m "v<version>"
    ```
 
-10. Publish:
-
-   ```sh
-   cargo publish --locked
-   ```
-
-11. Push the branch and tag:
+10. Push the release commit and tag:
 
    ```sh
    git push origin HEAD
    git push origin "v<version>"
+   ```
+
+11. Publish the exact pushed source:
+
+   ```sh
+   cargo publish --locked
    ```
 
 12. Verify installation from crates.io after the index updates:

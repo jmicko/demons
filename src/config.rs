@@ -2371,6 +2371,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shipped_config_examples_use_current_schema() {
+        for (name, source) in [
+            ("example", include_str!("../examples/demons.toml")),
+            (
+                "smoke fixture",
+                include_str!("../tests/fixtures/smoke.toml"),
+            ),
+        ] {
+            let config: Config = toml::from_str(source)
+                .unwrap_or_else(|error| panic!("{name} config did not parse: {error}"));
+            assert_eq!(
+                config.schema_version, CURRENT_SCHEMA_VERSION,
+                "{name} config uses a stale schema"
+            );
+        }
+    }
+
+    #[test]
     fn discovers_closest_config() {
         let temp = tempdir().unwrap();
         let root = temp.path();

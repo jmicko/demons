@@ -6,7 +6,7 @@ usage() {
 usage: scripts/set-version.sh <version>
 
 Updates the crate version in Cargo.toml and the root demons package entry in
-Cargo.lock. The version must be SemVer-like, for example 0.2.0 or 1.0.0-beta.1.
+Cargo.lock. The version must be SemVer-like, for example 0.3.0 or 1.0.0-beta.1.
 USAGE
 }
 

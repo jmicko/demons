@@ -51,8 +51,8 @@ tasks. Use the Tasks tab to add or edit tasks, Settings for app-level options,
 and Exit to save or discard changes. When an existing config is found in the
 current directory or a parent directory, `demons init` edits it in place.
 Working-directory fields validate before they are applied, Tab completes
-directory names relative to the config file, and environment variables are
-edited as key/value rows.
+directory names relative to the config file, and task or terminal environment
+variables are edited as key/value rows.
 
 If an existing config is parseable TOML but does not match the current schema,
 `demons init` recovers the pieces it understands into an editable draft. Red
@@ -115,7 +115,7 @@ Demons searches the current directory and its parents for the nearest
 
 Demons has two modes:
 
-* **Input mode**: keyboard and child mouse input goes to the selected task.
+* **Input mode**: keyboard and child mouse input goes to the selected pane.
 * **Command mode**: keyboard input controls Demons.
 
 Demons starts in command mode. Press `Alt+J` or click the fixed mode button at
@@ -129,18 +129,20 @@ a pane selects it without changing modes.
 | `f` | Toggle fullscreen for the focused pane |
 | `PageUp` / `PageDown` | Scroll the focused pane by one page |
 | `Home` / `End` | Jump to the top or bottom of focused pane history |
-| `y` | Copy the focused pane's visible text |
+| `y` | Copy the current selection |
 | `Y` | Copy the focused pane's full scrollback |
 | `S` | Save the focused pane's full scrollback to a temp log file |
 | `/` | Search the focused pane's scrollback |
-| `r` | Restart the focused task and its dependents |
-| `R` | Restart every task |
+| `t` | Add a temporary terminal pane for this session |
+| `x` | Close the focused temporary terminal pane |
+| `r` | Restart the focused pane and any task dependents |
+| `R` | Restart every pane |
 | `c` | Clear the focused pane and its scrollback |
 | `?` | Open the menu |
 | `q` or `Ctrl+C` | Ask to close Demons |
 | Leader | Return to input mode |
 
-Click a pane to focus it. Click `[↻]` in a pane header to restart that task.
+Click a pane to focus it. Click `[↻]` in a pane header to restart that pane.
 The mouse wheel scrolls pane history unless the child application has enabled
 terminal mouse reporting in input mode. Footer command buttons are clickable;
 paired commands like `y` / `Y` and `r` / `R` are shown as separate buttons.
@@ -154,19 +156,24 @@ expand by whole lines. If the child application has enabled mouse reporting,
 use `Shift`-drag to select instead of sending the drag to the child. Dragging
 above or below the pane scrolls that pane's history while keeping the selection
 inside the original pane. Right-click or press `Ctrl+Shift+C` to copy the
-selection; terminals that support OSC 52 receive it on the system clipboard.
+selection. Demons also attempts to write it to the system clipboard and, up to
+512 KiB, sends OSC 52 for compatible host terminals.
 `Ctrl+Shift+V`, middle-click, or right-click with no active selection pastes the
 last copied Demons selection back to the focused pane in input mode.
 
-In command mode, `y` copies the focused pane's visible text and `Y` copies its
-full scrollback. `S` saves the focused pane's full scrollback to a temp log file
-and copies the file path. On Unix, these logs are written under a per-user temp
-directory with restricted permissions. `/` opens a focused-pane search prompt;
-typing jumps to the newest match and shows the current/total match count. Press
-Enter to go to the previous match, `Shift+Enter` to go to the next match, or
-`Esc` to leave search mode.
+In command mode, `y` copies the active selection and is disabled when nothing is
+selected. `Y` copies the focused pane's full scrollback. `S` saves the full
+scrollback to a temp log file and copies the file path. On Unix, these logs are
+written under a per-user temp directory with restricted permissions. `/` opens
+a focused-pane search prompt; typing jumps to the newest match and shows the
+current/total match count. Press Enter to go to the previous match,
+`Shift+Enter` to go to the next match, or `Esc` to leave search mode.
 Press `Tab`/`Shift+Tab` or click another pane while the prompt is open to
 search that pane instead.
+
+Press `t` to add a regular shell for the current Demons session. When that pane
+is focused, the footer shows `x close`; pressing it removes only that temporary
+pane. Persistent terminal panes are added, edited, or removed in the Tasks tab.
 
 Each pane retains up to 10,000 rows. The live screen and nearby scrollback use
 full terminal emulation; the deeper archive is optimized for line-oriented
@@ -276,15 +283,20 @@ schema_version = 2
 [[terminal]]
 name = "scratch"
 cwd = "."
+
+[terminal.env]
+RUST_LOG = "debug"
 ```
 
 Task and terminal names share one namespace. Working directories are resolved
 relative to the directory containing the config file. Unknown keys and invalid
 directories are reported before any task starts. Saving task-list changes from
-the runtime menu applies them in the current app session; added, removed, or
-renamed panes restart in place rather than requiring a Demons restart. The
-command footer also has `t terminal` for adding a temporary shell pane that is
-not written to the config.
+the runtime menu reconciles them in the current session: compatible panes stay
+running, added panes start, removed panes stop, and temporary terminals remain.
+The selected save action controls whether affected or all retained panes also
+restart. The command footer has `t terminal` for adding a temporary shell pane
+that is not written to the config. Focus that pane and use `x close` to remove
+it.
 
 `schema_version` is the Demons config schema version, not the Demons app or
 crate version. Existing unversioned configs are treated as the current schema
@@ -297,9 +309,10 @@ a configuration never silently promises behavior that is not implemented.
 
 ## Process Behavior
 
-Tasks start concurrently in separate process groups. Restart and shutdown
-signals apply to each full task process tree. On quit, Demons sends `SIGTERM`,
-waits up to two seconds, then sends `SIGKILL` to anything still running.
+Panes start concurrently in separate process groups. Restart and shutdown
+signals apply to each full process tree. On quit, Demons sends `SIGTERM` to
+configured tasks and `SIGHUP` to shell panes, waits up to two seconds, then
+sends `SIGKILL` to anything still running.
 External `SIGINT`, `SIGTERM`, and `SIGHUP` signals trigger the same cleanup.
 
 The VT renderer supports colors, cursor movement, alternate screens, bracketed

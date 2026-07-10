@@ -140,19 +140,17 @@ relevant broader checks pass.
     guard and reports a pane failure instead of panicking. Focused boundary tests,
     the full suite, and clippy pass.
 
-- [x] **11. Clip every decorative scene to its assigned rectangle.**
+- [x] **11. Clip non-output pane rendering to its assigned rectangle.**
   - Severity: low.
-  - Evidence: skating pines use a helper that clips to the complete frame rather
-    than the scene, allowing edge sprites to overwrite a pane border or neighbor.
-  - Required: enforce scene-local clipping and add an edge-position regression
-    test.
-  - Completed: scenes now render through a scene-sized compositor before being
-    copied into the terminal frame, creating one containment boundary for every
-    animation. Pine drawing also uses the rectangle-aware text primitive. Tests
-    cover 128 pine seeds and every scene kind in an offset rectangle; a live
-    resize smoke confirmed the skating scene remained intact and pane-local.
+  - Evidence: one pane-local helper clipped to the complete frame, allowing an
+    edge glyph to overwrite a pane border or neighbor.
+  - Required: enforce pane-local clipping and add an edge-position regression.
+  - Completed: non-output rendering now passes through a pane-sized compositor
+    before being copied into the terminal frame. Direct helpers also use
+    rectangle-aware primitives. Seeded edge cases and every render variant are
+    covered in offset rectangles, and a live resize smoke remained pane-local.
 
-- [ ] **12. Synchronize user-facing documentation and help.**
+- [x] **12. Synchronize user-facing documentation and help.**
   - Severity: low.
   - Evidence: README, specification, and in-app Help still describe `y` as
     copying visible text instead of the selection; Help omits `t`; the packaged
@@ -160,6 +158,12 @@ relevant broader checks pass.
     v0.1.
   - Required: make README, specification, in-app Help, examples, changelog, and
     release instructions agree with implemented 0.3.0 behavior.
+  - Completed: public docs, in-app Help, release notes, release mechanics, and
+    shipped examples now agree on selection copy, temporary and persistent
+    terminals, schema v2, config reconciliation, and process signals. Tests
+    parse packaged examples and render-check Help. Package inspection excludes
+    this audit and local test files, and private visual behavior remains
+    undocumented as intended.
 
 - [x] **13. Stabilize detached-terminal hangup detection.**
   - Severity: low; discovered while running the item 7 full suite.

@@ -6,6 +6,8 @@ All notable user-facing changes should be recorded here before a release.
 
 - Added config schema v2 with persistent `[[terminal]]` shell panes, plus a
   session-only `t terminal` command for ad-hoc shells.
+- Added `x close` for the focused session-only terminal while protecting
+  configured panes from accidental removal.
 - Changed unversioned and schema v1 configs to migrate to schema v2 after
   validation.
 - Changed `demons init` and interactive startup to recover parseable broken
@@ -17,18 +19,28 @@ All notable user-facing changes should be recorded here before a release.
   that overwrites the broken file only when saved.
 - Fixed recovery warnings so generic root notices do not linger as menu
   problems, while concrete ignored keys still appear with useful locations.
-- Changed runtime config saves so added, removed, or renamed tasks rebuild and
-  restart the task set in place instead of requiring a Demons restart.
-- Changed the task environment editor from a comma-separated text field to a
-  nested key/value row editor with add, rename, value edit, and delete actions.
+- Changed runtime config saves to reconcile panes in place, preserving compatible
+  task processes, scrollback, and session terminals while applying the selected
+  restart policy only where requested.
+- Changed task and terminal environment editing to a nested key/value row editor
+  with add, rename, value edit, and delete actions.
+- Changed `y` to copy only the current selection and added a system clipboard
+  fallback. Large copies remain available internally and through the system
+  clipboard without sending oversized OSC 52 escapes.
+- Expanded pane scrollback to a bounded, streaming, Unicode-width-aware archive
+  that preserves ANSI colors and cursor-redrawn output during deep scrolling.
+- Hardened bracketed paste handling against embedded delimiters and split host
+  events while preserving ordinary multiline and Unicode paste.
+- Fixed stale PTY events and final-output races during restart and config saves.
+- Changed shell-pane shutdown to use SIGHUP and fixed detached-terminal cleanup.
+- Tightened start-delay validation and protected scheduling from duration
+  overflow.
 - Fixed no-op command edits so direct command arrays are not rewritten as shell
   strings.
 - Hardened saved scrollback logs on Unix by using a per-user temp directory and
   rejecting symlinked or incorrectly owned log directories.
 - Raised the minimum supported Rust version to 1.88 and updated the terminal UI
   stack to `ratatui` 0.30 / `crossterm` 0.29.
-- Added lightweight animated scene rendering for completed panes and unused
-  grid slots without adding the scene text to scrollback or copy output.
 
 ## 0.2.0 - 2026-06-19
 
