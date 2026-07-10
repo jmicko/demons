@@ -57,7 +57,7 @@ relevant broader checks pass.
 
 ## Correctness and Security
 
-- [ ] **5. Harden bracketed-paste forwarding.**
+- [x] **5. Harden bracketed-paste forwarding.**
   - Severity: medium; final severity depends on an end-to-end reproduction.
   - Evidence: `paste_text_to_task` wraps an `Event::Paste` payload without
     neutralizing embedded bracketed-paste start/end sequences.
@@ -65,8 +65,13 @@ relevant broader checks pass.
     trailing bytes into live shell input.
   - Required: define and test safe handling of embedded paste delimiters without
     breaking ordinary multiline and Unicode paste.
+  - Completed: child-bound paste payloads neutralize embedded start/end
+    delimiters. Host paste events are held for a 25 ms quiet window so bytes
+    Crossterm splits after a forged end delimiter are discarded instead of
+    becoming live key events. Tests cover the split-event attack plus unchanged
+    ordinary multiline and Unicode input; all 203 tests and clippy pass.
 
-- [ ] **6. Make deep scrollback terminal-correct and memory-conscious.**
+- [x] **6. Make deep scrollback terminal-correct and memory-conscious.**
   - Severity: medium.
   - Evidence: `TextHistory` decodes each PTY chunk independently with lossy
     UTF-8, treats each Unicode scalar as one cell, supports only a small CSI
@@ -76,6 +81,12 @@ relevant broader checks pass.
     substantial memory.
   - Required: use a streaming, width-aware authoritative history model or define
     a narrower supported behavior with regression tests and bounded memory.
+  - Completed: the 10,000-row line-oriented archive now decodes UTF-8 across
+    chunks, tracks terminal columns for wide and combining text, preserves ANSI
+    styles, and resnapshots cursor-addressed screens from `vt100`. Duplicate
+    fully styled parser history is capped at 512 rows. Unit tests cover each
+    boundary; a live 700-line test retained colors and Unicode at line 1,
+    copied a deep multi-page selection, and shut down without descendants.
 
 - [ ] **7. Recover malformed current-schema declarations without losing data.**
   - Severity: medium.

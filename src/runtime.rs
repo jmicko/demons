@@ -4,6 +4,7 @@ use std::os::{
     unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
 };
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, HashSet, VecDeque},
     env, fs,
     io::{self, IsTerminal, Read, Stdout, Write},
@@ -37,6 +38,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget, Wrap},
 };
+use unicode_width::UnicodeWidthChar;
 use vt100::{MouseProtocolEncoding, MouseProtocolMode, Parser};
 
 use crate::{
@@ -49,11 +51,15 @@ use crate::{
     layout::{Grid, choose_grid, grid_rects, pane_rects},
 };
 
-const SCROLLBACK_LINES: usize = 10_000;
+// Keep the long archive compact; vt100 remains authoritative for the live
+// screen and a bounded nearby window used during interactive scrolling.
+const HISTORY_LINES: usize = 10_000;
+const PARSER_SCROLLBACK_LINES: usize = 512;
 const RESTART_GRACE: Duration = Duration::from_secs(1);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const EVENT_INTERVAL: Duration = Duration::from_millis(25);
 const ALT_ESCAPE_TIMEOUT: Duration = Duration::from_millis(50);
+const HOST_PASTE_QUIET_WINDOW: Duration = Duration::from_millis(25);
 const MODE_BUTTON_WIDTH: u16 = 13;
 const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(45);
 const SCENE_FRAME_INTERVAL: Duration = Duration::from_millis(350);
@@ -61,6 +67,8 @@ const NOTICE_DURATION: Duration = Duration::from_secs(6);
 #[cfg(not(test))]
 const SYSTEM_CLIPBOARD_WAIT: Duration = Duration::from_millis(150);
 const MAX_FULL_HISTORY_OSC52_BYTES: usize = 512 * 1024;
+const BRACKETED_PASTE_START: &str = "\x1b[200~";
+const BRACKETED_PASTE_END: &str = "\x1b[201~";
 const DEV_SCENE_ENV: &str = "DEMONS_DEV_SCENE";
 const DEV_SCENE_SEED_ENV: &str = "DEMONS_DEV_SCENE_SEED";
 const DEV_SCENE_FRAME_ENV: &str = "DEMONS_DEV_SCENE_FRAME";
@@ -571,6 +579,7 @@ struct App {
     dependent_indexes: Vec<Vec<usize>>,
     stopping: bool,
     pending_escape: Option<Instant>,
+    pending_host_paste: Option<PendingHostPaste>,
     selection: Option<Selection>,
     last_click: Option<ClickState>,
     clipboard: String,
@@ -647,6 +656,7 @@ impl App {
             dependent_indexes,
             stopping: false,
             pending_escape: None,
+            pending_host_paste: None,
             selection: None,
             last_click: None,
             clipboard: String::new(),
@@ -1015,21 +1025,24 @@ impl App {
     }
 
     fn handle_terminal_event(&mut self, event: Event) -> Result<Action> {
+        // Crossterm ends a paste at the first end delimiter. Quarantine any
+        // immediately following events so clipboard bytes cannot become keys.
+        if self.pending_host_paste.is_some()
+            && !matches!(
+                event,
+                Event::Resize(_, _) | Event::FocusGained | Event::FocusLost
+            )
+        {
+            self.reject_pending_host_paste(Instant::now());
+            return Ok(Action::Continue);
+        }
         match event {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 self.handle_key(key)
             }
             Event::Mouse(mouse) => self.handle_mouse(mouse),
             Event::Paste(text) => {
-                if self.menu.is_some() {
-                    self.insert_menu_edit_text(&text);
-                    return Ok(Action::Continue);
-                }
-                match self.mode {
-                    AppMode::Input => self.paste_text_to_task(self.focus, &text)?,
-                    AppMode::Search => self.insert_search_text(&text),
-                    AppMode::Command => {}
-                }
+                self.begin_host_paste(text, Instant::now());
                 Ok(Action::Continue)
             }
             Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => Ok(Action::Continue),
@@ -3757,6 +3770,66 @@ impl App {
         ))
     }
 
+    fn begin_host_paste(&mut self, text: String, now: Instant) {
+        let target = if self.menu.is_some() {
+            HostPasteTarget::Menu
+        } else {
+            match self.mode {
+                AppMode::Input => self
+                    .tasks
+                    .get(self.focus)
+                    .map(|task| HostPasteTarget::Input {
+                        generation: task.generation,
+                    })
+                    .unwrap_or(HostPasteTarget::Ignore),
+                AppMode::Search => HostPasteTarget::Search,
+                AppMode::Command => HostPasteTarget::Ignore,
+            }
+        };
+        self.pending_host_paste = Some(PendingHostPaste {
+            text,
+            target,
+            quiet_deadline: now + HOST_PASTE_QUIET_WINDOW,
+            rejected: false,
+        });
+    }
+
+    fn reject_pending_host_paste(&mut self, now: Instant) {
+        if let Some(paste) = self.pending_host_paste.as_mut() {
+            paste.rejected = true;
+            paste.quiet_deadline = now + HOST_PASTE_QUIET_WINDOW;
+        }
+    }
+
+    fn finish_pending_host_paste(&mut self, now: Instant) -> Result<bool> {
+        let Some(paste) = self
+            .pending_host_paste
+            .take_if(|paste| paste.quiet_deadline <= now)
+        else {
+            return Ok(false);
+        };
+        if paste.rejected {
+            self.set_notice("Blocked a paste containing an unsafe terminal delimiter.".to_owned());
+            return Ok(true);
+        }
+
+        match paste.target {
+            HostPasteTarget::Menu => self.insert_menu_edit_text(&paste.text),
+            HostPasteTarget::Input { generation } => {
+                if let Some(index) = self
+                    .tasks
+                    .iter()
+                    .position(|task| task.generation == generation)
+                {
+                    self.paste_text_to_task(index, &paste.text)?;
+                }
+            }
+            HostPasteTarget::Search => self.insert_search_text(&paste.text),
+            HostPasteTarget::Ignore => {}
+        }
+        Ok(true)
+    }
+
     fn paste_clipboard_to_focus(&mut self) -> Result<bool> {
         self.paste_clipboard_to_task(self.focus)
     }
@@ -3776,13 +3849,8 @@ impl App {
             return Ok(());
         }
         let bracketed = self.tasks[index].parser.screen().bracketed_paste();
-        if bracketed {
-            self.tasks[index].write_input(b"\x1b[200~")?;
-        }
-        self.tasks[index].write_input(text.as_bytes())?;
-        if bracketed {
-            self.tasks[index].write_input(b"\x1b[201~")?;
-        }
+        let bytes = encode_terminal_paste(text, bracketed);
+        self.tasks[index].write_input(&bytes)?;
         Ok(())
     }
 
@@ -4190,6 +4258,9 @@ impl App {
             self.apply_escape()?;
             changed = true;
         }
+        if self.finish_pending_host_paste(now)? {
+            changed = true;
+        }
         if self.autoscroll_selection(now, false) {
             changed = true;
         }
@@ -4345,7 +4416,7 @@ impl TaskRuntime {
             task,
             kind: RuntimePaneKind::Task,
             cwd,
-            parser: Parser::new(pty_size.rows, pty_size.cols, SCROLLBACK_LINES),
+            parser: Parser::new(pty_size.rows, pty_size.cols, PARSER_SCROLLBACK_LINES),
             master: None,
             writer: None,
             pid: None,
@@ -4359,7 +4430,7 @@ impl TaskRuntime {
             pty_size,
             scroll_offset: 0,
             terminal_scrollback_len: 0,
-            history: TextHistory::new(pty_size.cols, pty_size.rows, SCROLLBACK_LINES),
+            history: TextHistory::new(pty_size.cols, pty_size.rows, HISTORY_LINES),
             output_closed: true,
             pending_exit: None,
         }
@@ -4570,7 +4641,11 @@ impl TaskRuntime {
     }
 
     fn clear(&mut self) {
-        self.parser = Parser::new(self.pty_size.rows, self.pty_size.cols, SCROLLBACK_LINES);
+        self.parser = Parser::new(
+            self.pty_size.rows,
+            self.pty_size.cols,
+            PARSER_SCROLLBACK_LINES,
+        );
         self.scroll_offset = 0;
         self.terminal_scrollback_len = 0;
         self.history.clear();
@@ -4651,11 +4726,22 @@ impl TaskRuntime {
             .set_scrollback(current.min(self.terminal_scrollback_len));
     }
 
+    fn sync_history_screen_if_needed(&mut self) {
+        if !self.history.screen_sync_needed {
+            return;
+        }
+        let scrollback = self.parser.screen().scrollback();
+        self.parser.set_scrollback(0);
+        self.history.sync_visible_screen(self.parser.screen());
+        self.parser.set_scrollback(scrollback);
+    }
+
     fn message(&mut self, message: &str) {
         self.scroll_offset = 0;
         self.sync_parser_scrollback();
         self.history.process(message.as_bytes());
         self.parser.process(message.as_bytes());
+        self.sync_history_screen_if_needed();
         self.refresh_terminal_scrollback_len();
         self.sync_parser_scrollback();
     }
@@ -4664,6 +4750,7 @@ impl TaskRuntime {
         let parser_offset = self.parser.screen().scrollback();
         let added_rows = self.history.process(bytes);
         self.parser.process(bytes);
+        self.sync_history_screen_if_needed();
         let parser_added_rows = self
             .parser
             .screen()
@@ -4889,6 +4976,22 @@ struct Notice {
     until: Instant,
 }
 
+#[derive(Clone, Debug)]
+struct PendingHostPaste {
+    text: String,
+    target: HostPasteTarget,
+    quiet_deadline: Instant,
+    rejected: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostPasteTarget {
+    Menu,
+    Input { generation: u64 },
+    Search,
+    Ignore,
+}
+
 #[derive(Clone, Debug, Default)]
 struct HistoryLine {
     text: String,
@@ -4899,6 +5002,236 @@ struct HistoryLine {
 impl HistoryLine {
     fn style_at(&self, column: usize) -> Style {
         self.styles.get(column).copied().unwrap_or_else(pane_style)
+    }
+
+    fn display_width(&self) -> usize {
+        self.styles.len()
+    }
+
+    fn text_between_columns(&self, start: usize, end: usize) -> String {
+        if start >= end {
+            return String::new();
+        }
+        let mut text = String::new();
+        let mut output_column = start;
+        for glyph in display_glyphs(&self.text) {
+            if glyph.column < start {
+                continue;
+            }
+            if glyph.column >= end {
+                break;
+            }
+            for _ in output_column..glyph.column {
+                text.push(' ');
+            }
+            text.push_str(&glyph.symbol);
+            output_column = glyph.column.saturating_add(glyph.width);
+        }
+        text
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DisplayGlyph {
+    symbol: String,
+    column: usize,
+    width: usize,
+}
+
+#[derive(Clone, Debug)]
+enum HistoryCellText {
+    Blank,
+    Glyph(String),
+    Continuation,
+}
+
+fn display_glyphs(text: &str) -> Vec<DisplayGlyph> {
+    let mut glyphs: Vec<DisplayGlyph> = Vec::new();
+    let mut column = 0_usize;
+    for character in text.chars() {
+        let width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if width == 0 {
+            if let Some(glyph) = glyphs.last_mut() {
+                glyph.symbol.push(character);
+            }
+            continue;
+        }
+        glyphs.push(DisplayGlyph {
+            symbol: character.to_string(),
+            column,
+            width,
+        });
+        column = column.saturating_add(width);
+    }
+    glyphs
+}
+
+fn history_cells(text: &str, width: usize) -> Vec<HistoryCellText> {
+    let mut cells = vec![HistoryCellText::Blank; width];
+    for glyph in display_glyphs(text) {
+        if glyph.column >= cells.len() {
+            break;
+        }
+        cells[glyph.column] = HistoryCellText::Glyph(glyph.symbol);
+        for column in glyph.column + 1..glyph.column.saturating_add(glyph.width).min(cells.len()) {
+            cells[column] = HistoryCellText::Continuation;
+        }
+    }
+    cells
+}
+
+fn cells_text(cells: &[HistoryCellText]) -> String {
+    let mut text = String::new();
+    for cell in cells {
+        match cell {
+            HistoryCellText::Blank => text.push(' '),
+            HistoryCellText::Glyph(symbol) => text.push_str(symbol),
+            HistoryCellText::Continuation => {}
+        }
+    }
+    text
+}
+
+fn replace_history_symbol(
+    line: &mut HistoryLine,
+    column: usize,
+    symbol: char,
+    width: usize,
+    style: Style,
+) {
+    let end = column.saturating_add(width);
+    let total_width = line.styles.len().max(end);
+    let glyphs = display_glyphs(&line.text);
+    let mut cells = history_cells(&line.text, total_width);
+    for glyph in glyphs {
+        let glyph_end = glyph.column.saturating_add(glyph.width);
+        if glyph.column < end && glyph_end > column {
+            for cell in cells
+                .iter_mut()
+                .take(glyph_end.min(total_width))
+                .skip(glyph.column)
+            {
+                *cell = HistoryCellText::Blank;
+            }
+        }
+    }
+    cells[column] = HistoryCellText::Glyph(symbol.to_string());
+    for cell in cells.iter_mut().take(end).skip(column + 1) {
+        *cell = HistoryCellText::Continuation;
+    }
+    line.text = cells_text(&cells);
+    line.styles.resize(total_width, pane_style());
+    for cell_style in line.styles.iter_mut().take(end).skip(column) {
+        *cell_style = style;
+    }
+}
+
+fn append_history_combining(line: &mut HistoryLine, column: usize, character: char) {
+    if column == 0 {
+        return;
+    }
+    let target = column - 1;
+    let mut glyphs = display_glyphs(&line.text);
+    let Some(glyph) = glyphs
+        .iter_mut()
+        .find(|glyph| target >= glyph.column && target < glyph.column.saturating_add(glyph.width))
+    else {
+        return;
+    };
+    glyph.symbol.push(character);
+    line.text = glyphs.into_iter().map(|glyph| glyph.symbol).collect();
+}
+
+fn truncate_history_columns(line: &mut HistoryLine, columns: usize) {
+    let mut text = String::new();
+    let mut output_column = 0;
+    for glyph in display_glyphs(&line.text) {
+        let glyph_end = glyph.column.saturating_add(glyph.width);
+        if glyph_end > columns {
+            break;
+        }
+        for _ in output_column..glyph.column {
+            text.push(' ');
+        }
+        text.push_str(&glyph.symbol);
+        output_column = glyph_end;
+    }
+    line.text = text;
+    line.styles.truncate(columns);
+}
+
+fn erase_history_columns(line: &mut HistoryLine, start: usize, end: usize, style: Style) {
+    if start >= end {
+        return;
+    }
+    let total_width = line.styles.len();
+    let glyphs = display_glyphs(&line.text);
+    let mut cells = history_cells(&line.text, total_width);
+    for glyph in glyphs {
+        let glyph_end = glyph.column.saturating_add(glyph.width);
+        if glyph.column < end && glyph_end > start {
+            for cell in cells
+                .iter_mut()
+                .take(glyph_end.min(total_width))
+                .skip(glyph.column)
+            {
+                *cell = HistoryCellText::Blank;
+            }
+        }
+    }
+    for cell in cells.iter_mut().take(end.min(total_width)).skip(start) {
+        *cell = HistoryCellText::Blank;
+    }
+    line.text = cells_text(&cells);
+    for cell_style in line
+        .styles
+        .iter_mut()
+        .take(end.min(total_width))
+        .skip(start)
+    {
+        *cell_style = style;
+    }
+}
+
+fn history_line_from_screen(screen: &vt100::Screen, row: u16, columns: u16) -> HistoryLine {
+    let width = usize::from(columns);
+    let mut cells = vec![HistoryCellText::Blank; width];
+    let mut styles = vec![pane_style(); width];
+    let mut relevant_width = 0_usize;
+
+    for column in 0..columns {
+        let Some(cell) = screen.cell(row, column) else {
+            continue;
+        };
+        let index = usize::from(column);
+        let style = cell_style(cell);
+        styles[index] = style;
+        if cell.is_wide_continuation() {
+            cells[index] = HistoryCellText::Continuation;
+            if style != pane_style() {
+                relevant_width = relevant_width.max(index + 1);
+            }
+            continue;
+        }
+
+        let contents = cell.contents();
+        if !contents.is_empty() {
+            cells[index] = HistoryCellText::Glyph(contents);
+        }
+        let cell_width = if cell.is_wide() { 2 } else { 1 };
+        if matches!(cells[index], HistoryCellText::Glyph(ref symbol) if symbol != " ")
+            || style != pane_style()
+        {
+            relevant_width = relevant_width.max(index.saturating_add(cell_width));
+        }
+    }
+
+    cells.truncate(relevant_width);
+    styles.truncate(relevant_width);
+    HistoryLine {
+        text: cells_text(&cells),
+        styles,
+        wrapped: screen.row_wrapped(row),
     }
 }
 
@@ -4928,6 +5261,10 @@ struct TextHistory {
     state: TextParserState,
     csi: String,
     style: Style,
+    utf8_pending: Vec<u8>,
+    screen_sync_needed: bool,
+    screen_sync_active: bool,
+    synced_visible_rows: usize,
 }
 
 impl TextHistory {
@@ -4945,6 +5282,10 @@ impl TextHistory {
             state: TextParserState::Ground,
             csi: String::new(),
             style: pane_style(),
+            utf8_pending: Vec::with_capacity(4),
+            screen_sync_needed: false,
+            screen_sync_active: false,
+            synced_visible_rows: 0,
         }
     }
 
@@ -4958,6 +5299,10 @@ impl TextHistory {
         self.state = TextParserState::Ground;
         self.csi.clear();
         self.style = pane_style();
+        self.utf8_pending.clear();
+        self.screen_sync_needed = false;
+        self.screen_sync_active = false;
+        self.synced_visible_rows = 0;
     }
 
     fn clear_visible_screen(&mut self) {
@@ -4977,6 +5322,55 @@ impl TextHistory {
         if self.column >= usize::from(self.width) {
             self.column = usize::from(self.width.saturating_sub(1));
             self.pending_wrap = false;
+        }
+    }
+
+    fn sync_visible_screen(&mut self, screen: &vt100::Screen) {
+        let rows_to_remove = if self.synced_visible_rows == 0 {
+            usize::from(self.height)
+        } else {
+            self.synced_visible_rows
+        };
+        for _ in 0..rows_to_remove.saturating_sub(1).min(self.lines.len()) {
+            self.lines.pop_back();
+        }
+        self.current = HistoryLine::default();
+        let (rows, columns) = screen.size();
+        let (cursor_row, cursor_column) = screen.cursor_position();
+        let mut visible = Vec::with_capacity(usize::from(rows));
+        let mut last_relevant = usize::from(cursor_row.min(rows.saturating_sub(1)));
+
+        for row in 0..rows {
+            let line = history_line_from_screen(screen, row, columns);
+            if line.display_width() > 0 || line.wrapped {
+                last_relevant = usize::from(row);
+            }
+            visible.push(line);
+        }
+
+        for (row, line) in visible.into_iter().take(last_relevant + 1).enumerate() {
+            if row == last_relevant {
+                self.current = line;
+            } else {
+                self.push_line(line);
+            }
+        }
+        self.column = if usize::from(cursor_row) == last_relevant {
+            usize::from(cursor_column).min(usize::from(self.width.saturating_sub(1)))
+        } else {
+            self.current.display_width().min(usize::from(self.width))
+        };
+        self.pending_wrap = false;
+        self.cursor_home = false;
+        self.screen_sync_needed = false;
+        self.synced_visible_rows = last_relevant + 1;
+    }
+
+    fn push_line(&mut self, line: HistoryLine) {
+        self.lines.push_back(line);
+        while self.lines.len() > self.max_lines {
+            self.lines.pop_front();
+            self.first_index = self.first_index.saturating_add(1);
         }
     }
 
@@ -5007,8 +5401,17 @@ impl TextHistory {
     }
 
     fn process(&mut self, bytes: &[u8]) -> usize {
+        let decoded = self.decode_utf8(bytes);
+        if self.screen_sync_active {
+            self.screen_sync_needed = true;
+            return 0;
+        }
         let mut added_rows = 0;
-        for character in String::from_utf8_lossy(bytes).chars() {
+        for character in decoded.chars() {
+            if self.screen_sync_active {
+                self.screen_sync_needed = true;
+                continue;
+            }
             match self.state {
                 TextParserState::Ground => match character {
                     '\x1b' => self.state = TextParserState::Escape,
@@ -5047,7 +5450,10 @@ impl TextHistory {
                     }
                     ']' => self.state = TextParserState::Osc,
                     'P' | '^' | '_' => self.state = TextParserState::StringControl,
-                    _ => self.state = TextParserState::Ground,
+                    _ => {
+                        self.enable_screen_sync();
+                        self.state = TextParserState::Ground;
+                    }
                 },
                 TextParserState::Csi => {
                     if ('@'..='~').contains(&character) {
@@ -5087,20 +5493,70 @@ impl TextHistory {
         added_rows
     }
 
+    fn decode_utf8(&mut self, bytes: &[u8]) -> String {
+        self.utf8_pending.extend_from_slice(bytes);
+        let input = std::mem::take(&mut self.utf8_pending);
+        let mut remaining = input.as_slice();
+        let mut decoded = String::with_capacity(input.len());
+
+        while !remaining.is_empty() {
+            match std::str::from_utf8(remaining) {
+                Ok(text) => {
+                    decoded.push_str(text);
+                    break;
+                }
+                Err(error) => {
+                    let valid = error.valid_up_to();
+                    decoded.push_str(std::str::from_utf8(&remaining[..valid]).unwrap());
+                    match error.error_len() {
+                        Some(invalid) => {
+                            decoded.push('\u{fffd}');
+                            remaining = &remaining[valid + invalid..];
+                        }
+                        None => {
+                            self.utf8_pending.extend_from_slice(&remaining[valid..]);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        decoded
+    }
+
     fn put_char(&mut self, character: char) -> usize {
         let mut added_rows = 0;
         if self.pending_wrap {
             added_rows += self.push_current(true);
             self.pending_wrap = false;
         }
-        while char_count(&self.current.text) < self.column {
+        let mut character = character;
+        let mut width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if width == 0 {
+            append_history_combining(&mut self.current, self.column, character);
+            return added_rows;
+        }
+        if width > usize::from(self.width) {
+            character = '\u{fffd}';
+            width = 1;
+        }
+        if self.column.saturating_add(width) > usize::from(self.width) {
+            added_rows += self.push_current(true);
+        }
+        while self.current.display_width() < self.column {
             self.current.text.push(' ');
             self.current.styles.push(pane_style());
         }
 
-        replace_char(&mut self.current.text, self.column, character);
-        replace_style(&mut self.current.styles, self.column, self.style);
-        self.column += 1;
+        if self.column == self.current.display_width() {
+            self.current.text.push(character);
+            self.current
+                .styles
+                .extend(std::iter::repeat_n(self.style, width));
+        } else {
+            replace_history_symbol(&mut self.current, self.column, character, width, self.style);
+        }
+        self.column += width;
         if self.column >= usize::from(self.width) {
             self.pending_wrap = true;
         }
@@ -5109,15 +5565,14 @@ impl TextHistory {
 
     fn push_current(&mut self, wrapped: bool) -> usize {
         let mut line = std::mem::take(&mut self.current);
-        let trimmed_len = line.text.trim_end().chars().count();
-        truncate_chars(&mut line.text, trimmed_len);
-        line.styles.truncate(trimmed_len);
+        line.text = line.text.trim_end().to_owned();
+        line.styles.truncate(
+            display_glyphs(&line.text)
+                .last()
+                .map_or(0, |glyph| glyph.column.saturating_add(glyph.width)),
+        );
         line.wrapped = wrapped;
-        self.lines.push_back(line);
-        while self.lines.len() > self.max_lines {
-            self.lines.pop_front();
-            self.first_index = self.first_index.saturating_add(1);
-        }
+        self.push_line(line);
         self.column = 0;
         self.pending_wrap = false;
         1
@@ -5129,7 +5584,10 @@ impl TextHistory {
             'J' => self.apply_erase_display(),
             'K' => self.apply_erase_line(),
             'm' => self.apply_sgr(),
-            _ => self.cursor_home = false,
+            _ => {
+                self.cursor_home = false;
+                self.enable_screen_sync();
+            }
         }
     }
 
@@ -5141,6 +5599,12 @@ impl TextHistory {
             .min(usize::from(self.width.saturating_sub(1)));
         self.pending_wrap = false;
         self.cursor_home = row == 1 && column == 1;
+        self.enable_screen_sync();
+    }
+
+    fn enable_screen_sync(&mut self) {
+        self.screen_sync_active = true;
+        self.screen_sync_needed = true;
     }
 
     fn apply_erase_display(&mut self) {
@@ -5162,21 +5626,19 @@ impl TextHistory {
     fn apply_erase_line(&mut self) {
         match first_csi_param(&self.csi).unwrap_or(0) {
             0 => {
-                truncate_chars(&mut self.current.text, self.column);
-                self.current.styles.truncate(self.column);
+                truncate_history_columns(&mut self.current, self.column);
             }
             1 => {
-                let end = byte_index_for_char(&self.current.text, self.column);
-                self.current.text.replace_range(0..end, "");
-                self.current
-                    .styles
-                    .drain(0..self.column.min(self.current.styles.len()));
-                self.column = 0;
+                erase_history_columns(
+                    &mut self.current,
+                    0,
+                    self.column.saturating_add(1),
+                    self.style,
+                );
             }
             2 => {
                 self.current.text.clear();
                 self.current.styles.clear();
-                self.column = 0;
             }
             _ => {}
         }
@@ -5264,7 +5726,7 @@ impl TextHistory {
             } else {
                 usize::MAX
             };
-            text.push_str(&slice_chars(&line.text, start_column, end_column));
+            text.push_str(&line.text_between_columns(start_column, end_column));
             if line_index != end.line && !line.wrapped {
                 text.push('\n');
             }
@@ -5297,7 +5759,7 @@ impl TextHistory {
     }
 
     fn line_char_count(&self, index: u64) -> Option<usize> {
-        self.line(index).map(|line| char_count(&line.text))
+        self.line(index).map(HistoryLine::display_width)
     }
 
     fn line_matches(&self, index: u64, needle: &str) -> bool {
@@ -9199,16 +9661,13 @@ fn render_history(task: &TaskRuntime, area: Rect, buffer: &mut Buffer) {
         let Some(line) = task.history.line(start.saturating_add(u64::from(row))) else {
             continue;
         };
-        for (column, character) in line.text.chars().take(usize::from(area.width)).enumerate() {
-            let mut encoded = [0_u8; 4];
-            let symbol = if character.is_control() {
-                " "
-            } else {
-                character.encode_utf8(&mut encoded)
-            };
-            buffer[(area.x + column as u16, area.y + row)]
-                .set_symbol(symbol)
-                .set_style(line.style_at(column));
+        for glyph in display_glyphs(&line.text) {
+            if glyph.column >= usize::from(area.width) {
+                break;
+            }
+            buffer[(area.x + glyph.column as u16, area.y + row)]
+                .set_symbol(&glyph.symbol)
+                .set_style(line.style_at(glyph.column));
         }
     }
 }
@@ -9332,7 +9791,7 @@ fn render_live_history_selection(
     let Some(line) = task.history.line(start.line) else {
         return false;
     };
-    let expected = slice_chars(&line.text, 0, usize::from(area.width));
+    let expected = line.text_between_columns(0, usize::from(area.width));
     let expected = expected.trim_end();
     if expected.is_empty() {
         return false;
@@ -9640,24 +10099,31 @@ fn selection_scroll_step(rect: Rect, y: u16) -> usize {
 }
 
 fn word_columns_at(text: &str, column: u16) -> Option<(u16, u16)> {
-    let chars = text.chars().collect::<Vec<_>>();
-    let index = usize::from(column);
-    if index >= chars.len() || chars[index].is_whitespace() {
+    let glyphs = display_glyphs(text);
+    let column = usize::from(column);
+    let index = glyphs.iter().position(|glyph| {
+        column >= glyph.column && column < glyph.column.saturating_add(glyph.width)
+    })?;
+    if glyphs[index].symbol.chars().all(char::is_whitespace) {
         return None;
     }
 
     let mut start = index;
-    while start > 0 && !chars[start - 1].is_whitespace() {
+    while start > 0 && !glyphs[start - 1].symbol.chars().all(char::is_whitespace) {
         start -= 1;
     }
     let mut end = index;
-    while end + 1 < chars.len() && !chars[end + 1].is_whitespace() {
+    while end + 1 < glyphs.len() && !glyphs[end + 1].symbol.chars().all(char::is_whitespace) {
         end += 1;
     }
 
     Some((
-        start.min(usize::from(u16::MAX)) as u16,
-        end.min(usize::from(u16::MAX)) as u16,
+        glyphs[start].column.min(usize::from(u16::MAX)) as u16,
+        glyphs[end]
+            .column
+            .saturating_add(glyphs[end].width)
+            .saturating_sub(1)
+            .min(usize::from(u16::MAX)) as u16,
     ))
 }
 
@@ -9669,47 +10135,12 @@ fn to_u16(value: usize) -> u16 {
     value.min(usize::from(u16::MAX)) as u16
 }
 
-fn replace_char(value: &mut String, index: usize, character: char) {
-    let mut indices = value.char_indices().map(|(offset, _)| offset);
-    let Some(start) = indices.nth(index) else {
-        value.push(character);
-        return;
-    };
-    let end = value[start..]
-        .char_indices()
-        .nth(1)
-        .map(|(offset, _)| start + offset)
-        .unwrap_or(value.len());
-    value.replace_range(start..end, character.encode_utf8(&mut [0_u8; 4]));
-}
-
-fn replace_style(styles: &mut Vec<Style>, index: usize, style: Style) {
-    if index < styles.len() {
-        styles[index] = style;
-    } else {
-        styles.push(style);
-    }
-}
-
-fn truncate_chars(value: &mut String, len: usize) {
-    let index = byte_index_for_char(value, len);
-    value.truncate(index);
-}
-
 fn byte_index_for_char(value: &str, char_index: usize) -> usize {
     value
         .char_indices()
         .nth(char_index)
         .map(|(index, _)| index)
         .unwrap_or(value.len())
-}
-
-fn slice_chars(value: &str, start: usize, end: usize) -> String {
-    value
-        .chars()
-        .skip(start)
-        .take(end.saturating_sub(start))
-        .collect()
 }
 
 fn first_csi_param(value: &str) -> Option<usize> {
@@ -10207,6 +10638,35 @@ fn base64_encode(bytes: &[u8]) -> String {
     encoded
 }
 
+fn neutralize_bracketed_paste_delimiters(text: &str) -> Cow<'_, str> {
+    if text.contains(BRACKETED_PASTE_START) || text.contains(BRACKETED_PASTE_END) {
+        Cow::Owned(
+            text.replace(BRACKETED_PASTE_START, r"\x1b[200~")
+                .replace(BRACKETED_PASTE_END, r"\x1b[201~"),
+        )
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
+fn encode_terminal_paste(text: &str, bracketed: bool) -> Vec<u8> {
+    let text = neutralize_bracketed_paste_delimiters(text);
+    let wrapper_bytes = if bracketed {
+        BRACKETED_PASTE_START.len() + BRACKETED_PASTE_END.len()
+    } else {
+        0
+    };
+    let mut bytes = Vec::with_capacity(text.len() + wrapper_bytes);
+    if bracketed {
+        bytes.extend_from_slice(BRACKETED_PASTE_START.as_bytes());
+    }
+    bytes.extend_from_slice(text.as_bytes());
+    if bracketed {
+        bytes.extend_from_slice(BRACKETED_PASTE_END.as_bytes());
+    }
+    bytes
+}
+
 fn is_copy_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char('c' | 'C'))
         && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -10590,6 +11050,33 @@ mod tests {
     }
 
     #[test]
+    fn terminal_paste_preserves_ordinary_multiline_unicode() {
+        let text = "first line\nsecond β line";
+
+        assert_eq!(encode_terminal_paste(text, false), text.as_bytes());
+        assert_eq!(
+            encode_terminal_paste(text, true),
+            format!("{BRACKETED_PASTE_START}{text}{BRACKETED_PASTE_END}").as_bytes()
+        );
+    }
+
+    #[test]
+    fn terminal_paste_neutralizes_embedded_bracket_delimiters() {
+        let text = format!("safe{BRACKETED_PASTE_END}echo dangerous{BRACKETED_PASTE_START}tail");
+        let encoded = encode_terminal_paste(&text, true);
+        let encoded = String::from_utf8(encoded).unwrap();
+
+        assert_eq!(
+            encoded,
+            format!(
+                "{BRACKETED_PASTE_START}safe\\x1b[201~echo dangerous\\x1b[200~tail{BRACKETED_PASTE_END}"
+            )
+        );
+        assert_eq!(encoded.matches(BRACKETED_PASTE_START).count(), 1);
+        assert_eq!(encoded.matches(BRACKETED_PASTE_END).count(), 1);
+    }
+
+    #[test]
     fn encodes_sgr_mouse_events() {
         let event = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -10903,6 +11390,86 @@ mod tests {
     }
 
     #[test]
+    fn text_history_decodes_utf8_across_output_chunks() {
+        let mut history = TextHistory::new(80, 24, 100);
+        let text = "snow ☃ and 界";
+        for byte in text.as_bytes() {
+            history.process(std::slice::from_ref(byte));
+        }
+
+        assert_eq!(history.all_text(), text);
+        assert!(!history.all_text().contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn text_history_wraps_and_selects_by_terminal_columns() {
+        let mut history = TextHistory::new(4, 24, 100);
+        history.process("ab界c".as_bytes());
+
+        let first = history.line(0).unwrap();
+        assert_eq!(first.text, "ab界");
+        assert_eq!(first.display_width(), 4);
+        assert!(first.wrapped);
+        assert_eq!(first.text_between_columns(2, 4), "界");
+        assert_eq!(first.text_between_columns(3, 4), "");
+        assert_eq!(history.all_text(), "ab界c");
+    }
+
+    #[test]
+    fn text_history_keeps_combining_marks_with_their_base_cell() {
+        let mut history = TextHistory::new(10, 24, 100);
+        history.process("e\u{301}x".as_bytes());
+
+        let line = history.line(0).unwrap();
+        assert_eq!(line.display_width(), 2);
+        assert_eq!(line.text_between_columns(0, 1), "e\u{301}");
+        assert_eq!(line.text_between_columns(1, 2), "x");
+        assert_eq!(word_columns_at("e\u{301} 界面", 4), Some((2, 5)));
+    }
+
+    #[test]
+    fn text_history_clears_both_cells_when_overwriting_a_wide_glyph() {
+        let mut history = TextHistory::new(10, 24, 100);
+        history.process("界Z\rA".as_bytes());
+
+        assert_eq!(history.all_text(), "A Z");
+    }
+
+    #[test]
+    fn parser_scrollback_is_bounded_below_the_full_text_archive() {
+        let mut task = TaskRuntime::new(test_task("bounded"), PathBuf::from("."));
+        task.resize(20, 4);
+        for line in 0..700 {
+            task.process_output(format!("line {line}\r\n").as_bytes());
+        }
+
+        assert_eq!(task.terminal_scrollback_len, PARSER_SCROLLBACK_LINES);
+        assert!(task.history.visible_line_count() > PARSER_SCROLLBACK_LINES as u64);
+        task.scroll_to_top();
+        assert!(!task.renders_with_terminal_parser(4));
+        assert!(task.history.all_text().starts_with("line 0"));
+    }
+
+    #[test]
+    fn cursor_addressed_redraws_resnapshot_without_erasing_older_scrollback() {
+        let mut task = TaskRuntime::new(test_task("redraw"), PathBuf::from("."));
+        task.resize(20, 4);
+        for line in 0..12 {
+            task.process_output(format!("line {line}\r\n").as_bytes());
+        }
+
+        task.process_output(b"\x1b[1;1H\x1b[31mFRAME ONE\x1b[0m");
+        task.process_output(b"\x1b[1;1HFRAME TWO");
+
+        let text = task.history.all_text();
+        assert!(text.starts_with("line 0"));
+        assert!(text.contains("FRAME TWO"));
+        assert!(!text.contains("FRAME ONE"));
+        assert_eq!(text.matches("line 0").count(), 1);
+        assert!(task.history.screen_sync_active);
+    }
+
+    #[test]
     fn text_history_honors_erase_line_for_progress_output() {
         let mut history = TextHistory::new(80, 24, 100);
         history.process(b"old progress text\r\x1b[Kdone\n");
@@ -10919,14 +11486,15 @@ mod tests {
     }
 
     #[test]
-    fn text_history_honors_home_clear_redraws() {
-        let mut history = TextHistory::new(80, 24, 100);
-        history.process(
+    fn terminal_history_honors_home_clear_redraws() {
+        let mut task = TaskRuntime::new(test_task("web"), PathBuf::from("."));
+        task.resize(80, 24);
+        task.process_output(
             b"\r\n> vashti-web@0.1.0 dev\r\n> vite --host 127.0.0.1\r\n\r\n\r\n\
               \x1b[1;1H\x1b[0J\r\n  VITE v6.4.2  ready in 103 ms\r\n\r\n  -> Local: http://localhost:5173/\r\n",
         );
 
-        let text = history.all_text();
+        let text = task.history.all_text();
         assert!(!text.contains("vashti-web"));
         assert!(!text.contains("vite --host"));
         assert!(text.contains("VITE v6.4.2"));
@@ -10964,13 +11532,14 @@ mod tests {
     }
 
     #[test]
-    fn text_history_home_clear_preserves_scrolled_off_history() {
-        let mut history = TextHistory::new(80, 3, 100);
-        history.process(b"old one\r\nold two\r\nvisible one\r\nvisible two\r\nvisible three");
+    fn terminal_history_home_clear_preserves_scrolled_off_history() {
+        let mut task = TaskRuntime::new(test_task("web"), PathBuf::from("."));
+        task.resize(80, 3);
+        task.process_output(b"old one\r\nold two\r\nvisible one\r\nvisible two\r\nvisible three");
 
-        history.process(b"\x1b[1;1H\x1b[0Jnew screen\r\n");
+        task.process_output(b"\x1b[1;1H\x1b[0Jnew screen\r\n");
 
-        let text = history.all_text();
+        let text = task.history.all_text();
         assert!(text.contains("old one"));
         assert!(text.contains("old two"));
         assert!(!text.contains("visible one"));
@@ -11883,6 +12452,50 @@ mod tests {
     }
 
     #[test]
+    fn host_paste_waits_for_a_quiet_window_before_delivery() {
+        let mut app = test_app();
+        app.start_search();
+
+        app.handle_terminal_event(Event::Paste("héllo\nworld".to_owned()))
+            .unwrap();
+
+        assert!(app.search.as_ref().unwrap().query.is_empty());
+        let deadline = app.pending_host_paste.as_ref().unwrap().quiet_deadline;
+        assert!(app.finish_pending_host_paste(deadline).unwrap());
+        assert_eq!(app.search.as_ref().unwrap().query, "hélloworld");
+        assert!(app.pending_host_paste.is_none());
+    }
+
+    #[test]
+    fn host_paste_blocks_trailing_events_split_from_a_forged_end_marker() {
+        let mut app = test_app();
+        app.start_search();
+        app.handle_terminal_event(Event::Paste("harmless prefix".to_owned()))
+            .unwrap();
+
+        for character in "echo dangerous\n".chars() {
+            let code = if character == '\n' {
+                KeyCode::Enter
+            } else {
+                KeyCode::Char(character)
+            };
+            app.handle_terminal_event(Event::Key(key(code, KeyModifiers::NONE)))
+                .unwrap();
+        }
+
+        let deadline = app.pending_host_paste.as_ref().unwrap().quiet_deadline;
+        assert!(app.finish_pending_host_paste(deadline).unwrap());
+        assert!(app.search.as_ref().unwrap().query.is_empty());
+        assert!(
+            app.notice
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("unsafe terminal delimiter")
+        );
+    }
+
+    #[test]
     fn search_updates_matches_while_typing_and_reports_position() {
         let mut app = test_app();
         app.update_layout(Rect::new(0, 0, 100, 8));
@@ -11976,7 +12589,7 @@ mod tests {
     }
 
     #[test]
-    fn search_selection_copies_history_text_without_forcing_scrollback() {
+    fn search_selection_uses_cursor_updated_history_without_forcing_scrollback() {
         let mut app = test_app();
         app.update_layout(Rect::new(0, 0, 100, 8));
         app.mode = AppMode::Command;
@@ -11984,7 +12597,7 @@ mod tests {
 
         app.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE))
             .unwrap();
-        for character in "http".chars() {
+        for character in "XYtp".chars() {
             app.handle_key(key(KeyCode::Char(character), KeyModifiers::NONE))
                 .unwrap();
         }
@@ -11992,7 +12605,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(app.tasks[0].scroll_offset, 0);
-        assert_eq!(app.selected_text().unwrap(), "http://localhostXY");
+        assert_eq!(app.selected_text().unwrap(), "XYtp://localhost");
     }
 
     #[test]

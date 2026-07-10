@@ -168,6 +168,12 @@ Enter to go to the previous match, `Shift+Enter` to go to the next match, or
 Press `Tab`/`Shift+Tab` or click another pane while the prompt is open to
 search that pane instead.
 
+Each pane retains up to 10,000 rows. The live screen and nearby scrollback use
+full terminal emulation; the deeper archive is optimized for line-oriented
+build and server output while preserving streamed UTF-8, terminal-width text,
+and ANSI colors. Cursor-addressed redraws are snapshotted from the live parser
+so interactive output does not silently diverge when it enters the archive.
+
 Closing Demons is confirmed: press `q` or `Ctrl+C`, then press it again to
 close, or `Esc` to cancel. In input mode, those keys still go to a running
 child process; once the focused pane can no longer accept input, they open the
