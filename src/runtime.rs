@@ -566,6 +566,7 @@ struct App {
     tx: SyncSender<ProcessEvent>,
     rx: Receiver<ProcessEvent>,
     registry: ProcessRegistry,
+    next_process_generation: u64,
     dependency_indexes: Vec<Vec<usize>>,
     dependent_indexes: Vec<Vec<usize>>,
     stopping: bool,
@@ -641,6 +642,7 @@ impl App {
             tx,
             rx,
             registry,
+            next_process_generation: 1,
             dependency_indexes,
             dependent_indexes,
             stopping: false,
@@ -681,14 +683,27 @@ impl App {
         if index >= self.tasks.len() {
             return;
         }
+        let generation = self.allocate_process_generation();
         self.tasks[index].pending_start = None;
         self.tasks[index].start_requested = false;
         let size = self.tasks[index].pty_size;
-        if let Err(error) =
-            self.tasks[index].spawn(index, size, self.tx.clone(), Arc::clone(&self.registry))
-        {
+        if let Err(error) = self.tasks[index].spawn(
+            generation,
+            size,
+            self.tx.clone(),
+            Arc::clone(&self.registry),
+        ) {
             self.tasks[index].record_spawn_error(&error);
         }
+    }
+
+    fn allocate_process_generation(&mut self) -> u64 {
+        let generation = self.next_process_generation;
+        self.next_process_generation = self
+            .next_process_generation
+            .checked_add(1)
+            .expect("process generation counter exhausted");
+        generation
     }
 
     fn update_layout(&mut self, terminal_area: Rect) {
@@ -2331,90 +2346,207 @@ impl App {
             return;
         }
 
-        let same_runtime_shape = old.tasks.len() == new.tasks.len()
-            && old
-                .tasks
-                .iter()
-                .zip(&new.tasks)
-                .all(|(old, new)| old.name == new.name)
-            && old.terminals.len() == new.terminals.len()
-            && old
-                .terminals
-                .iter()
-                .zip(&new.terminals)
-                .all(|(old, new)| old.name == new.name);
-
-        if same_runtime_shape {
-            let changed_tasks = old
-                .tasks
-                .iter()
-                .zip(&new.tasks)
-                .enumerate()
-                .filter_map(|(index, (old, new))| (old != new).then_some(index))
-                .collect::<Vec<_>>();
-            let changed_terminals = old
-                .terminals
-                .iter()
-                .zip(&new.terminals)
-                .enumerate()
-                .filter_map(|(index, (old, new))| (old != new).then_some(index))
-                .collect::<Vec<_>>();
-            self.loaded.config = new;
-            for index in 0..self.loaded.config.tasks.len() {
-                let task = self.loaded.config.tasks[index].clone();
-                self.tasks[index].cwd = self.loaded.task_cwd(&task);
-                self.tasks[index].start_delay = task
-                    .start_delay
-                    .as_deref()
-                    .and_then(|delay| parse_start_delay(delay).ok())
-                    .unwrap_or_default();
-                self.tasks[index].task = task;
-                self.tasks[index].kind = RuntimePaneKind::Task;
-            }
-            let terminal_offset = self.loaded.config.tasks.len();
-            for (index, terminal) in self.loaded.config.terminals.iter().cloned().enumerate() {
-                let runtime_index = terminal_offset + index;
-                if let Some(runtime) = self.tasks.get_mut(runtime_index) {
-                    runtime.cwd = self.loaded.terminal_cwd(&terminal);
-                    runtime.start_delay = Duration::ZERO;
-                    runtime.task = terminal_runtime_task(terminal);
-                    runtime.kind = RuntimePaneKind::ConfigTerminal(index);
-                }
-            }
-            self.rebuild_dependency_graph_from_runtime();
-            match restart {
-                RestartMode::All => self.request_restart_all(),
-                RestartMode::Affected => {
-                    let mut indexes = Vec::new();
-                    for index in changed_tasks {
-                        indexes.extend(self.restart_closure(index));
-                    }
-                    indexes.extend(
-                        changed_terminals
-                            .into_iter()
-                            .map(|index| terminal_offset + index),
-                    );
-                    indexes.sort_unstable();
-                    indexes.dedup();
-                    self.request_restart_set(&indexes);
-                }
-                RestartMode::None => {}
-            }
-            self.set_notice(format!("Saved {}.", self.loaded.path.display()));
-        } else {
-            self.stop_tasks_for_rebuild();
-            self.loaded.config = new;
-            self.rebuild_unstarted_tasks();
-            self.spawn_all();
-            self.set_notice(format!(
-                "Saved {}; restarted tasks.",
-                self.loaded.path.display()
-            ));
-        }
+        self.reconcile_running_config(&old, new, restart);
     }
 
-    fn stop_tasks_for_rebuild(&mut self) {
-        for task in &mut self.tasks {
+    fn reconcile_running_config(
+        &mut self,
+        old: &crate::config::Config,
+        new: crate::config::Config,
+        restart: RestartMode,
+    ) {
+        let removed = self
+            .tasks
+            .iter()
+            .enumerate()
+            .filter_map(|(index, runtime)| {
+                let retained = match runtime.kind {
+                    RuntimePaneKind::Task => {
+                        new.tasks.iter().any(|task| task.name == runtime.task.name)
+                    }
+                    RuntimePaneKind::ConfigTerminal(_) => new
+                        .terminals
+                        .iter()
+                        .any(|terminal| terminal.name == runtime.task.name),
+                    RuntimePaneKind::SessionTerminal => true,
+                };
+                (!retained).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        self.stop_runtime_indexes(&removed);
+
+        let focused_generation = self.tasks.get(self.focus).map(|runtime| runtime.generation);
+        let focused_name = self
+            .tasks
+            .get(self.focus)
+            .map(|runtime| runtime.task.name.clone());
+        let selected_generation = self.selection.as_ref().and_then(|selection| {
+            self.tasks
+                .get(selection.pane)
+                .map(|runtime| runtime.generation)
+        });
+
+        let changed_task_names = new
+            .tasks
+            .iter()
+            .filter(|task| {
+                old.tasks
+                    .iter()
+                    .find(|old_task| old_task.name == task.name)
+                    .is_some_and(|old_task| old_task != *task)
+            })
+            .map(|task| task.name.clone())
+            .collect::<HashSet<_>>();
+        let changed_terminal_names = new
+            .terminals
+            .iter()
+            .filter(|terminal| {
+                old.terminals
+                    .iter()
+                    .find(|old_terminal| old_terminal.name == terminal.name)
+                    .is_some_and(|old_terminal| old_terminal != *terminal)
+            })
+            .map(|terminal| terminal.name.clone())
+            .collect::<HashSet<_>>();
+
+        self.loaded.config = new;
+        let configured_tasks = self.loaded.config.tasks.clone();
+        let configured_terminals = self.loaded.config.terminals.clone();
+        let mut previous = std::mem::take(&mut self.tasks)
+            .into_iter()
+            .map(Some)
+            .collect::<Vec<_>>();
+        let mut runtimes = Vec::with_capacity(
+            previous
+                .len()
+                .max(configured_tasks.len() + configured_terminals.len()),
+        );
+
+        for task in configured_tasks {
+            let previous_index = previous.iter().position(|runtime| {
+                runtime.as_ref().is_some_and(|runtime| {
+                    matches!(runtime.kind, RuntimePaneKind::Task) && runtime.task.name == task.name
+                })
+            });
+            let cwd = self.loaded.task_cwd(&task);
+            let mut runtime = previous_index
+                .and_then(|index| previous[index].take())
+                .unwrap_or_else(|| {
+                    let mut runtime = TaskRuntime::new_task(task.clone(), cwd.clone());
+                    runtime.start_requested = true;
+                    runtime
+                });
+            runtime.apply_task_config(task, cwd);
+            runtimes.push(runtime);
+        }
+
+        for (terminal_index, terminal) in configured_terminals.into_iter().enumerate() {
+            let previous_index = previous.iter().position(|runtime| {
+                runtime.as_ref().is_some_and(|runtime| {
+                    matches!(runtime.kind, RuntimePaneKind::ConfigTerminal(_))
+                        && runtime.task.name == terminal.name
+                })
+            });
+            let cwd = self.loaded.terminal_cwd(&terminal);
+            let mut runtime = previous_index
+                .and_then(|index| previous[index].take())
+                .unwrap_or_else(|| {
+                    let mut runtime = TaskRuntime::new_config_terminal(
+                        terminal_index,
+                        terminal.clone(),
+                        cwd.clone(),
+                    );
+                    runtime.start_requested = true;
+                    runtime
+                });
+            runtime.apply_terminal_config(terminal_index, terminal, cwd);
+            runtimes.push(runtime);
+        }
+
+        for mut runtime in previous
+            .into_iter()
+            .flatten()
+            .filter(|runtime| matches!(runtime.kind, RuntimePaneKind::SessionTerminal))
+        {
+            let unique_name = unique_runtime_pane_name(&runtimes, &runtime.task.name);
+            runtime.task.name = unique_name;
+            runtimes.push(runtime);
+        }
+
+        self.tasks = runtimes;
+        self.rebuild_dependency_graph_from_runtime();
+        self.focus = focused_generation
+            .filter(|generation| *generation != 0)
+            .and_then(|generation| {
+                self.tasks
+                    .iter()
+                    .position(|runtime| runtime.generation == generation)
+            })
+            .or_else(|| {
+                focused_name.as_ref().and_then(|name| {
+                    self.tasks
+                        .iter()
+                        .position(|runtime| &runtime.task.name == name)
+                })
+            })
+            .unwrap_or_else(|| self.focus.min(self.tasks.len().saturating_sub(1)));
+        if let Some(selection) = self.selection.as_mut() {
+            let pane = selected_generation
+                .filter(|generation| *generation != 0)
+                .and_then(|generation| {
+                    self.tasks
+                        .iter()
+                        .position(|runtime| runtime.generation == generation)
+                });
+            if let Some(pane) = pane {
+                selection.pane = pane;
+            } else {
+                self.selection = None;
+            }
+        }
+        self.last_click = None;
+        self.countdown_snapshot.clear();
+
+        match restart {
+            RestartMode::All => self.request_restart_all(),
+            RestartMode::Affected => {
+                let mut indexes = Vec::new();
+                for (index, task) in self.loaded.config.tasks.iter().enumerate() {
+                    if changed_task_names.contains(&task.name) {
+                        indexes.extend(self.restart_closure(index));
+                    }
+                }
+                let terminal_offset = self.loaded.config.tasks.len();
+                indexes.extend(self.loaded.config.terminals.iter().enumerate().filter_map(
+                    |(index, terminal)| {
+                        changed_terminal_names
+                            .contains(&terminal.name)
+                            .then_some(terminal_offset + index)
+                    },
+                ));
+                indexes.sort_unstable();
+                indexes.dedup();
+                self.request_restart_set(&indexes);
+            }
+            RestartMode::None => {
+                self.tick_dependency_starts(Instant::now());
+            }
+        }
+
+        let action = match restart {
+            RestartMode::All => "restarting all panes",
+            RestartMode::Affected => "restarting affected panes",
+            RestartMode::None => "kept existing panes running",
+        };
+        self.set_notice(format!("Saved {}; {action}.", self.loaded.path.display()));
+    }
+
+    fn stop_runtime_indexes(&mut self, indexes: &[usize]) {
+        let indexes = indexes.iter().copied().collect::<HashSet<_>>();
+        for (index, task) in self.tasks.iter_mut().enumerate() {
+            if !indexes.contains(&index) {
+                continue;
+            }
             task.restart_requested = false;
             task.start_requested = false;
             task.pending_start = None;
@@ -2426,7 +2558,12 @@ impl App {
         }
 
         let deadline = Instant::now() + SHUTDOWN_GRACE;
-        while self.tasks.iter().any(|task| task.pid.is_some()) && Instant::now() < deadline {
+        while indexes.iter().any(|index| {
+            self.tasks
+                .get(*index)
+                .is_some_and(|task| task.pid.is_some())
+        }) && Instant::now() < deadline
+        {
             match self.rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(event) => self.apply_process_event(event),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -2434,28 +2571,24 @@ impl App {
             }
         }
 
-        for task in &self.tasks {
-            if let Some(pid) = task.pid {
+        for index in &indexes {
+            if let Some(pid) = self.tasks.get(*index).and_then(|task| task.pid) {
                 signal_process_group(pid, libc::SIGKILL).ok();
             }
         }
 
-        let deadline = Instant::now() + Duration::from_millis(500);
-        while self.tasks.iter().any(|task| task.pid.is_some()) && Instant::now() < deadline {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while indexes.iter().any(|index| {
+            self.tasks
+                .get(*index)
+                .is_some_and(|task| task.pid.is_some())
+        }) && Instant::now() < deadline
+        {
             match self.rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(event) => self.apply_process_event(event),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
-        }
-
-        for task in &mut self.tasks {
-            if let Some(pid) = task.pid.take() {
-                registry_remove(&self.registry, pid);
-            }
-            task.master = None;
-            task.writer = None;
-            task.kill_deadline = None;
         }
     }
 
@@ -3919,6 +4052,9 @@ impl App {
     }
 
     fn tick_dependency_starts(&mut self, now: Instant) -> bool {
+        if self.stopping {
+            return false;
+        }
         let mut changed = false;
         for index in 0..self.tasks.len() {
             if !self.tasks[index].start_requested
@@ -3971,57 +4107,76 @@ impl App {
 
     fn apply_process_event(&mut self, event: ProcessEvent) {
         match event {
-            ProcessEvent::Output {
-                task,
-                generation,
-                bytes,
-            } => {
-                let Some(runtime) = self.tasks.get_mut(task) else {
+            ProcessEvent::Output { generation, bytes } => {
+                let Some(runtime) = self
+                    .tasks
+                    .iter_mut()
+                    .find(|runtime| runtime.generation == generation)
+                else {
                     return;
                 };
-                if runtime.generation != generation {
-                    return;
-                }
                 runtime.process_output(&bytes);
             }
-            ProcessEvent::Exited {
-                task,
-                generation,
-                status,
-            } => {
-                let Some(runtime) = self.tasks.get_mut(task) else {
+            ProcessEvent::OutputClosed { generation } => {
+                let Some(index) = self
+                    .tasks
+                    .iter()
+                    .position(|runtime| runtime.generation == generation)
+                else {
                     return;
                 };
-                if runtime.generation != generation {
+                self.tasks[index].output_closed = true;
+                if let Some(status) = self.tasks[index].pending_exit.take() {
+                    self.finalize_process_exit(index, status);
+                }
+            }
+            ProcessEvent::ChildExited { generation, status } => {
+                let Some(index) = self
+                    .tasks
+                    .iter()
+                    .position(|runtime| runtime.generation == generation)
+                else {
                     return;
-                }
-                if let Some(pid) = runtime.pid.take() {
-                    registry_remove(&self.registry, pid);
-                }
-                runtime.master = None;
-                runtime.writer = None;
-                runtime.kill_deadline = None;
-                runtime.status = TaskStatus::Exited {
-                    code: status.exit_code(),
-                    success: status.success(),
-                    signal: status.signal().map(str::to_owned),
                 };
-                let reason = match status.signal() {
-                    Some(signal) => format!("signal {signal}"),
-                    None => format!("code {}", status.exit_code()),
-                };
-                runtime.message(&format!(
-                    "\r\n\x1b[90m[demons] process exited ({reason})\x1b[0m\r\n"
-                ));
-
-                if runtime.restart_requested && !self.stopping {
-                    runtime.restart_requested = false;
-                    runtime.start_requested = true;
-                    runtime.pending_start = None;
+                if self.tasks[index].output_closed {
+                    self.finalize_process_exit(index, status);
+                } else {
+                    self.tasks[index].pending_exit = Some(status);
                 }
-                self.tick_dependency_starts(Instant::now());
             }
         }
+    }
+
+    fn finalize_process_exit(&mut self, index: usize, status: ExitStatus) {
+        let Some(runtime) = self.tasks.get_mut(index) else {
+            return;
+        };
+        if let Some(pid) = runtime.pid.take() {
+            registry_remove(&self.registry, pid);
+        }
+        runtime.master = None;
+        runtime.writer = None;
+        runtime.kill_deadline = None;
+        runtime.pending_exit = None;
+        runtime.status = TaskStatus::Exited {
+            code: status.exit_code(),
+            success: status.success(),
+            signal: status.signal().map(str::to_owned),
+        };
+        let reason = match status.signal() {
+            Some(signal) => format!("signal {signal}"),
+            None => format!("code {}", status.exit_code()),
+        };
+        runtime.message(&format!(
+            "\r\n\x1b[90m[demons] process exited ({reason})\x1b[0m\r\n"
+        ));
+
+        if runtime.restart_requested && !self.stopping {
+            runtime.restart_requested = false;
+            runtime.start_requested = true;
+            runtime.pending_start = None;
+        }
+        self.tick_dependency_starts(Instant::now());
     }
 
     fn tick(&mut self) -> Result<bool> {
@@ -4162,6 +4317,8 @@ struct TaskRuntime {
     scroll_offset: usize,
     terminal_scrollback_len: usize,
     history: TextHistory,
+    output_closed: bool,
+    pending_exit: Option<ExitStatus>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4203,6 +4360,8 @@ impl TaskRuntime {
             scroll_offset: 0,
             terminal_scrollback_len: 0,
             history: TextHistory::new(pty_size.cols, pty_size.rows, SCROLLBACK_LINES),
+            output_closed: true,
+            pending_exit: None,
         }
     }
 
@@ -4222,16 +4381,35 @@ impl TaskRuntime {
         runtime
     }
 
+    fn apply_task_config(&mut self, task: Task, cwd: PathBuf) {
+        self.start_delay = task
+            .start_delay
+            .as_deref()
+            .and_then(|delay| parse_start_delay(delay).ok())
+            .unwrap_or_default();
+        self.task = task;
+        self.cwd = cwd;
+        self.kind = RuntimePaneKind::Task;
+    }
+
+    fn apply_terminal_config(&mut self, index: usize, terminal: TerminalPane, cwd: PathBuf) {
+        self.task = terminal_runtime_task(terminal);
+        self.cwd = cwd;
+        self.start_delay = Duration::ZERO;
+        self.kind = RuntimePaneKind::ConfigTerminal(index);
+    }
+
     fn spawn(
         &mut self,
-        task_index: usize,
+        generation: u64,
         size: PtySize,
         tx: SyncSender<ProcessEvent>,
         registry: ProcessRegistry,
     ) -> Result<()> {
-        self.generation = self.generation.wrapping_add(1);
-        let generation = self.generation;
+        self.generation = generation;
         self.status = TaskStatus::Starting;
+        self.output_closed = false;
+        self.pending_exit = None;
         self.scroll_offset = 0;
         self.sync_parser_scrollback();
 
@@ -4279,7 +4457,6 @@ impl TaskRuntime {
                         Ok(read) => {
                             if output_tx
                                 .send(ProcessEvent::Output {
-                                    task: task_index,
                                     generation,
                                     bytes: buffer[..read].to_vec(),
                                 })
@@ -4290,6 +4467,9 @@ impl TaskRuntime {
                         }
                     }
                 }
+                output_tx
+                    .send(ProcessEvent::OutputClosed { generation })
+                    .ok();
             })
         {
             terminate_unmanaged_child(&mut child, pid);
@@ -4302,12 +4482,8 @@ impl TaskRuntime {
             .name(format!("demons-wait-{}", self.task.name))
             .spawn(move || {
                 let status = child_guard.wait();
-                tx.send(ProcessEvent::Exited {
-                    task: task_index,
-                    generation,
-                    status,
-                })
-                .ok();
+                tx.send(ProcessEvent::ChildExited { generation, status })
+                    .ok();
             })
         {
             return Err(error).context("failed to start child wait thread");
@@ -4520,6 +4696,8 @@ impl TaskRuntime {
         self.pid = None;
         self.writer = None;
         self.master = None;
+        self.output_closed = true;
+        self.pending_exit = None;
         self.status = TaskStatus::Failed;
         self.message(&format!(
             "\r\n\x1b[31m[demons] failed to start: {error:#}\x1b[0m\r\n"
@@ -5129,16 +5307,9 @@ impl TextHistory {
 }
 
 enum ProcessEvent {
-    Output {
-        task: usize,
-        generation: u64,
-        bytes: Vec<u8>,
-    },
-    Exited {
-        task: usize,
-        generation: u64,
-        status: ExitStatus,
-    },
+    Output { generation: u64, bytes: Vec<u8> },
+    OutputClosed { generation: u64 },
+    ChildExited { generation: u64, status: ExitStatus },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -12872,6 +13043,282 @@ mod tests {
         ));
         assert_eq!(app.tasks[1].task.name, "scratch");
         assert_eq!(app.tasks[1].cwd, PathBuf::from("/tmp"));
+    }
+
+    #[test]
+    fn rebuilt_runtimes_reject_events_from_previous_generation() {
+        let mut app = test_app_with_tasks(vec![test_task("old")]);
+        let stale_generation = app.allocate_process_generation();
+        app.tasks[0].generation = stale_generation;
+
+        app.loaded.config.tasks = vec![test_task("replacement"), test_task("other")];
+        app.rebuild_unstarted_tasks();
+
+        let replacement_generation = app.allocate_process_generation();
+        let replacement_pid = 4242;
+        app.tasks[0].generation = replacement_generation;
+        app.tasks[0].pid = Some(replacement_pid);
+        app.tasks[0].status = TaskStatus::Running;
+        registry_insert(&app.registry, replacement_pid);
+
+        app.apply_process_event(ProcessEvent::Output {
+            generation: stale_generation,
+            bytes: b"stale output".to_vec(),
+        });
+        app.apply_process_event(ProcessEvent::ChildExited {
+            generation: stale_generation,
+            status: ExitStatus::with_exit_code(0),
+        });
+
+        assert_ne!(stale_generation, replacement_generation);
+        assert_eq!(app.tasks[0].pid, Some(replacement_pid));
+        assert_eq!(app.tasks[0].status, TaskStatus::Running);
+        assert!(app.tasks[0].history.all_text().is_empty());
+        assert!(app.registry.lock().unwrap().contains(&replacement_pid));
+    }
+
+    #[test]
+    fn child_exit_waits_for_final_output_and_reader_eof() {
+        let mut app = test_app_with_tasks(vec![test_task("worker")]);
+        let generation = app.allocate_process_generation();
+        let pid = 4301;
+        app.tasks[0].generation = generation;
+        app.tasks[0].pid = Some(pid);
+        app.tasks[0].status = TaskStatus::Running;
+        app.tasks[0].output_closed = false;
+        registry_insert(&app.registry, pid);
+
+        app.apply_process_event(ProcessEvent::ChildExited {
+            generation,
+            status: ExitStatus::with_exit_code(0),
+        });
+
+        assert_eq!(app.tasks[0].pid, Some(pid));
+        assert_eq!(app.tasks[0].status, TaskStatus::Running);
+        assert!(app.tasks[0].pending_exit.is_some());
+        assert!(
+            !app.tasks[0]
+                .history
+                .all_text()
+                .contains("[demons] process exited")
+        );
+
+        app.apply_process_event(ProcessEvent::Output {
+            generation,
+            bytes: b"final bytes\r\n".to_vec(),
+        });
+        app.apply_process_event(ProcessEvent::OutputClosed { generation });
+
+        let history = app.tasks[0].history.all_text();
+        let final_output = history.find("final bytes").unwrap();
+        let exit_marker = history.find("[demons] process exited").unwrap();
+        assert!(final_output < exit_marker);
+        assert_eq!(app.tasks[0].pid, None);
+        assert!(app.tasks[0].pending_exit.is_none());
+        assert!(matches!(
+            app.tasks[0].status,
+            TaskStatus::Exited {
+                code: 0,
+                success: true,
+                ..
+            }
+        ));
+        assert!(!app.registry.lock().unwrap().contains(&pid));
+    }
+
+    #[test]
+    fn reader_eof_before_child_exit_finalizes_when_status_arrives() {
+        let mut app = test_app_with_tasks(vec![test_task("worker")]);
+        let generation = app.allocate_process_generation();
+        let pid = 4302;
+        app.tasks[0].generation = generation;
+        app.tasks[0].pid = Some(pid);
+        app.tasks[0].status = TaskStatus::Running;
+        app.tasks[0].output_closed = false;
+        registry_insert(&app.registry, pid);
+
+        app.apply_process_event(ProcessEvent::Output {
+            generation,
+            bytes: b"last line\r\n".to_vec(),
+        });
+        app.apply_process_event(ProcessEvent::OutputClosed { generation });
+
+        assert_eq!(app.tasks[0].pid, Some(pid));
+        assert_eq!(app.tasks[0].status, TaskStatus::Running);
+
+        app.apply_process_event(ProcessEvent::ChildExited {
+            generation,
+            status: ExitStatus::with_exit_code(7),
+        });
+
+        let history = app.tasks[0].history.all_text();
+        assert!(history.find("last line").unwrap() < history.find("process exited").unwrap());
+        assert_eq!(app.tasks[0].pid, None);
+        assert!(matches!(
+            app.tasks[0].status,
+            TaskStatus::Exited {
+                code: 7,
+                success: false,
+                ..
+            }
+        ));
+        assert!(!app.registry.lock().unwrap().contains(&pid));
+    }
+
+    #[test]
+    fn restart_waits_for_reader_eof_before_reusing_the_pane() {
+        let mut worker = test_task("worker");
+        worker.depends_on = vec!["gate".to_owned()];
+        let mut app = test_app_with_tasks(vec![worker, test_task("gate")]);
+        let generation = app.allocate_process_generation();
+        app.tasks[0].generation = generation;
+        app.tasks[0].pid = Some(4303);
+        app.tasks[0].status = TaskStatus::Restarting;
+        app.tasks[0].output_closed = false;
+        app.tasks[0].restart_requested = true;
+
+        app.apply_process_event(ProcessEvent::ChildExited {
+            generation,
+            status: ExitStatus::with_exit_code(0),
+        });
+
+        assert_eq!(app.tasks[0].pid, Some(4303));
+        assert!(app.tasks[0].restart_requested);
+        assert!(!app.tasks[0].start_requested);
+
+        app.apply_process_event(ProcessEvent::Output {
+            generation,
+            bytes: b"last output before restart\r\n".to_vec(),
+        });
+        app.apply_process_event(ProcessEvent::OutputClosed { generation });
+
+        let history = app.tasks[0].history.all_text();
+        assert!(
+            history.find("last output before restart").unwrap()
+                < history.find("process exited").unwrap()
+        );
+        assert_eq!(app.tasks[0].pid, None);
+        assert!(!app.tasks[0].restart_requested);
+        assert!(app.tasks[0].start_requested);
+        assert_eq!(app.tasks[0].status, TaskStatus::Waiting);
+        assert_eq!(app.tasks[0].generation, generation);
+    }
+
+    #[test]
+    fn structural_save_without_restart_preserves_running_and_session_panes() {
+        let mut app = test_app();
+        app.tasks_started = true;
+        let first_generation = app.allocate_process_generation();
+        app.tasks[0].generation = first_generation;
+        app.tasks[0].pid = Some(4101);
+        app.tasks[0].status = TaskStatus::Running;
+        app.tasks[0].history.process(b"first history\r\n");
+
+        let second_generation = app.allocate_process_generation();
+        app.tasks[1].generation = second_generation;
+        app.tasks[1].pid = Some(4102);
+        app.tasks[1].status = TaskStatus::Running;
+
+        let session_generation = app.allocate_process_generation();
+        let mut session = TaskRuntime::new_session_terminal(
+            TerminalPane {
+                name: "terminal".to_owned(),
+                cwd: PathBuf::from("."),
+                env: BTreeMap::new(),
+            },
+            PathBuf::from("."),
+        );
+        session.generation = session_generation;
+        session.pid = Some(4103);
+        session.status = TaskStatus::Running;
+        session.history.process(b"shell state\r\n");
+        app.tasks.push(session);
+        app.focus = 2;
+
+        let old = app.loaded.config.clone();
+        let mut new = old.clone();
+        let mut added = test_task("added");
+        added.start_delay = Some("1h".to_owned());
+        new.tasks.push(added);
+
+        app.apply_saved_config(old, new, RestartMode::None);
+
+        assert_eq!(app.tasks.len(), 4);
+        assert_eq!(app.tasks[0].generation, first_generation);
+        assert_eq!(app.tasks[0].pid, Some(4101));
+        assert!(app.tasks[0].history.all_text().contains("first history"));
+        assert_eq!(app.tasks[2].task.name, "added");
+        assert!(app.tasks[2].start_requested);
+        assert_eq!(app.tasks[2].status, TaskStatus::Waiting);
+        assert!(matches!(
+            app.tasks[3].kind,
+            RuntimePaneKind::SessionTerminal
+        ));
+        assert_eq!(app.tasks[3].generation, session_generation);
+        assert_eq!(app.tasks[3].pid, Some(4103));
+        assert_eq!(app.focus, 3);
+
+        app.apply_process_event(ProcessEvent::Output {
+            generation: session_generation,
+            bytes: b"after move\r\n".to_vec(),
+        });
+
+        assert!(app.tasks[3].history.all_text().contains("after move"));
+        assert!(app.tasks.iter().all(|runtime| !runtime.restart_requested));
+    }
+
+    #[test]
+    fn structural_save_reconciles_added_and_removed_panes_without_global_restart() {
+        let mut app = test_app();
+        app.tasks_started = true;
+        app.stopping = true;
+        let preserved_generation = app.allocate_process_generation();
+        app.tasks[0].generation = preserved_generation;
+        app.tasks[0].pid = Some(4201);
+        app.tasks[0].status = TaskStatus::Running;
+
+        let session_generation = app.allocate_process_generation();
+        let mut session = TaskRuntime::new_session_terminal(
+            TerminalPane {
+                name: "terminal".to_owned(),
+                cwd: PathBuf::from("."),
+                env: BTreeMap::new(),
+            },
+            PathBuf::from("."),
+        );
+        session.generation = session_generation;
+        session.pid = Some(4202);
+        session.status = TaskStatus::Running;
+        app.tasks.push(session);
+
+        let old = app.loaded.config.clone();
+        let mut new = old.clone();
+        new.tasks.remove(1);
+        new.terminals.push(TerminalPane {
+            name: "scratch".to_owned(),
+            cwd: PathBuf::from("."),
+            env: BTreeMap::new(),
+        });
+
+        app.apply_saved_config(old, new, RestartMode::None);
+
+        assert_eq!(app.tasks.len(), 3);
+        assert_eq!(app.tasks[0].task.name, "one");
+        assert_eq!(app.tasks[0].generation, preserved_generation);
+        assert_eq!(app.tasks[0].pid, Some(4201));
+        assert!(matches!(
+            app.tasks[1].kind,
+            RuntimePaneKind::ConfigTerminal(0)
+        ));
+        assert_eq!(app.tasks[1].task.name, "scratch");
+        assert!(app.tasks[1].start_requested);
+        assert!(matches!(
+            app.tasks[2].kind,
+            RuntimePaneKind::SessionTerminal
+        ));
+        assert_eq!(app.tasks[2].generation, session_generation);
+        assert_eq!(app.tasks[2].pid, Some(4202));
+        assert!(app.tasks.iter().all(|runtime| !runtime.restart_requested));
     }
 
     #[test]
