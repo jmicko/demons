@@ -43,8 +43,17 @@ fn try_main() -> Result<()> {
         command: McpCommand::Serve { scope },
     }) = &cli.command
     {
+        let config_path = cli
+            .config
+            .as_deref()
+            .context("demons mcp serve requires --config")?;
+        let config_path = if config_path.is_absolute() {
+            config_path.to_path_buf()
+        } else {
+            cwd.join(config_path)
+        };
         #[cfg(unix)]
-        return mcp_server::serve(scope.clone());
+        return mcp_server::serve(scope.clone(), config_path);
         #[cfg(not(unix))]
         bail!("the Demons MCP adapter currently requires Unix domain sockets");
     }

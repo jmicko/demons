@@ -270,7 +270,7 @@ impl ControlListener {
             instance_id,
             scope_id: scope_id.to_owned(),
             pid: std::process::id(),
-            config_path: config_path.to_path_buf(),
+            config_path: normalized_path(config_path),
             socket_path: socket_path.clone(),
         };
         write_private_json(&discovery_path, &info)?;
@@ -404,8 +404,9 @@ fn connection_loop(
     }
 }
 
-pub fn discover_instances(scope_id: &str) -> Result<Vec<InstanceInfo>> {
+pub fn discover_instances(scope_id: &str, config_path: &Path) -> Result<Vec<InstanceInfo>> {
     uuid::Uuid::parse_str(scope_id).context("invalid MCP project scope ID")?;
+    let config_path = normalized_path(config_path);
     let prefix = format!("{scope_id}-");
     let mut instances = Vec::new();
     for dir in runtime_dir_candidates()? {
@@ -437,7 +438,10 @@ pub fn discover_instances(scope_id: &str) -> Result<Vec<InstanceInfo>> {
                 Some(info) => info,
                 None => continue,
             };
-            if info.scope_id != scope_id || info.protocol_version != CONTROL_PROTOCOL_VERSION {
+            if info.scope_id != scope_id
+                || info.protocol_version != CONTROL_PROTOCOL_VERSION
+                || normalized_path(&info.config_path) != config_path
+            {
                 continue;
             }
             if !process_is_alive(info.pid) || !owned_socket(&info.socket_path) {
@@ -455,6 +459,10 @@ pub fn discover_instances(scope_id: &str) -> Result<Vec<InstanceInfo>> {
     }
     instances.sort_by(|left, right| left.instance_id.cmp(&right.instance_id));
     Ok(instances)
+}
+
+fn normalized_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 pub fn request(instance: &InstanceInfo, request: &ControlRequest) -> Result<ControlResponse> {

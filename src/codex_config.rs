@@ -44,6 +44,7 @@ impl CodexConfigChange {
         if !self.changed {
             return Ok(());
         }
+        validate_config_target(&self.path, false)?;
         match self.previous {
             Some(contents) => fs::write(&self.path, contents)
                 .with_context(|| format!("failed to restore {}", self.path.display())),
@@ -64,6 +65,9 @@ pub fn project_config_path(project_root: &Path) -> PathBuf {
 
 pub fn inspect(project_root: &Path) -> IntegrationStatus {
     let path = project_config_path(project_root);
+    if let Err(error) = validate_config_target(&path, false) {
+        return IntegrationStatus::Invalid(error.to_string());
+    }
     let source = match fs::read_to_string(&path) {
         Ok(source) => source,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -82,17 +86,24 @@ pub fn inspect(project_root: &Path) -> IntegrationStatus {
     }
 }
 
-pub fn install(project_root: &Path, scope: &str) -> Result<CodexConfigChange> {
+pub fn install(project_root: &Path, config_path: &Path, scope: &str) -> Result<CodexConfigChange> {
     uuid::Uuid::parse_str(scope).context("invalid MCP project scope ID")?;
-    edit(project_root, Some(scope))
+    if !config_path.is_absolute() {
+        bail!("MCP config path must be absolute");
+    }
+    config_path
+        .to_str()
+        .context("MCP config path must be valid UTF-8")?;
+    edit(project_root, Some((scope, config_path)))
 }
 
 pub fn uninstall(project_root: &Path) -> Result<CodexConfigChange> {
     edit(project_root, None)
 }
 
-fn edit(project_root: &Path, scope: Option<&str>) -> Result<CodexConfigChange> {
+fn edit(project_root: &Path, server: Option<(&str, &Path)>) -> Result<CodexConfigChange> {
     let path = project_config_path(project_root);
+    validate_config_target(&path, true)?;
     let previous = match fs::read(&path) {
         Ok(contents) => Some(contents),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -101,8 +112,10 @@ fn edit(project_root: &Path, scope: Option<&str>) -> Result<CodexConfigChange> {
         }
     };
     let source = previous
-        .as_deref()
-        .map(String::from_utf8_lossy)
+        .as_ref()
+        .map(|contents| String::from_utf8(contents.clone()))
+        .transpose()
+        .with_context(|| format!("{} is not valid UTF-8", path.display()))?
         .unwrap_or_default();
     let mut document = source
         .parse::<DocumentMut>()
@@ -116,8 +129,8 @@ fn edit(project_root: &Path, scope: Option<&str>) -> Result<CodexConfigChange> {
         );
     }
 
-    match scope {
-        Some(scope) => set_managed_server(&mut document, scope)?,
+    match server {
+        Some((scope, config_path)) => set_managed_server(&mut document, scope, config_path)?,
         None => remove_managed_server(&mut document),
     }
 
@@ -138,10 +151,7 @@ fn edit(project_root: &Path, scope: Option<&str>) -> Result<CodexConfigChange> {
             changed: false,
         });
     }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
+    validate_config_target(&path, true)?;
     fs::write(&path, output).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(CodexConfigChange {
         path,
@@ -161,14 +171,15 @@ fn is_managed(item: &Item) -> bool {
     let Some(table) = item.as_table() else {
         return false;
     };
-    table
+    let has_marker = table
         .decor()
         .prefix()
         .and_then(|prefix| prefix.as_str())
-        .is_some_and(|prefix| prefix.contains(MANAGED_MARKER))
+        .is_some_and(|prefix| prefix.contains(MANAGED_MARKER));
+    has_marker && table.get("command").and_then(Item::as_str) == Some("demons")
 }
 
-fn set_managed_server(document: &mut DocumentMut, scope: &str) -> Result<()> {
+fn set_managed_server(document: &mut DocumentMut, scope: &str, config_path: &Path) -> Result<()> {
     if document.get("mcp_servers").is_none() {
         document["mcp_servers"] = Item::Table(Table::new());
     }
@@ -181,12 +192,47 @@ fn set_managed_server(document: &mut DocumentMut, scope: &str) -> Result<()> {
         .set_prefix(format!("\n# {MANAGED_MARKER}\n"));
     server["command"] = value("demons");
     let mut args = Array::new();
-    for arg in ["mcp", "serve", "--scope", scope] {
+    let config_path = config_path
+        .to_str()
+        .context("MCP config path must be valid UTF-8")?;
+    for arg in ["--config", config_path, "mcp", "serve", "--scope", scope] {
         args.push(arg);
     }
     server["args"] = value(args);
     server["default_tools_approval_mode"] = value("writes");
     servers.insert(SERVER_NAME, Item::Table(server));
+    Ok(())
+}
+
+fn validate_config_target(path: &Path, create_parent: bool) -> Result<()> {
+    let parent = path.parent().context("Codex config path has no parent")?;
+    match fs::symlink_metadata(parent) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                bail!("{} is not a safe config directory", parent.display());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && create_parent => {
+            fs::create_dir(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", parent.display()));
+        }
+    }
+
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                bail!("{} is not a safe config file", path.display());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+        }
+    }
     Ok(())
 }
 
@@ -213,17 +259,27 @@ mod tests {
     fn installs_updates_and_removes_only_managed_entry() {
         let temp = tempdir().unwrap();
         let path = project_config_path(temp.path());
+        let demons_config = temp.path().join("demons.toml");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, "model = \"gpt-test\"\n").unwrap();
 
-        assert!(install(temp.path(), SCOPE).unwrap().changed());
+        assert!(
+            install(temp.path(), &demons_config, SCOPE)
+                .unwrap()
+                .changed()
+        );
         assert_eq!(inspect(temp.path()), IntegrationStatus::Managed);
         let installed = fs::read_to_string(&path).unwrap();
         assert!(installed.contains("Managed by Demons"));
         assert!(installed.contains(SCOPE));
+        assert!(installed.contains(demons_config.to_str().unwrap()));
         assert!(installed.contains("model = \"gpt-test\""));
 
-        assert!(!install(temp.path(), SCOPE).unwrap().changed());
+        assert!(
+            !install(temp.path(), &demons_config, SCOPE)
+                .unwrap()
+                .changed()
+        );
         assert!(uninstall(temp.path()).unwrap().changed());
         assert_eq!(inspect(temp.path()), IntegrationStatus::Missing);
         assert!(
@@ -237,22 +293,73 @@ mod tests {
     fn refuses_to_replace_user_owned_entry() {
         let temp = tempdir().unwrap();
         let path = project_config_path(temp.path());
+        let demons_config = temp.path().join("demons.toml");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, "[mcp_servers.demons]\ncommand = \"custom-server\"\n").unwrap();
 
         assert_eq!(inspect(temp.path()), IntegrationStatus::Conflict);
-        assert!(install(temp.path(), SCOPE).is_err());
+        assert!(install(temp.path(), &demons_config, SCOPE).is_err());
         assert!(uninstall(temp.path()).is_err());
+    }
+
+    #[test]
+    fn marker_does_not_claim_a_non_demons_entry() {
+        let temp = tempdir().unwrap();
+        let path = project_config_path(temp.path());
+        let demons_config = temp.path().join("demons.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            "# Managed by Demons\n[mcp_servers.demons]\ncommand = \"custom-server\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(inspect(temp.path()), IntegrationStatus::Conflict);
+        assert!(install(temp.path(), &demons_config, SCOPE).is_err());
+    }
+
+    #[test]
+    fn refuses_to_rewrite_non_utf8_codex_config() {
+        let temp = tempdir().unwrap();
+        let path = project_config_path(temp.path());
+        let demons_config = temp.path().join("demons.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, [0xff, 0xfe]).unwrap();
+
+        assert!(install(temp.path(), &demons_config, SCOPE).is_err());
+        assert_eq!(fs::read(path).unwrap(), [0xff, 0xfe]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_symlinked_codex_directory() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        symlink(&outside, temp.path().join(".codex")).unwrap();
+        let demons_config = temp.path().join("demons.toml");
+
+        assert!(matches!(
+            inspect(temp.path()),
+            IntegrationStatus::Invalid(_)
+        ));
+        assert!(install(temp.path(), &demons_config, SCOPE).is_err());
     }
 
     #[test]
     fn rollback_restores_original_file() {
         let temp = tempdir().unwrap();
         let path = project_config_path(temp.path());
+        let demons_config = temp.path().join("demons.toml");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, "model = \"before\"\n").unwrap();
 
-        install(temp.path(), SCOPE).unwrap().rollback().unwrap();
+        install(temp.path(), &demons_config, SCOPE)
+            .unwrap()
+            .rollback()
+            .unwrap();
         assert_eq!(fs::read_to_string(path).unwrap(), "model = \"before\"\n");
     }
 }

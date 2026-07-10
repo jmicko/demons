@@ -3090,7 +3090,7 @@ impl App {
                 self.set_notice("MCP access needs a valid project scope ID.".to_owned());
                 return Ok(Action::Continue);
             };
-            match codex_config::install(&project_root, scope) {
+            match codex_config::install(&project_root, &self.loaded.path, scope) {
                 Ok(change) => codex_change = Some(change),
                 Err(error) => {
                     self.set_notice(format!("MCP integration not installed: {error:#}"));

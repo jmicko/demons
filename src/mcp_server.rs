@@ -16,6 +16,7 @@ use crate::control::{self, CaptureView, ControlRequest, ControlResponse, Instanc
 #[derive(Clone)]
 struct DemonsMcpServer {
     scope_id: String,
+    config_path: PathBuf,
     #[expect(dead_code, reason = "tool_handler macro accesses this router field")]
     tool_router: ToolRouter<Self>,
 }
@@ -120,9 +121,10 @@ struct CaptureRequest {
 
 #[tool_router]
 impl DemonsMcpServer {
-    fn new(scope_id: String) -> Self {
+    fn new(scope_id: String, config_path: PathBuf) -> Self {
         Self {
             scope_id,
+            config_path,
             tool_router: Self::tool_router(),
         }
     }
@@ -132,10 +134,12 @@ impl DemonsMcpServer {
     )]
     async fn list_instances(&self) -> Result<CallToolResult, McpError> {
         let scope = self.scope_id.clone();
-        let instances = tokio::task::spawn_blocking(move || control::discover_instances(&scope))
-            .await
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        let config_path = self.config_path.clone();
+        let instances =
+            tokio::task::spawn_blocking(move || control::discover_instances(&scope, &config_path))
+                .await
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?;
         json_result(&instances)
     }
 
@@ -377,10 +381,12 @@ impl DemonsMcpServer {
 
     async fn select_instance(&self, instance_id: Option<String>) -> Result<InstanceInfo, McpError> {
         let scope = self.scope_id.clone();
-        let instances = tokio::task::spawn_blocking(move || control::discover_instances(&scope))
-            .await
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        let config_path = self.config_path.clone();
+        let instances =
+            tokio::task::spawn_blocking(move || control::discover_instances(&scope, &config_path))
+                .await
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?;
         match instance_id {
             Some(instance_id) => instances
                 .into_iter()
@@ -428,14 +434,14 @@ fn response_result(response: ControlResponse) -> Result<CallToolResult, McpError
     json_result(&response)
 }
 
-pub fn serve(scope_id: String) -> Result<()> {
+pub fn serve(scope_id: String, config_path: PathBuf) -> Result<()> {
     uuid::Uuid::parse_str(&scope_id).context("invalid MCP project scope ID")?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("failed to initialize MCP runtime")?;
     runtime.block_on(async move {
-        let service = DemonsMcpServer::new(scope_id)
+        let service = DemonsMcpServer::new(scope_id, config_path)
             .serve(rmcp::transport::stdio())
             .await
             .context("failed to start MCP stdio server")?;
