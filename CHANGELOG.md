@@ -4,6 +4,17 @@ All notable user-facing changes should be recorded here before a release.
 
 ## Unreleased
 
+- Added config schema v3 with Off, Read only, and Full project-scoped MCP
+  access levels managed from the Settings tab.
+- Added a Codex project registration that is bound to the exact active config
+  path and generated project scope, refuses to replace user-owned entries, and
+  shuts off live access immediately when disabled.
+- Added MCP tools for bounded pane history, literal search, output/status waits,
+  pane status, task control, visible agent command panes, explicit input, and
+  synthetic PNG captures of the current terminal layout.
+- Marked MCP mutations for Codex approval handling and restricted local control
+  sockets and discovery metadata to the current user.
+
 ## 0.3.0 - 2026-07-09
 
 - Added config schema v2 with persistent `[[terminal]]` shell panes, plus a

@@ -1,4 +1,4 @@
-# Demons - Specification (v0.3.0)
+# Demons - Specification
 
 ## 1. Overview
 
@@ -66,6 +66,10 @@ leader = "alt-j"
 multi_click_ms = 500
 # Reserved for a future release. It must remain false.
 logging = false
+# Optional project-scoped MCP access: "off" (default), "read_only", or "full".
+mcp_access = "off"
+# Generated and managed by Demons when MCP access is enabled.
+# mcp_scope_id = "3f4a7f63-2492-477a-ae7f-92bffab78fa4"
 
 # Tasks. One [[task]] per pane.
 [[task]]
@@ -100,9 +104,9 @@ env = { RUST_LOG = "debug" }
 
 Validation rules (enforced at startup, fail loudly):
 
-- `schema_version` must be `2` for this release. Missing `schema_version` is
+- `schema_version` must be `3` for this release. Missing `schema_version` is
   treated as the current schema for compatibility with existing configs.
-  Schema version 1 is migrated to version 2.
+  Schema versions 1 and 2 migrate to version 3.
 - At least one `[[task]]` or `[[terminal]]` is required.
 - Task and terminal `name` values are required and unique per file.
 - `command` is required and non-empty.
@@ -112,9 +116,12 @@ Validation rules (enforced at startup, fail loudly):
 - `start_delay` must be a non-negative integer with an optional unit of `ms`,
   `s`, `m`, or `h`; no unit means seconds.
 - `settings.multi_click_ms` must be between 150 and 1000 milliseconds.
+- `settings.mcp_access` must be `off`, `read_only`, or `full`. Read-only and
+  full access require a valid UUID in `settings.mcp_scope_id`; the
+  configurator generates it when needed.
 - Unknown keys are an error (no silent ignoring — the configurator owns the schema).
-- Reserved v2 fields are parseable so future files have a stable schema, but
-  v2 rejects `logging = true` and any task that sets `watch`,
+- Reserved v3 fields are parseable so future files have a stable schema, but
+  v3 rejects `logging = true` and any task that sets `watch`,
   `run_on_change`, or `repeat`. Reserved behavior is never silently ignored.
 
 ### 4.3 Configurator
@@ -156,8 +163,8 @@ The runtime menu is opened with `?` in command mode or by clicking the footer's
   from a checkbox list of other tasks. Working-directory edits validate
   immediately and support Tab completion for directories relative to the config
   file.
-- **Settings** — app-level settings that can apply immediately, such as the
-  leader key and double/triple-click timing.
+- **Settings** — app-level settings such as the leader key,
+  double/triple-click timing, and project-scoped MCP access.
 - **Exit** — discard, save without restarting, save and restart affected, save
   and restart all, and a Problems section when the draft has config problems.
   In `demons init`, save/discard closes the configurator without starting
@@ -168,6 +175,39 @@ activates, Space toggles dependency checkboxes, Left/Right adjust sliders, Esc
 backs out one level, and text fields support cursor movement and basic line
 editing. Tab completes directories while editing a task's working directory.
 
+### 4.4 Project-scoped MCP integration
+
+On Unix platforms, Settings exposes three MCP access levels:
+
+- **Off**: no control listener. Saving removes a registration previously
+  managed by Demons without modifying a user-owned entry.
+- **Read only**: allows project/pane discovery, bounded history reads, literal
+  history search, output/status waits, command completion waits, and synthetic
+  TUI capture.
+- **Full**: also allows visible agent command panes, explicit pane input,
+  interrupts, task restarts, and closing agent-owned command panes.
+
+Saving an enabled level writes a managed `mcp_servers.demons` entry to
+`.codex/config.toml` beside the active `demons.toml`. The generated stdio
+command includes the config's absolute path and `mcp_scope_id`. Discovery must
+match both values exactly; if more than one live instance matches, callers must
+select an explicit instance ID. Demons never scans or exposes unrelated
+project scopes through that adapter.
+
+Codex ignores project-local configuration until the project is trusted, and a
+running Codex process must restart after registration changes. Demons does not
+depend on that restart for enforcement: selecting a lower access level stops
+or restricts the live control listener immediately, and each request is
+authorized again inside the running TUI. The Unix socket and discovery files
+must be private to the current user.
+
+History APIs return process text from the pane history model and exclude
+application UI composition. Visual diagnosis uses an explicit synthetic PNG
+capture of the terminal cell grid. `workspace` capture omits an active menu or
+dialog; `full` capture includes it. Capture is bounded by terminal dimensions,
+font lookup is lazy, and the response reports rendering metadata and missing
+glyphs.
+
 ## 5. CLI
 
 ```
@@ -175,6 +215,8 @@ demons                         # Run all tasks from the nearest demons.toml.
 demons init                    # Open the configurator without starting tasks.
 demons --config <path>         # Use a specific config file.
 demons -c <path>               # Short form.
+demons --config <path> mcp serve --scope <uuid>
+                                # Managed stdio adapter; normally generated.
 demons --help                  # Show usage.
 demons --version               # Print version.
 ```
@@ -357,6 +399,7 @@ layout = "grid"
 leader = "alt-j"
 multi_click_ms = 500
 logging = false
+mcp_access = "off"
 
 [[task]]
 name = "server"

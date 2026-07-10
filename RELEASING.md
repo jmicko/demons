@@ -59,6 +59,12 @@ Before publishing from a machine for the first time:
      command mode and close it with `x`. Confirm configured panes stay running.
    - Add a persistent terminal and environment variable in the Tasks tab, save,
      and confirm the shell receives that value.
+   - Enable Read only MCP access, save, and confirm the trusted project loads
+     the managed `.codex/config.toml` entry after Codex restarts. Read pane
+     output and request both workspace and full TUI captures.
+   - Enable Full MCP access, run and close an agent command pane, then switch
+     MCP access Off. Confirm live access stops immediately and saving removes
+     the managed project registration.
    - Restart a task with a dependent task and confirm the dependent restarts
      after its configured delay.
    - Quit with two `q` or `Ctrl+C` confirmations and verify no child process
