@@ -42,11 +42,17 @@ use unicode_width::UnicodeWidthChar;
 use vt100::{MouseProtocolEncoding, MouseProtocolMode, Parser};
 
 use crate::{
+    capture::{CaptureJob, CaptureWorker},
+    codex_config,
     config::{
         ConfigProblem, ConfigProblemLocation, ConfigProblemSeverity, ConfigSettingField,
         ConfigTaskField, ConfigTerminalField, Leader, LoadedConfig, MAX_MULTI_CLICK_MS,
-        MIN_MULTI_CLICK_MS, MULTI_CLICK_STEP_MS, Task, TaskCommand, TerminalPane,
+        MIN_MULTI_CLICK_MS, MULTI_CLICK_STEP_MS, McpAccess, Task, TaskCommand, TerminalPane,
         config_blocking_problems, parse_start_delay,
+    },
+    control::{
+        self, ControlEnvelope, ControlListener, ControlRequest, ControlResponse, OutputPage,
+        PaneInfo, PaneKind, SearchMatch, SearchResults, WaitResult,
     },
     layout::{Grid, choose_grid, grid_rects, pane_rects},
 };
@@ -341,6 +347,9 @@ fn run_with_options(loaded: LoadedConfig, options: RunOptions) -> Result<()> {
         options.quit_when_menu_closes,
         options.start_after_config_save,
     );
+    if let Err(error) = app.sync_control_listener() {
+        app.set_notice(format!("MCP control unavailable: {error:#}"));
+    }
     if options.open_menu {
         app.open_menu(MenuTab::Tasks);
     }
@@ -384,13 +393,17 @@ fn run_loop(
             return Ok(());
         }
         dirty |= app.drain_process_events();
+        dirty |= app.drain_control_requests();
+        dirty |= app.resolve_control_waits();
         dirty |= app.tick()?;
 
         if dirty {
-            terminal
+            let completed = terminal
                 .draw(|frame| app.draw(frame))
                 .context("failed to draw terminal UI")?;
-            dirty = false;
+            let buffer = completed.buffer.clone();
+            let area = completed.area;
+            dirty = app.after_draw(&buffer, area);
         }
 
         match poll_terminal_input(EVENT_INTERVAL)? {
@@ -601,6 +614,36 @@ struct App {
     scene_frame: u64,
     scene_frame_override: Option<u64>,
     last_scene_frame: Instant,
+    control: Option<ControlRuntime>,
+    pending_control_waits: Vec<PendingControlWait>,
+    pending_captures: VecDeque<PendingCapture>,
+    capture_worker: CaptureWorker,
+    last_cursor_position: Option<(u16, u16)>,
+}
+
+struct ControlRuntime {
+    listener: ControlListener,
+    rx: Receiver<ControlEnvelope>,
+}
+
+struct PendingControlWait {
+    pane_id: String,
+    query: Option<String>,
+    status: Option<String>,
+    after_cursor: u64,
+    deadline: Instant,
+    reply: SyncSender<ControlResponse>,
+}
+
+struct PendingCapture {
+    view: control::CaptureView,
+    reply: SyncSender<ControlResponse>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RenderView {
+    Full,
+    Workspace,
 }
 
 impl App {
@@ -678,6 +721,11 @@ impl App {
             scene_frame: 0,
             scene_frame_override,
             last_scene_frame: Instant::now(),
+            control: None,
+            pending_control_waits: Vec::new(),
+            pending_captures: VecDeque::new(),
+            capture_worker: CaptureWorker::start(),
+            last_cursor_position: None,
         }
     }
 
@@ -687,6 +735,527 @@ impl App {
             self.tasks[index].start_requested = true;
         }
         self.tick_dependency_starts(Instant::now());
+    }
+
+    fn sync_control_listener(&mut self) -> Result<()> {
+        let access = self.loaded.config.settings.mcp_access;
+        if !access.allows_read() {
+            self.cancel_control_waits("MCP access is disabled");
+            self.control.take();
+            return Ok(());
+        }
+        let scope = self
+            .loaded
+            .config
+            .settings
+            .mcp_scope_id
+            .as_deref()
+            .context("MCP access requires a project scope ID")?
+            .to_owned();
+        if self
+            .control
+            .as_ref()
+            .is_some_and(|control| control.listener.info.scope_id == scope)
+        {
+            return Ok(());
+        }
+        self.cancel_control_waits("MCP project scope changed");
+        self.control.take();
+        let (listener, rx) = ControlListener::start(&scope, &self.loaded.path)?;
+        self.control = Some(ControlRuntime { listener, rx });
+        Ok(())
+    }
+
+    fn cancel_control_waits(&mut self, message: &str) {
+        for pending in self.pending_control_waits.drain(..) {
+            pending
+                .reply
+                .try_send(ControlResponse::error("disabled", message))
+                .ok();
+        }
+        for pending in self.pending_captures.drain(..) {
+            pending
+                .reply
+                .try_send(ControlResponse::error("disabled", message))
+                .ok();
+        }
+    }
+
+    fn drain_control_requests(&mut self) -> bool {
+        let mut envelopes = Vec::new();
+        if let Some(control) = self.control.as_ref() {
+            for _ in 0..64 {
+                let Ok(envelope) = control.rx.try_recv() else {
+                    break;
+                };
+                envelopes.push(envelope);
+            }
+        }
+        let changed = !envelopes.is_empty();
+        for envelope in envelopes {
+            self.handle_control_envelope(envelope);
+        }
+        changed
+    }
+
+    fn handle_control_envelope(&mut self, envelope: ControlEnvelope) {
+        let access = self.loaded.config.settings.mcp_access;
+        if let Err(error) = control::authorize(access, &envelope.request) {
+            envelope
+                .reply
+                .try_send(ControlResponse::error("forbidden", error.to_string()))
+                .ok();
+            return;
+        }
+        match envelope.request {
+            ControlRequest::Ping => unreachable!("ping is handled by the listener"),
+            ControlRequest::ListPanes => {
+                self.reply_control(
+                    envelope.reply,
+                    ControlResponse::Panes {
+                        panes: self.control_panes(),
+                    },
+                );
+            }
+            ControlRequest::ReadOutput {
+                pane_id,
+                cursor,
+                max_lines,
+            } => {
+                let response = self.control_read_output(&pane_id, cursor, max_lines);
+                self.reply_control(envelope.reply, response);
+            }
+            ControlRequest::SearchOutput {
+                pane_id,
+                query,
+                max_results,
+                context_lines,
+            } => {
+                let response =
+                    self.control_search_output(&pane_id, &query, max_results, context_lines);
+                self.reply_control(envelope.reply, response);
+            }
+            ControlRequest::WaitForOutput {
+                pane_id,
+                query,
+                status,
+                after_cursor,
+                timeout_ms,
+            } => self.start_control_wait(
+                pane_id,
+                query,
+                status,
+                after_cursor,
+                timeout_ms,
+                envelope.reply,
+            ),
+            ControlRequest::WaitForCommand {
+                pane_id,
+                timeout_ms,
+            } => self.start_control_wait(
+                pane_id,
+                None,
+                Some("exited".to_owned()),
+                None,
+                timeout_ms,
+                envelope.reply,
+            ),
+            ControlRequest::RestartTask { pane_id } => {
+                let response = if let Some(index) = self.control_pane_index(&pane_id) {
+                    if matches!(self.tasks[index].kind, RuntimePaneKind::Task) {
+                        self.request_restart(index);
+                        self.set_notice(format!("Agent restarted pane {pane_id}."));
+                        ControlResponse::Ok {
+                            message: format!("Restart requested for {pane_id}"),
+                        }
+                    } else {
+                        ControlResponse::error("invalid_pane", "restart_task requires a task pane")
+                    }
+                } else {
+                    ControlResponse::error("not_found", format!("pane {pane_id:?} was not found"))
+                };
+                self.reply_control(envelope.reply, response);
+            }
+            ControlRequest::RestartAll => {
+                let indexes = self
+                    .tasks
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, task)| {
+                        matches!(task.kind, RuntimePaneKind::Task).then_some(index)
+                    })
+                    .collect::<Vec<_>>();
+                self.request_restart_set(&indexes);
+                self.set_notice("Agent restarted all task panes.".to_owned());
+                self.reply_control(
+                    envelope.reply,
+                    ControlResponse::Ok {
+                        message: "Restart requested for all task panes".to_owned(),
+                    },
+                );
+            }
+            ControlRequest::InterruptPane { pane_id } => {
+                let response = self.control_interrupt_pane(&pane_id);
+                self.reply_control(envelope.reply, response);
+            }
+            ControlRequest::SendInput {
+                pane_id,
+                text,
+                submit,
+            } => {
+                let response = self.control_send_input(&pane_id, &text, submit);
+                self.reply_control(envelope.reply, response);
+            }
+            ControlRequest::RunCommand { command, cwd, name } => {
+                let response = self.control_run_command(command, cwd, name);
+                self.reply_control(envelope.reply, response);
+            }
+            ControlRequest::CloseCommand { pane_id } => {
+                let response = self.control_close_command(&pane_id);
+                self.reply_control(envelope.reply, response);
+            }
+            ControlRequest::CaptureTui { view } => {
+                if self.pending_captures.len() + self.capture_worker.pending() >= 4 {
+                    self.reply_control(
+                        envelope.reply,
+                        ControlResponse::error("busy", "four TUI captures are already pending"),
+                    );
+                } else {
+                    self.pending_captures.push_back(PendingCapture {
+                        view,
+                        reply: envelope.reply,
+                    });
+                }
+            }
+        }
+    }
+
+    fn reply_control(&self, reply: SyncSender<ControlResponse>, response: ControlResponse) {
+        reply.try_send(response).ok();
+    }
+
+    fn control_pane_index(&self, pane_id: &str) -> Option<usize> {
+        self.tasks.iter().position(|task| task.task.name == pane_id)
+    }
+
+    fn control_panes(&self) -> Vec<PaneInfo> {
+        self.tasks.iter().map(TaskRuntime::control_info).collect()
+    }
+
+    fn control_read_output(
+        &self,
+        pane_id: &str,
+        cursor: Option<u64>,
+        max_lines: u32,
+    ) -> ControlResponse {
+        let Some(index) = self.control_pane_index(pane_id) else {
+            return ControlResponse::error("not_found", format!("pane {pane_id:?} was not found"));
+        };
+        let history = &self.tasks[index].history;
+        let limit = max_lines.clamp(1, 1_000) as u64;
+        let end = history.line_count();
+        let requested = cursor.unwrap_or_else(|| end.saturating_sub(limit));
+        let start = requested.max(history.first_index).min(end);
+        let page_end = start.saturating_add(limit).min(end);
+        let lines = (start..page_end)
+            .filter_map(|line| {
+                history
+                    .line(line)
+                    .map(|line| line.text.trim_end().to_owned())
+            })
+            .collect();
+        ControlResponse::Output {
+            output: OutputPage {
+                pane_id: pane_id.to_owned(),
+                first_line: start,
+                next_cursor: page_end,
+                end_cursor: end,
+                truncated_before_cursor: requested < history.first_index,
+                lines,
+            },
+        }
+    }
+
+    fn control_search_output(
+        &self,
+        pane_id: &str,
+        query: &str,
+        max_results: u32,
+        context_lines: u32,
+    ) -> ControlResponse {
+        if query.trim().is_empty() {
+            return ControlResponse::error("invalid_request", "search query cannot be empty");
+        }
+        let Some(index) = self.control_pane_index(pane_id) else {
+            return ControlResponse::error("not_found", format!("pane {pane_id:?} was not found"));
+        };
+        let history = &self.tasks[index].history;
+        let matching = history.matching_lines(query);
+        let total_matches = matching.len();
+        let limit = max_results.clamp(1, 200) as usize;
+        let context = context_lines.min(20) as u64;
+        let matches = matching
+            .iter()
+            .take(limit)
+            .filter_map(|line_index| {
+                let line = history.line(*line_index)?;
+                let before_start = line_index.saturating_sub(context).max(history.first_index);
+                let before = (before_start..*line_index)
+                    .filter_map(|line| {
+                        history
+                            .line(line)
+                            .map(|line| line.text.trim_end().to_owned())
+                    })
+                    .collect();
+                let after_end = line_index
+                    .saturating_add(context)
+                    .saturating_add(1)
+                    .min(history.line_count());
+                let after = (line_index.saturating_add(1)..after_end)
+                    .filter_map(|line| {
+                        history
+                            .line(line)
+                            .map(|line| line.text.trim_end().to_owned())
+                    })
+                    .collect();
+                Some(SearchMatch {
+                    line: *line_index,
+                    text: line.text.trim_end().to_owned(),
+                    before,
+                    after,
+                })
+            })
+            .collect();
+        ControlResponse::Search {
+            results: SearchResults {
+                pane_id: pane_id.to_owned(),
+                query: query.to_owned(),
+                matches,
+                total_matches,
+                truncated: total_matches > limit,
+            },
+        }
+    }
+
+    fn start_control_wait(
+        &mut self,
+        pane_id: String,
+        query: Option<String>,
+        status: Option<String>,
+        after_cursor: Option<u64>,
+        timeout_ms: u64,
+        reply: SyncSender<ControlResponse>,
+    ) {
+        let Some(index) = self.control_pane_index(&pane_id) else {
+            self.reply_control(
+                reply,
+                ControlResponse::error("not_found", format!("pane {pane_id:?} was not found")),
+            );
+            return;
+        };
+        if query.as_deref().is_none_or(|query| query.trim().is_empty()) && status.is_none() {
+            self.reply_control(
+                reply,
+                ControlResponse::error("invalid_request", "wait requires query or status"),
+            );
+            return;
+        }
+        let after_cursor = after_cursor.unwrap_or_else(|| self.tasks[index].history.line_count());
+        let timeout = Duration::from_millis(timeout_ms.clamp(1, 60_000));
+        self.pending_control_waits.push(PendingControlWait {
+            pane_id,
+            query: query.map(|query| query.to_ascii_lowercase()),
+            status: status.map(|status| status.to_ascii_lowercase()),
+            after_cursor,
+            deadline: Instant::now() + timeout,
+            reply,
+        });
+        self.resolve_control_waits();
+    }
+
+    fn resolve_control_waits(&mut self) -> bool {
+        if self.pending_control_waits.is_empty() {
+            return false;
+        }
+        let now = Instant::now();
+        let mut resolved = false;
+        let mut remaining = Vec::new();
+        let pending = std::mem::take(&mut self.pending_control_waits);
+        for wait in pending {
+            let Some(index) = self.control_pane_index(&wait.pane_id) else {
+                wait.reply
+                    .try_send(ControlResponse::error("not_found", "pane no longer exists"))
+                    .ok();
+                resolved = true;
+                continue;
+            };
+            let task = &self.tasks[index];
+            let status = task.control_status();
+            let status_match = wait
+                .status
+                .as_deref()
+                .is_some_and(|wanted| control_status_matches(wanted, &status));
+            let line_match = wait.query.as_deref().and_then(|query| {
+                (wait.after_cursor.max(task.history.first_index)..task.history.line_count()).find(
+                    |line| {
+                        task.history
+                            .line(*line)
+                            .is_some_and(|line| line.text.to_ascii_lowercase().contains(query))
+                    },
+                )
+            });
+            if status_match || line_match.is_some() || now >= wait.deadline {
+                wait.reply
+                    .try_send(ControlResponse::Wait {
+                        result: WaitResult {
+                            pane_id: wait.pane_id,
+                            matched: status_match || line_match.is_some(),
+                            timed_out: now >= wait.deadline
+                                && !status_match
+                                && line_match.is_none(),
+                            status,
+                            cursor: task.history.line_count(),
+                            line: line_match,
+                        },
+                    })
+                    .ok();
+                resolved = true;
+            } else {
+                remaining.push(wait);
+            }
+        }
+        self.pending_control_waits = remaining;
+        resolved
+    }
+
+    fn control_interrupt_pane(&mut self, pane_id: &str) -> ControlResponse {
+        let Some(index) = self.control_pane_index(pane_id) else {
+            return ControlResponse::error("not_found", format!("pane {pane_id:?} was not found"));
+        };
+        let Some(pid) = self.tasks[index].pid else {
+            return ControlResponse::error("not_running", "pane has no running process");
+        };
+        match signal_process_group(pid, libc::SIGINT) {
+            Ok(()) => {
+                self.set_notice(format!("Agent interrupted pane {pane_id}."));
+                ControlResponse::Ok {
+                    message: format!("Sent SIGINT to {pane_id}"),
+                }
+            }
+            Err(error) => ControlResponse::error("signal_failed", error.to_string()),
+        }
+    }
+
+    fn control_send_input(&mut self, pane_id: &str, text: &str, submit: bool) -> ControlResponse {
+        const MAX_INPUT_BYTES: usize = 64 * 1024;
+        if text.len() > MAX_INPUT_BYTES || text.contains('\0') {
+            return ControlResponse::error(
+                "invalid_request",
+                "input must be at most 65536 bytes and cannot contain NUL",
+            );
+        }
+        let Some(index) = self.control_pane_index(pane_id) else {
+            return ControlResponse::error("not_found", format!("pane {pane_id:?} was not found"));
+        };
+        if self.tasks[index].writer.is_none() {
+            return ControlResponse::error("not_running", "pane is not accepting input");
+        }
+        let mut bytes = text.as_bytes().to_vec();
+        if submit {
+            bytes.push(b'\r');
+        }
+        match self.tasks[index].write_input(&bytes) {
+            Ok(()) => {
+                self.set_notice(format!("Agent sent input to pane {pane_id}."));
+                ControlResponse::Ok {
+                    message: format!("Sent {} bytes to {pane_id}", bytes.len()),
+                }
+            }
+            Err(error) => ControlResponse::error("input_failed", error.to_string()),
+        }
+    }
+
+    fn control_run_command(
+        &mut self,
+        command: String,
+        cwd: Option<PathBuf>,
+        name: Option<String>,
+    ) -> ControlResponse {
+        const MAX_COMMAND_BYTES: usize = 64 * 1024;
+        let active = self
+            .tasks
+            .iter()
+            .filter(|task| matches!(task.kind, RuntimePaneKind::McpCommand))
+            .count();
+        if active >= 4 {
+            return ControlResponse::error("limit_reached", "four MCP command panes already exist");
+        }
+        if command.trim().is_empty() || command.len() > MAX_COMMAND_BYTES || command.contains('\0')
+        {
+            return ControlResponse::error(
+                "invalid_request",
+                "command must be non-empty, at most 65536 bytes, and contain no NUL",
+            );
+        }
+        let cwd = cwd.unwrap_or_else(|| self.loaded.root.clone());
+        let cwd = if cwd.is_absolute() {
+            cwd
+        } else {
+            self.loaded.root.join(cwd)
+        };
+        let cwd = match fs::canonicalize(&cwd) {
+            Ok(cwd) if cwd.is_dir() => cwd,
+            Ok(_) => return ControlResponse::error("invalid_cwd", "cwd is not a directory"),
+            Err(error) => return ControlResponse::error("invalid_cwd", error.to_string()),
+        };
+        let base = name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty() && !name.chars().any(char::is_control))
+            .unwrap_or("agent");
+        let name = unique_runtime_pane_name(&self.tasks, base);
+        let mut runtime = TaskRuntime::new_mcp_command(name.clone(), command, cwd);
+        runtime.start_requested = true;
+        self.tasks.push(runtime);
+        let index = self.tasks.len() - 1;
+        self.spawn(index);
+        self.focus = index;
+        self.set_notice(format!("Agent started command pane {name}."));
+        ControlResponse::Command {
+            pane: self.tasks[index].control_info(),
+        }
+    }
+
+    fn control_close_command(&mut self, pane_id: &str) -> ControlResponse {
+        let Some(index) = self.control_pane_index(pane_id) else {
+            return ControlResponse::error("not_found", format!("pane {pane_id:?} was not found"));
+        };
+        if !matches!(self.tasks[index].kind, RuntimePaneKind::McpCommand) {
+            return ControlResponse::error(
+                "invalid_pane",
+                "close_command requires an MCP command pane",
+            );
+        }
+        self.tasks[index].remove_when_exited = true;
+        if let Some(pid) = self.tasks[index].pid {
+            self.tasks[index].signal_graceful_stop(pid).ok();
+            self.tasks[index].status = TaskStatus::Stopping;
+            self.tasks[index].kill_deadline = Some(Instant::now() + RESTART_GRACE);
+        } else {
+            self.remove_runtime_pane(index);
+        }
+        self.set_notice(format!("Agent closed command pane {pane_id}."));
+        ControlResponse::Ok {
+            message: format!("Closing command pane {pane_id}"),
+        }
+    }
+
+    fn remove_runtime_pane(&mut self, index: usize) {
+        if index >= self.tasks.len() {
+            return;
+        }
+        self.tasks.remove(index);
+        self.focus = self.focus.min(self.tasks.len().saturating_sub(1));
     }
 
     fn spawn(&mut self, index: usize) {
@@ -853,10 +1422,24 @@ impl App {
     }
 
     fn draw(&mut self, frame: &mut Frame<'_>) {
-        let now = Instant::now();
         let frame_area = frame.area();
+        let cursor = self.draw_buffer(frame_area, frame.buffer_mut(), RenderView::Full);
+        self.last_cursor_position = cursor;
+        if let Some(cursor) = cursor {
+            frame.set_cursor_position(cursor);
+        }
+    }
+
+    fn draw_buffer(
+        &mut self,
+        frame_area: Rect,
+        buffer: &mut Buffer,
+        view: RenderView,
+    ) -> Option<(u16, u16)> {
+        let now = Instant::now();
         self.update_layout(frame_area);
-        let buffer = frame.buffer_mut();
+        let interactive = view == RenderView::Full;
+        let mouse_position = interactive.then_some(self.mouse_position).flatten();
         self.footer_hits.clear();
         clear_rect(buffer, frame_area, app_style());
 
@@ -966,9 +1549,7 @@ impl App {
                 footer_area.height,
             );
             let (mode_label, mode_color, items) = self.footer_parts(now);
-            let mode_hovered = self
-                .mouse_position
-                .is_some_and(|(x, y)| contains(button_area, x, y));
+            let mode_hovered = mouse_position.is_some_and(|(x, y)| contains(button_area, x, y));
             Paragraph::new(mode_label)
                 .alignment(ratatui::layout::Alignment::Center)
                 .style(Style::default().fg(THEME_BLACK).bg(if mode_hovered {
@@ -977,10 +1558,10 @@ impl App {
                     mode_color
                 }))
                 .render(button_area, buffer);
-            self.footer_hits = render_footer_items(&items, help_area, buffer, self.mouse_position);
+            self.footer_hits = render_footer_items(&items, help_area, buffer, mouse_position);
         }
 
-        if let Some(menu) = self.menu.as_mut() {
+        if interactive && let Some(menu) = self.menu.as_mut() {
             let exit_mode = menu_exit_mode(
                 self.quit_when_menu_closes,
                 self.start_after_config_save,
@@ -992,36 +1573,76 @@ impl App {
                 menu,
                 self.loaded.config.settings.leader.label(),
                 exit_mode,
-                self.mouse_position,
+                mouse_position,
             );
         }
 
-        if self.welcome_intro {
+        if interactive && self.welcome_intro {
             render_welcome_intro(frame_area, buffer);
         }
 
-        if self.problem_intro {
+        if interactive && self.problem_intro {
             render_problem_intro(frame_area, buffer);
         }
 
-        if self.confirm_quit {
+        if interactive && self.confirm_quit {
             render_quit_confirm(frame_area, buffer);
         }
 
-        if let Some(notice) = self.active_notice(now) {
+        if interactive && let Some(notice) = self.active_notice(now) {
             render_notice(frame_area, self.footer_rect, notice, buffer);
         }
 
-        if self.mode == AppMode::Input && self.menu.is_none() && !self.tasks.is_empty() {
+        if interactive
+            && self.mode == AppMode::Input
+            && self.menu.is_none()
+            && !self.tasks.is_empty()
+        {
             let task = &self.tasks[self.focus];
             let area = self.task_output_rect(self.focus).unwrap_or_default();
             if task.scroll_offset == 0 && !task.parser.screen().hide_cursor() {
                 let (row, column) = task.parser.screen().cursor_position();
                 if row < area.height && column < area.width {
-                    frame.set_cursor_position((area.x + column, area.y + row));
+                    return Some((area.x + column, area.y + row));
                 }
             }
         }
+        None
+    }
+
+    fn after_draw(&mut self, live_buffer: &Buffer, area: Rect) -> bool {
+        let Some(pending) = self.pending_captures.pop_front() else {
+            return false;
+        };
+        let (buffer, cursor) = match pending.view {
+            control::CaptureView::Full => (live_buffer.clone(), self.last_cursor_position),
+            control::CaptureView::Workspace => {
+                let footer_hits = std::mem::take(&mut self.footer_hits);
+                let menu_hits = self
+                    .menu
+                    .as_mut()
+                    .map(|menu| std::mem::take(&mut menu.hits));
+                let mut buffer = Buffer::empty(area);
+                self.draw_buffer(area, &mut buffer, RenderView::Workspace);
+                self.footer_hits = footer_hits;
+                if let (Some(menu), Some(hits)) = (self.menu.as_mut(), menu_hits) {
+                    menu.hits = hits;
+                }
+                (buffer, None)
+            }
+        };
+        if let Err(error) = self.capture_worker.submit(CaptureJob {
+            view: pending.view,
+            buffer,
+            cursor,
+            reply: pending.reply.clone(),
+        }) {
+            pending
+                .reply
+                .try_send(ControlResponse::error("busy", error.to_string()))
+                .ok();
+        }
+        !self.pending_captures.is_empty()
     }
 
     fn handle_terminal_event(&mut self, event: Event) -> Result<Action> {
@@ -1252,6 +1873,13 @@ impl App {
         if self.menu.as_ref().is_some_and(|menu| menu.leader_picker) {
             return self.handle_menu_leader_key(key);
         }
+        if self
+            .menu
+            .as_ref()
+            .is_some_and(|menu| menu.mcp_access_picker)
+        {
+            return self.handle_menu_mcp_access_key(key);
+        }
 
         match key.code {
             KeyCode::Esc => return Ok(self.menu_back_or_close()),
@@ -1325,6 +1953,25 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => self.move_menu_leader_cursor(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_menu_leader_cursor(1),
             KeyCode::Enter | KeyCode::Char(' ') => self.select_menu_leader(),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Ok(self.request_quit());
+            }
+            _ => {}
+        }
+        Ok(Action::Continue)
+    }
+
+    fn handle_menu_mcp_access_key(&mut self, key: KeyEvent) -> Result<Action> {
+        match key.code {
+            KeyCode::Esc => {
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.mcp_access_picker = false;
+                    menu.mcp_access_cursor = 0;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.move_menu_mcp_access_cursor(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_menu_mcp_access_cursor(1),
+            KeyCode::Enter | KeyCode::Char(' ') => self.select_menu_mcp_access(),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 return Ok(self.request_quit());
             }
@@ -1415,6 +2062,8 @@ impl App {
         menu.env_owner = None;
         menu.env_detail_key = None;
         menu.env_cursor = 0;
+        menu.leader_picker = false;
+        menu.mcp_access_picker = false;
     }
 
     fn move_menu_cursor(&mut self, delta: isize) {
@@ -1474,6 +2123,14 @@ impl App {
         }
     }
 
+    fn move_menu_mcp_access_cursor(&mut self, delta: isize) {
+        let count = all_mcp_access_levels().len();
+        if let Some(menu) = self.menu.as_mut() {
+            menu.mcp_access_cursor =
+                (menu.mcp_access_cursor as isize + delta).rem_euclid(count as isize) as usize;
+        }
+    }
+
     fn select_menu_leader(&mut self) {
         let Some(index) = self.menu.as_ref().map(|menu| menu.leader_cursor) else {
             return;
@@ -1482,6 +2139,16 @@ impl App {
             return;
         };
         self.set_menu_leader(leader);
+    }
+
+    fn select_menu_mcp_access(&mut self) {
+        let Some(index) = self.menu.as_ref().map(|menu| menu.mcp_access_cursor) else {
+            return;
+        };
+        let Some(&access) = all_mcp_access_levels().get(index) else {
+            return;
+        };
+        self.set_menu_mcp_access(access);
     }
 
     fn activate_selected_menu_item(&mut self) -> Result<Action> {
@@ -1526,6 +2193,7 @@ impl App {
             MenuTab::Settings => match menu.cursor {
                 1 => Some(MenuAction::OpenLeaderPicker),
                 2 => Some(MenuAction::AdjustMultiClick(MULTI_CLICK_STEP_MS as i64)),
+                4 => Some(MenuAction::OpenMcpAccessPicker),
                 _ => None,
             },
             MenuTab::Exit => {
@@ -1595,6 +2263,8 @@ impl App {
             MenuAction::BackEnv => self.back_env_menu(),
             MenuAction::OpenLeaderPicker => self.open_menu_leader_picker(),
             MenuAction::SelectLeader(leader) => self.set_menu_leader(leader),
+            MenuAction::OpenMcpAccessPicker => self.open_menu_mcp_access_picker(),
+            MenuAction::SelectMcpAccess(access) => self.set_menu_mcp_access(access),
             MenuAction::AdjustMultiClick(delta) => self.adjust_menu_multi_click(delta),
             MenuAction::SetMultiClick(value) => self.set_menu_multi_click(value),
             MenuAction::Exit(action) => return self.handle_menu_exit_action(action),
@@ -1724,6 +2394,11 @@ impl App {
         if menu.leader_picker {
             menu.leader_picker = false;
             menu.leader_cursor = 0;
+            return Action::Continue;
+        }
+        if menu.mcp_access_picker {
+            menu.mcp_access_picker = false;
+            menu.mcp_access_cursor = 0;
             return Action::Continue;
         }
         if menu.task_detail.is_some() {
@@ -2255,6 +2930,37 @@ impl App {
         self.loaded.config.settings.leader = leader;
     }
 
+    fn open_menu_mcp_access_picker(&mut self) {
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        let current = menu.draft.settings.mcp_access;
+        menu.mcp_access_cursor = all_mcp_access_levels()
+            .iter()
+            .position(|access| *access == current)
+            .unwrap_or(0);
+        menu.mcp_access_picker = true;
+    }
+
+    fn set_menu_mcp_access(&mut self, access: McpAccess) {
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        if access.allows_read() && menu.draft.settings.mcp_scope_id.is_none() {
+            menu.draft.settings.mcp_scope_id = Some(uuid::Uuid::new_v4().to_string());
+        }
+        menu.draft.settings.mcp_access = access;
+        menu.mcp_access_picker = false;
+
+        if mcp_access_rank(access) < mcp_access_rank(self.loaded.config.settings.mcp_access) {
+            self.loaded.config.settings.mcp_access = access;
+            if !access.allows_read() {
+                self.cancel_control_waits("MCP access is disabled");
+                self.control.take();
+            }
+        }
+    }
+
     fn selected_menu_slider(&self) -> bool {
         self.menu
             .as_ref()
@@ -2293,6 +2999,9 @@ impl App {
                     if !self.tasks_started {
                         self.rebuild_unstarted_tasks();
                     }
+                }
+                if let Err(error) = self.sync_control_listener() {
+                    self.set_notice(format!("MCP control unavailable: {error:#}"));
                 }
                 if self.quit_when_menu_closes {
                     Ok(Action::Quit)
@@ -2341,14 +3050,65 @@ impl App {
             config_problems: Vec::new(),
             created_from_missing_file: false,
         };
+        let project_root = loaded.root.clone();
+        let mut codex_change = None;
+        if draft.settings.mcp_access.allows_read() {
+            let Some(scope) = draft.settings.mcp_scope_id.as_deref() else {
+                self.set_notice("MCP access needs a valid project scope ID.".to_owned());
+                return Ok(Action::Continue);
+            };
+            match codex_config::install(&project_root, scope) {
+                Ok(change) => codex_change = Some(change),
+                Err(error) => {
+                    self.set_notice(format!("MCP integration not installed: {error:#}"));
+                    return Ok(Action::Continue);
+                }
+            }
+        }
         if let Err(error) = loaded.save() {
+            if let Some(change) = codex_change {
+                change.rollback().ok();
+            }
             self.set_notice(format!("Config not saved: {error:#}"));
             return Ok(Action::Continue);
+        }
+
+        let integration_changed = codex_change
+            .as_ref()
+            .is_some_and(codex_config::CodexConfigChange::changed);
+        let mut integration_warning = None;
+        if !draft.settings.mcp_access.allows_read() {
+            match codex_config::inspect(&project_root) {
+                codex_config::IntegrationStatus::Managed => {
+                    match codex_config::uninstall(&project_root) {
+                        Ok(change) => {
+                            if change.changed() {
+                                codex_change = Some(change);
+                            }
+                        }
+                        Err(error) => {
+                            integration_warning = Some(format!(
+                                "MCP access is off, but Codex registration removal failed: {error:#}"
+                            ))
+                        }
+                    }
+                }
+                codex_config::IntegrationStatus::Invalid(error) => {
+                    integration_warning = Some(format!(
+                        "MCP access is off; Codex config could not be updated: {error}"
+                    ));
+                }
+                codex_config::IntegrationStatus::Missing
+                | codex_config::IntegrationStatus::Conflict => {}
+            }
         }
 
         let old = self.loaded.config.clone();
         self.menu = None;
         self.apply_saved_config(old, draft, restart);
+        if let Err(error) = self.sync_control_listener() {
+            self.set_notice(format!("MCP control unavailable: {error:#}"));
+        }
         self.loaded.config_problems.clear();
         if self.start_after_config_save && !self.tasks_started {
             self.start_after_config_save = false;
@@ -2357,6 +3117,15 @@ impl App {
                 "Saved {}; starting tasks.",
                 self.loaded.path.display()
             ));
+        }
+        if let Some(warning) = integration_warning {
+            self.set_notice(warning);
+        } else if integration_changed
+            || codex_change
+                .as_ref()
+                .is_some_and(codex_config::CodexConfigChange::changed)
+        {
+            self.set_notice("MCP registration changed; restart Codex to update tools.".to_owned());
         }
         if self.quit_when_menu_closes {
             Ok(Action::Quit)
@@ -2401,7 +3170,7 @@ impl App {
                         .terminals
                         .iter()
                         .any(|terminal| terminal.name == runtime.task.name),
-                    RuntimePaneKind::SessionTerminal => true,
+                    RuntimePaneKind::SessionTerminal | RuntimePaneKind::McpCommand => true,
                 };
                 (!retained).then_some(index)
             })
@@ -4329,6 +5098,11 @@ impl App {
             runtime.start_requested = true;
             runtime.pending_start = None;
         }
+        let remove_when_exited = runtime.remove_when_exited;
+        if remove_when_exited {
+            self.remove_runtime_pane(index);
+            return;
+        }
         self.tick_dependency_starts(Instant::now());
     }
 
@@ -4475,6 +5249,7 @@ struct TaskRuntime {
     history: TextHistory,
     output_closed: bool,
     pending_exit: Option<ExitStatus>,
+    remove_when_exited: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4482,6 +5257,7 @@ enum RuntimePaneKind {
     Task,
     ConfigTerminal(usize),
     SessionTerminal,
+    McpCommand,
 }
 
 impl TaskRuntime {
@@ -4518,6 +5294,7 @@ impl TaskRuntime {
             history: TextHistory::new(pty_size.cols, pty_size.rows, HISTORY_LINES),
             output_closed: true,
             pending_exit: None,
+            remove_when_exited: false,
         }
     }
 
@@ -4534,6 +5311,25 @@ impl TaskRuntime {
     fn new_session_terminal(terminal: TerminalPane, cwd: PathBuf) -> Self {
         let mut runtime = Self::new(terminal_runtime_task(terminal), cwd);
         runtime.kind = RuntimePaneKind::SessionTerminal;
+        runtime
+    }
+
+    fn new_mcp_command(name: String, command: String, cwd: PathBuf) -> Self {
+        let mut runtime = Self::new(
+            Task {
+                name,
+                command: TaskCommand::Shell(command),
+                cwd: PathBuf::from("."),
+                env: BTreeMap::new(),
+                depends_on: Vec::new(),
+                start_delay: None,
+                watch: None,
+                run_on_change: None,
+                repeat: None,
+            },
+            cwd,
+        );
+        runtime.kind = RuntimePaneKind::McpCommand;
         runtime
     }
 
@@ -4653,7 +5449,10 @@ impl TaskRuntime {
     }
 
     fn command_builder(&self) -> CommandBuilder {
-        if !matches!(self.kind, RuntimePaneKind::Task) {
+        if matches!(
+            self.kind,
+            RuntimePaneKind::ConfigTerminal(_) | RuntimePaneKind::SessionTerminal
+        ) {
             let shell = env::var_os("SHELL")
                 .filter(|shell| !shell.is_empty())
                 .unwrap_or_else(|| "/bin/sh".into());
@@ -4679,7 +5478,7 @@ impl TaskRuntime {
 
     fn graceful_stop_signal(&self) -> libc::c_int {
         match self.kind {
-            RuntimePaneKind::Task => libc::SIGTERM,
+            RuntimePaneKind::Task | RuntimePaneKind::McpCommand => libc::SIGTERM,
             RuntimePaneKind::ConfigTerminal(_) | RuntimePaneKind::SessionTerminal => libc::SIGHUP,
         }
     }
@@ -4899,6 +5698,50 @@ impl TaskRuntime {
                 }
             }
         }
+    }
+
+    fn control_status(&self) -> String {
+        match self.status {
+            TaskStatus::NotStarted => "not_started",
+            TaskStatus::Waiting => "waiting",
+            TaskStatus::Starting => "starting",
+            TaskStatus::Running => "running",
+            TaskStatus::Restarting => "restarting",
+            TaskStatus::Stopping => "stopping",
+            TaskStatus::Failed => "failed",
+            TaskStatus::Exited { .. } => "exited",
+        }
+        .to_owned()
+    }
+
+    fn control_info(&self) -> PaneInfo {
+        let kind = match self.kind {
+            RuntimePaneKind::Task => PaneKind::Task,
+            RuntimePaneKind::ConfigTerminal(_) => PaneKind::ConfigTerminal,
+            RuntimePaneKind::SessionTerminal => PaneKind::SessionTerminal,
+            RuntimePaneKind::McpCommand => PaneKind::Command,
+        };
+        PaneInfo {
+            pane_id: self.task.name.clone(),
+            name: self.task.name.clone(),
+            kind,
+            status: self.control_status(),
+            pid: self.pid,
+            cwd: self.cwd.clone(),
+            generation: self.generation,
+            accepts_input: self.writer.is_some(),
+            first_line: self.history.first_index,
+            next_line: self.history.line_count(),
+        }
+    }
+}
+
+fn control_status_matches(wanted: &str, current: &str) -> bool {
+    match wanted {
+        "exited" | "finished" => matches!(current, "exited" | "failed"),
+        "running" => current == "running",
+        "stopped" => matches!(current, "exited" | "failed" | "not_started"),
+        other => current == other,
     }
 }
 
@@ -5907,6 +6750,8 @@ struct MenuState {
     env_cursor: usize,
     leader_picker: bool,
     leader_cursor: usize,
+    mcp_access_picker: bool,
+    mcp_access_cursor: usize,
     edit: Option<MenuEdit>,
     path: PathBuf,
     initial_problems: Vec<ConfigProblem>,
@@ -5935,6 +6780,8 @@ impl MenuState {
             env_cursor: 0,
             leader_picker: false,
             leader_cursor: 0,
+            mcp_access_picker: false,
+            mcp_access_cursor: 0,
             edit: None,
             path,
             initial_problems,
@@ -6075,6 +6922,8 @@ enum MenuAction {
     BackEnv,
     OpenLeaderPicker,
     SelectLeader(Leader),
+    OpenMcpAccessPicker,
+    SelectMcpAccess(McpAccess),
     AdjustMultiClick(i64),
     SetMultiClick(u64),
     Exit(MenuExitAction),
@@ -6445,6 +7294,10 @@ fn render_menu(
     }
     if menu.leader_picker {
         render_menu_leaders(body, buffer, menu, hover_position);
+        return;
+    }
+    if menu.mcp_access_picker {
+        render_menu_mcp_access(body, buffer, menu, hover_position);
         return;
     }
 
@@ -6897,6 +7750,33 @@ fn render_menu_settings(
         setting_problem_badges(&problems, ConfigSettingField::Logging),
         hover_position,
     );
+    let mcp_rect = Rect::new(area.x, area.y.saturating_add(5), area.width, 1);
+    let mcp_badges = setting_problem_badges(&problems, ConfigSettingField::McpAccess);
+    let project_root = menu.path.parent().unwrap_or_else(|| Path::new("."));
+    let integration = codex_config::inspect(project_root);
+    let text = format!(
+        "MCP access: {} ({})",
+        menu.draft.settings.mcp_access.label(),
+        integration.label()
+    );
+    render_menu_row(
+        buffer,
+        mcp_rect,
+        &text_with_problem_badges(&text, mcp_badges),
+        menu.cursor == 4,
+        Some(MenuAction::OpenMcpAccessPicker),
+        &mut menu.hits,
+        hover_position,
+    );
+    render_problem_badges(
+        buffer,
+        mcp_rect,
+        mcp_badges,
+        row_bg_color(
+            menu.cursor == 4,
+            hover_position.is_some_and(|(x, y)| contains(mcp_rect, x, y)),
+        ),
+    );
 }
 
 fn render_menu_static_setting_row(
@@ -7021,6 +7901,36 @@ fn render_menu_leaders(
             &text,
             index == menu.leader_cursor,
             Some(MenuAction::SelectLeader(leader)),
+            &mut menu.hits,
+            hover_position,
+        );
+    }
+}
+
+fn render_menu_mcp_access(
+    area: Rect,
+    buffer: &mut Buffer,
+    menu: &mut MenuState,
+    hover_position: Option<(u16, u16)>,
+) {
+    render_text(
+        buffer,
+        Rect::new(area.x, area.y, area.width, 1),
+        "MCP access",
+        menu_heading_style(),
+    );
+    for (row, access) in all_mcp_access_levels().iter().enumerate() {
+        if row + 1 >= usize::from(area.height) {
+            break;
+        }
+        let selected = *access == menu.draft.settings.mcp_access;
+        let text = format!("[{}] {}", if selected { "x" } else { " " }, access.label());
+        render_menu_row(
+            buffer,
+            Rect::new(area.x, area.y + row as u16 + 1, area.width, 1),
+            &text,
+            row == menu.mcp_access_cursor,
+            Some(MenuAction::SelectMcpAccess(*access)),
             &mut menu.hits,
             hover_position,
         );
@@ -7384,7 +8294,7 @@ fn menu_item_count(menu: &MenuState, exit_mode: MenuExitMode) -> usize {
         MenuTab::Tasks if menu.task_detail.is_some() => task_detail_fields().len(),
         MenuTab::Tasks if menu.terminal_detail.is_some() => terminal_detail_fields().len(),
         MenuTab::Tasks => task_list_count(menu),
-        MenuTab::Settings => 4,
+        MenuTab::Settings => 5,
         MenuTab::Exit => exit_actions(exit_mode).len() + menu_problems(menu).len(),
     }
 }
@@ -7438,6 +8348,10 @@ fn setting_value_unchanged(menu: &MenuState, field: ConfigSettingField) -> bool 
         }
         ConfigSettingField::Logging => {
             menu.draft.settings.logging == menu.original.settings.logging
+        }
+        ConfigSettingField::McpAccess => {
+            menu.draft.settings.mcp_access == menu.original.settings.mcp_access
+                && menu.draft.settings.mcp_scope_id == menu.original.settings.mcp_scope_id
         }
     }
 }
@@ -7800,6 +8714,7 @@ fn setting_cursor(field: ConfigSettingField) -> usize {
         ConfigSettingField::Leader => 1,
         ConfigSettingField::MultiClick => 2,
         ConfigSettingField::Logging => 3,
+        ConfigSettingField::McpAccess => 4,
     }
 }
 
@@ -7809,6 +8724,7 @@ fn setting_field_label(field: ConfigSettingField) -> &'static str {
         ConfigSettingField::Leader => "leader",
         ConfigSettingField::MultiClick => "multi-click timing",
         ConfigSettingField::Logging => "logging",
+        ConfigSettingField::McpAccess => "MCP access",
     }
 }
 
@@ -7934,6 +8850,18 @@ fn all_leaders() -> &'static [Leader] {
         Leader::CtrlQ,
         Leader::CtrlBackslash,
     ]
+}
+
+fn all_mcp_access_levels() -> &'static [McpAccess] {
+    &[McpAccess::Off, McpAccess::ReadOnly, McpAccess::Full]
+}
+
+fn mcp_access_rank(access: McpAccess) -> u8 {
+    match access {
+        McpAccess::Off => 0,
+        McpAccess::ReadOnly => 1,
+        McpAccess::Full => 2,
+    }
 }
 
 fn unique_task_name(config: &crate::config::Config, base: &str) -> String {
@@ -15383,6 +16311,66 @@ mod tests {
 
         assert!(app.tasks[0].start_requested || app.tasks[0].pid.is_some());
         assert!(app.tasks[1].start_requested || app.tasks[1].pid.is_some());
+    }
+
+    #[test]
+    fn settings_mcp_picker_generates_scope_without_enabling_live_access() {
+        let mut app = test_app();
+        app.open_menu(MenuTab::Settings);
+
+        app.open_menu_mcp_access_picker();
+        app.set_menu_mcp_access(McpAccess::ReadOnly);
+
+        let menu = app.menu.as_ref().unwrap();
+        assert_eq!(menu.draft.settings.mcp_access, McpAccess::ReadOnly);
+        assert!(menu.draft.settings.mcp_scope_id.is_some());
+        assert_eq!(app.loaded.config.settings.mcp_access, McpAccess::Off);
+    }
+
+    #[test]
+    fn control_output_never_contains_composed_tui_content() {
+        let mut app = test_app_with_tasks(vec![test_task("worker")]);
+        app.tasks[0].process_output(b"real process output\r\n");
+        app.tasks[0].status = TaskStatus::Exited {
+            code: 0,
+            success: true,
+            signal: None,
+        };
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buffer = Buffer::empty(area);
+        app.draw_buffer(area, &mut buffer, RenderView::Full);
+        let composed = buffer_text(&buffer, area);
+        assert!(composed.contains("worker"));
+
+        let ControlResponse::Output { output } = app.control_read_output("worker", None, 100)
+        else {
+            panic!("expected output response");
+        };
+        let text = output.lines.join("\n");
+        assert!(text.contains("real process output"));
+        assert!(!text.contains("worker"));
+        assert!(!text.contains("COMMAND"));
+    }
+
+    #[test]
+    fn workspace_render_suppresses_menu_without_changing_live_menu_hits() {
+        let mut app = test_app();
+        app.open_menu(MenuTab::Help);
+        let area = Rect::new(0, 0, 100, 30);
+        let mut full = Buffer::empty(area);
+        app.draw_buffer(area, &mut full, RenderView::Full);
+        let live_hits = app.menu.as_ref().unwrap().hits.clone();
+        assert!(buffer_text(&full, area).contains("Demons Menu"));
+
+        let mut workspace = Buffer::empty(area);
+        let footer_hits = std::mem::take(&mut app.footer_hits);
+        let menu_hits = std::mem::take(&mut app.menu.as_mut().unwrap().hits);
+        app.draw_buffer(area, &mut workspace, RenderView::Workspace);
+        app.footer_hits = footer_hits;
+        app.menu.as_mut().unwrap().hits = menu_hits;
+
+        assert!(!buffer_text(&workspace, area).contains("Demons Menu"));
+        assert_eq!(app.menu.as_ref().unwrap().hits, live_hits);
     }
 
     fn test_task(name: &str) -> Task {

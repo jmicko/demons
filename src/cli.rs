@@ -21,4 +21,19 @@ pub struct Cli {
 pub enum Command {
     /// Open the configurator without starting tasks.
     Init,
+    /// Run the project-scoped Model Context Protocol adapter.
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum McpCommand {
+    /// Serve MCP over standard input and output.
+    Serve {
+        /// Opaque project scope created by the Demons configurator.
+        #[arg(long, hide = true)]
+        scope: String,
+    },
 }

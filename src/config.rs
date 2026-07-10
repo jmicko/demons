@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 pub const CONFIG_FILE: &str = "demons.toml";
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 pub const DEFAULT_MULTI_CLICK_MS: u64 = 500;
 pub const MIN_MULTI_CLICK_MS: u64 = 150;
 pub const MAX_MULTI_CLICK_MS: u64 = 1000;
@@ -49,6 +49,10 @@ pub struct Settings {
     #[serde(default = "default_multi_click_ms")]
     pub multi_click_ms: u64,
     pub logging: bool,
+    #[serde(default)]
+    pub mcp_access: McpAccess,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_scope_id: Option<String>,
 }
 
 impl Default for Settings {
@@ -58,12 +62,50 @@ impl Default for Settings {
             leader: Leader::AltJ,
             multi_click_ms: DEFAULT_MULTI_CLICK_MS,
             logging: false,
+            mcp_access: McpAccess::Off,
+            mcp_scope_id: None,
         }
     }
 }
 
 fn default_multi_click_ms() -> u64 {
     DEFAULT_MULTI_CLICK_MS
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpAccess {
+    #[default]
+    Off,
+    ReadOnly,
+    Full,
+}
+
+impl McpAccess {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::ReadOnly => "Read only",
+            Self::Full => "Full",
+        }
+    }
+
+    pub fn allows_read(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    pub fn allows_write(self) -> bool {
+        matches!(self, Self::Full)
+    }
+
+    fn from_config(value: &str) -> Option<Self> {
+        match value {
+            "off" => Some(Self::Off),
+            "read_only" => Some(Self::ReadOnly),
+            "full" => Some(Self::Full),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -248,6 +290,7 @@ pub enum ConfigSettingField {
     Leader,
     MultiClick,
     Logging,
+    McpAccess,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -637,7 +680,14 @@ fn recover_settings(
     warn_unknown_keys(
         "settings",
         table.keys().map(String::as_str),
-        &["layout", "leader", "multi_click_ms", "logging"],
+        &[
+            "layout",
+            "leader",
+            "multi_click_ms",
+            "logging",
+            "mcp_access",
+            "mcp_scope_id",
+        ],
         ConfigProblemLocation::Settings,
         warnings,
         problems,
@@ -725,11 +775,55 @@ fn recover_settings(
         );
     }
 
+    let mcp_access = match table.get("mcp_access") {
+        Some(value) => match value.as_str().and_then(McpAccess::from_config) {
+            Some(access) => access,
+            None => {
+                push_recovery_warning(
+                    warnings,
+                    problems,
+                    ConfigProblemLocation::Setting(ConfigSettingField::McpAccess),
+                    "Reset invalid settings.mcp_access to \"off\".".to_owned(),
+                );
+                McpAccess::Off
+            }
+        },
+        None => McpAccess::Off,
+    };
+    let mut mcp_scope_id = table
+        .get("mcp_scope_id")
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned);
+    if mcp_scope_id
+        .as_deref()
+        .is_some_and(|scope| uuid::Uuid::parse_str(scope).is_err())
+    {
+        push_recovery_warning(
+            warnings,
+            problems,
+            ConfigProblemLocation::Setting(ConfigSettingField::McpAccess),
+            "Replaced invalid settings.mcp_scope_id.".to_owned(),
+        );
+        mcp_scope_id = None;
+    }
+    if mcp_access.allows_read() && mcp_scope_id.is_none() {
+        let scope = uuid::Uuid::new_v4().to_string();
+        push_recovery_warning(
+            warnings,
+            problems,
+            ConfigProblemLocation::Setting(ConfigSettingField::McpAccess),
+            "Generated a missing MCP project scope ID.".to_owned(),
+        );
+        mcp_scope_id = Some(scope);
+    }
+
     Settings {
         layout,
         leader,
         multi_click_ms,
         logging: false,
+        mcp_access,
+        mcp_scope_id,
     }
 }
 
@@ -1507,6 +1601,29 @@ fn repair_config_for_configurator(
     warnings: &mut Vec<String>,
     problems: &mut Vec<ConfigProblem>,
 ) {
+    if config
+        .settings
+        .mcp_scope_id
+        .as_deref()
+        .is_some_and(|scope| uuid::Uuid::parse_str(scope).is_err())
+    {
+        config.settings.mcp_scope_id = None;
+        push_recovery_warning(
+            warnings,
+            problems,
+            ConfigProblemLocation::Setting(ConfigSettingField::McpAccess),
+            "Replaced invalid settings.mcp_scope_id.".to_owned(),
+        );
+    }
+    if config.settings.mcp_access.allows_read() && config.settings.mcp_scope_id.is_none() {
+        config.settings.mcp_scope_id = Some(uuid::Uuid::new_v4().to_string());
+        push_recovery_warning(
+            warnings,
+            problems,
+            ConfigProblemLocation::Setting(ConfigSettingField::McpAccess),
+            "Generated a missing MCP project scope ID.".to_owned(),
+        );
+    }
     if config.settings.logging {
         config.settings.logging = false;
         push_recovery_warning(
@@ -1524,6 +1641,18 @@ fn repair_config_for_configurator(
             ConfigProblemLocation::Setting(ConfigSettingField::MultiClick),
             format!("Reset invalid settings.multi_click_ms to {DEFAULT_MULTI_CLICK_MS}."),
         );
+    }
+    if config.settings.mcp_access.allows_read()
+        && config
+            .settings
+            .mcp_scope_id
+            .as_deref()
+            .is_none_or(|scope| uuid::Uuid::parse_str(scope).is_err())
+    {
+        problems.push(ConfigProblem::error(
+            ConfigProblemLocation::Setting(ConfigSettingField::McpAccess),
+            "MCP access requires a valid project scope ID.",
+        ));
     }
 
     repair_task_names(config, warnings, problems);
@@ -1787,6 +1916,18 @@ pub fn config_blocking_problems(config: &Config, path: &Path) -> Vec<ConfigProbl
             ),
         ));
     }
+    if config.settings.mcp_access.allows_read()
+        && config
+            .settings
+            .mcp_scope_id
+            .as_deref()
+            .is_none_or(|scope| uuid::Uuid::parse_str(scope).is_err())
+    {
+        problems.push(ConfigProblem::error(
+            ConfigProblemLocation::Setting(ConfigSettingField::McpAccess),
+            "MCP access requires a valid project scope ID.",
+        ));
+    }
 
     let root = path.parent().unwrap_or_else(|| Path::new("."));
     let mut names = HashSet::new();
@@ -2024,6 +2165,18 @@ pub fn validate_for_path(config: &Config, path: &Path) -> Result<()> {
     if !(MIN_MULTI_CLICK_MS..=MAX_MULTI_CLICK_MS).contains(&config.settings.multi_click_ms) {
         bail!(
             "{}: settings.multi_click_ms must be between {MIN_MULTI_CLICK_MS} and {MAX_MULTI_CLICK_MS}",
+            path.display()
+        );
+    }
+    if config.settings.mcp_access.allows_read()
+        && config
+            .settings
+            .mcp_scope_id
+            .as_deref()
+            .is_none_or(|scope| uuid::Uuid::parse_str(scope).is_err())
+    {
+        bail!(
+            "{}: MCP access requires a valid settings.mcp_scope_id UUID",
             path.display()
         );
     }
@@ -2421,7 +2574,7 @@ mod tests {
 
         assert_eq!(loaded.config.schema_version, CURRENT_SCHEMA_VERSION);
         let saved = fs::read_to_string(path).unwrap();
-        assert!(saved.contains("schema_version = 2"));
+        assert!(saved.contains("schema_version = 3"));
         assert!(saved.contains("[settings]"));
         assert!(saved.contains("layout = \"grid\""));
         assert!(saved.contains("leader = \"alt-j\""));
@@ -2465,7 +2618,7 @@ mod tests {
         assert!(
             fs::read_to_string(path)
                 .unwrap()
-                .contains("schema_version = 2")
+                .contains("schema_version = 3")
         );
     }
 
@@ -2615,7 +2768,7 @@ mod tests {
         fs::write(
             &path,
             r#"
-                schema_version = 3
+                schema_version = 4
                 future_setting = true
             "#,
         )
@@ -2625,7 +2778,7 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert!(error.contains("uses config schema_version 3"));
+        assert!(error.contains("uses config schema_version 4"));
     }
 
     #[test]
@@ -2745,7 +2898,7 @@ mod tests {
     fn load_does_not_rewrite_current_version_config() {
         let temp = tempdir().unwrap();
         let path = temp.path().join(CONFIG_FILE);
-        let original = r#"schema_version = 2
+        let original = r#"schema_version = 3
 
 [[task]]
 name = "server"
@@ -2765,7 +2918,7 @@ command = "echo ok"
         fs::write(
             &path,
             r#"
-                schema_version = 3
+                schema_version = 4
                 future_setting = true
             "#,
         )
@@ -2773,8 +2926,8 @@ command = "echo ok"
 
         let error = parse_file(&path).unwrap_err().to_string();
 
-        assert!(error.contains("uses config schema_version 3"));
-        assert!(error.contains("supports schema_version 2"));
+        assert!(error.contains("uses config schema_version 4"));
+        assert!(error.contains("supports schema_version 3"));
     }
 
     #[test]
@@ -3038,5 +3191,81 @@ command = "echo ok"
         )
         .unwrap();
         assert!(validate_for_path(&invalid, &path).is_err());
+    }
+
+    #[test]
+    fn schema_v2_migrates_to_v3_with_mcp_off() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join(CONFIG_FILE);
+        fs::write(
+            &path,
+            r#"
+                schema_version = 2
+
+                [[task]]
+                name = "server"
+                command = "echo ready"
+            "#,
+        )
+        .unwrap();
+
+        let loaded = LoadedConfig::load(path.clone()).unwrap();
+
+        assert_eq!(loaded.config.schema_version, 3);
+        assert_eq!(loaded.config.settings.mcp_access, McpAccess::Off);
+        assert!(loaded.config.settings.mcp_scope_id.is_none());
+        let saved = fs::read_to_string(path).unwrap();
+        assert!(saved.contains("mcp_access = \"off\""));
+    }
+
+    #[test]
+    fn enabled_mcp_requires_a_valid_scope_id() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join(CONFIG_FILE);
+        let mut config = Config::default();
+        config.tasks.push(Task {
+            name: "server".to_owned(),
+            command: TaskCommand::Shell("echo ready".to_owned()),
+            cwd: PathBuf::from("."),
+            env: BTreeMap::new(),
+            depends_on: Vec::new(),
+            start_delay: None,
+            watch: None,
+            run_on_change: None,
+            repeat: None,
+        });
+        config.settings.mcp_access = McpAccess::ReadOnly;
+
+        assert!(validate_for_path(&config, &path).is_err());
+        config.settings.mcp_scope_id = Some(uuid::Uuid::new_v4().to_string());
+        validate_for_path(&config, &path).unwrap();
+    }
+
+    #[test]
+    fn configurator_recovers_missing_enabled_mcp_scope_without_rewriting() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join(CONFIG_FILE);
+        let original = r#"
+            schema_version = 3
+
+            [settings]
+            mcp_access = "read_only"
+
+            [[task]]
+            name = "server"
+            command = "echo ready"
+        "#;
+        fs::write(&path, original).unwrap();
+
+        let loaded = LoadedConfig::load_unvalidated_or_default(path.clone()).unwrap();
+
+        assert!(loaded.config.settings.mcp_scope_id.is_some());
+        assert!(
+            loaded
+                .config_warnings
+                .iter()
+                .any(|warning| warning.contains("scope ID"))
+        );
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
     }
 }

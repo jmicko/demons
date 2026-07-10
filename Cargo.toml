@@ -16,15 +16,25 @@ categories = ["command-line-utilities", "development-tools"]
 [dependencies]
 anyhow = "1.0"
 arboard = { version = "3.6.1", default-features = false }
+base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.29"
+fontdb = "0.23"
+fontdue = "0.9.3"
 libc = "0.2"
+png = "0.18"
 portable-pty = "0.9"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+rmcp = { version = "2.2", features = ["transport-io"] }
+schemars = "1.0"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 signal-hook = "0.3"
+tokio = { version = "1.48", features = ["io-std", "macros", "net", "rt-multi-thread", "sync", "time"] }
 toml = "0.8"
+toml_edit = "0.22"
 unicode-width = "0.2"
+uuid = { version = "1.23", features = ["v4"] }
 vt100 = "0.15"
 
 [dev-dependencies]

@@ -1,7 +1,13 @@
+mod capture;
 mod cli;
+mod codex_config;
 mod config;
+#[cfg(unix)]
+mod control;
 mod init;
 mod layout;
+#[cfg(unix)]
+mod mcp_server;
 mod runtime;
 
 use std::{
@@ -15,7 +21,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 
 use crate::{
-    cli::{Cli, Command},
+    cli::{Cli, Command, McpCommand},
     config::{CONFIG_FILE, LoadedConfig, explicit_or_discover},
 };
 
@@ -32,6 +38,16 @@ fn main() -> ExitCode {
 fn try_main() -> Result<()> {
     let cli = Cli::parse();
     let cwd = env::current_dir().context("failed to determine current directory")?;
+
+    if let Some(Command::Mcp {
+        command: McpCommand::Serve { scope },
+    }) = &cli.command
+    {
+        #[cfg(unix)]
+        return mcp_server::serve(scope.clone());
+        #[cfg(not(unix))]
+        bail!("the Demons MCP adapter currently requires Unix domain sockets");
+    }
 
     if matches!(cli.command, Some(Command::Init)) {
         let path = init_path(cli.config, &cwd)?;

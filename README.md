@@ -72,7 +72,7 @@ then starts them after you fix red problems and save.
 Or create `demons.toml` yourself:
 
 ```toml
-schema_version = 2
+schema_version = 3
 
 [settings]
 layout = "grid"
@@ -193,7 +193,7 @@ can save or discard that change. `Alt+Backtick` is available for one-hand use,
 but some desktops use it for window switching, so it is not the default.
 
 ```toml
-schema_version = 2
+schema_version = 3
 
 [settings]
 leader = "alt-backtick" # also: "tab", "ctrl-b", "ctrl-q", "ctrl-\\"
@@ -223,7 +223,7 @@ while true; do date; sleep 1; done
 String commands run through `$SHELL -c` (falling back to `/bin/sh`):
 
 ```toml
-schema_version = 2
+schema_version = 3
 
 [[task]]
 name = "api"
@@ -237,7 +237,7 @@ depends_on = []
 Array commands execute directly, without shell parsing:
 
 ```toml
-schema_version = 2
+schema_version = 3
 
 [[task]]
 name = "api"
@@ -255,7 +255,7 @@ a task also restarts its dependents. While a task is waiting for a delayed
 start, the pane body shows the countdown to launch.
 
 ```toml
-schema_version = 2
+schema_version = 3
 
 [[task]]
 name = "server"
@@ -278,7 +278,7 @@ start_delay = "3s"
 Use `[[terminal]]` for a regular shell pane that starts alongside tasks:
 
 ```toml
-schema_version = 2
+schema_version = 3
 
 [[terminal]]
 name = "scratch"
