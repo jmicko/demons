@@ -4,6 +4,8 @@ All notable user-facing changes should be recorded here before a release.
 
 ## Unreleased
 
+## 0.3.0 - 2026-07-09
+
 - Added config schema v2 with persistent `[[terminal]]` shell panes, plus a
   session-only `t terminal` command for ad-hoc shells.
 - Added `x close` for the focused session-only terminal while protecting
