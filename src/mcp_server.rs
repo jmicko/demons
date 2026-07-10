@@ -501,7 +501,7 @@ fn response_result(response: ControlResponse) -> Result<CallToolResult, McpError
 
 pub fn serve(scope_id: String, config_path: PathBuf) -> Result<()> {
     uuid::Uuid::parse_str(&scope_id).context("invalid MCP project scope ID")?;
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("failed to initialize MCP runtime")?;
