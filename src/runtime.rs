@@ -6953,6 +6953,7 @@ struct MenuState {
     mcp_access_cursor: usize,
     edit: Option<MenuEdit>,
     path: PathBuf,
+    mcp_integration: codex_config::IntegrationStatus,
     initial_problems: Vec<ConfigProblem>,
     draft: crate::config::Config,
     original: crate::config::Config,
@@ -6966,6 +6967,8 @@ impl MenuState {
         initial_problems: Vec<ConfigProblem>,
         tab: MenuTab,
     ) -> Self {
+        let project_root = path.parent().unwrap_or_else(|| Path::new("."));
+        let mcp_integration = codex_config::inspect(project_root);
         Self {
             tab,
             cursor: 0,
@@ -6983,6 +6986,7 @@ impl MenuState {
             mcp_access_cursor: 0,
             edit: None,
             path,
+            mcp_integration,
             initial_problems,
             draft: config.clone(),
             original: config,
@@ -7951,12 +7955,10 @@ fn render_menu_settings(
     );
     let mcp_rect = Rect::new(area.x, area.y.saturating_add(5), area.width, 1);
     let mcp_badges = setting_problem_badges(&problems, ConfigSettingField::McpAccess);
-    let project_root = menu.path.parent().unwrap_or_else(|| Path::new("."));
-    let integration = codex_config::inspect(project_root);
     let text = format!(
         "MCP access: {} ({})",
         menu.draft.settings.mcp_access.label(),
-        integration.label()
+        menu.mcp_integration.label()
     );
     render_menu_row(
         buffer,
