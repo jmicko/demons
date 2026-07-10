@@ -640,6 +640,8 @@ struct PendingCapture {
     reply: SyncSender<ControlResponse>,
 }
 
+const MAX_PENDING_CONTROL_WAITS: usize = 64;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RenderView {
     Full,
@@ -740,8 +742,7 @@ impl App {
     fn sync_control_listener(&mut self) -> Result<()> {
         let access = self.loaded.config.settings.mcp_access;
         if !access.allows_read() {
-            self.cancel_control_waits("MCP access is disabled");
-            self.control.take();
+            self.disable_control("MCP access is disabled");
             return Ok(());
         }
         let scope = self
@@ -764,6 +765,11 @@ impl App {
         let (listener, rx) = ControlListener::start(&scope, &self.loaded.path)?;
         self.control = Some(ControlRuntime { listener, rx });
         Ok(())
+    }
+
+    fn disable_control(&mut self, message: &str) {
+        self.cancel_control_waits(message);
+        self.control.take();
     }
 
     fn cancel_control_waits(&mut self, message: &str) {
@@ -1090,6 +1096,13 @@ impl App {
             None => self.tasks[index].history.line_count(),
         };
         let timeout = Duration::from_millis(timeout_ms.clamp(1, 60_000));
+        if self.pending_control_waits.len() >= MAX_PENDING_CONTROL_WAITS {
+            self.reply_control(
+                reply,
+                ControlResponse::error("busy", "too many MCP waits are already pending"),
+            );
+            return;
+        }
         self.pending_control_waits.push(PendingControlWait {
             pane_id,
             query: query.map(|query| query.to_ascii_lowercase()),
@@ -1811,7 +1824,7 @@ impl App {
             KeyCode::Char('Y') => self.copy_focused_history(),
             KeyCode::Char('S') => self.save_focused_history()?,
             KeyCode::Char('t') => self.add_session_terminal(),
-            KeyCode::Char('x') => self.close_focused_session_terminal(),
+            KeyCode::Char('x') => self.close_focused_temporary_pane(),
             KeyCode::Char('r') => self.request_restart(self.focus),
             KeyCode::Char('R') => self.request_restart_all(),
             KeyCode::Char('q') => return Ok(self.request_quit()),
@@ -2976,21 +2989,28 @@ impl App {
     }
 
     fn set_menu_mcp_access(&mut self, access: McpAccess) {
-        let Some(menu) = self.menu.as_mut() else {
-            return;
-        };
-        if access.allows_read() && menu.draft.settings.mcp_scope_id.is_none() {
-            menu.draft.settings.mcp_scope_id = Some(uuid::Uuid::new_v4().to_string());
-        }
-        menu.draft.settings.mcp_access = access;
-        menu.mcp_access_picker = false;
-
-        if mcp_access_rank(access) < mcp_access_rank(self.loaded.config.settings.mcp_access) {
-            self.loaded.config.settings.mcp_access = access;
-            if !access.allows_read() {
-                self.cancel_control_waits("MCP access is disabled");
-                self.control.take();
+        let original_access = {
+            let Some(menu) = self.menu.as_mut() else {
+                return;
+            };
+            if access.allows_read() && menu.draft.settings.mcp_scope_id.is_none() {
+                menu.draft.settings.mcp_scope_id = Some(uuid::Uuid::new_v4().to_string());
             }
+            menu.draft.settings.mcp_access = access;
+            menu.mcp_access_picker = false;
+            menu.original.settings.mcp_access
+        };
+
+        // Never grant more live access than the saved config, but restore the
+        // saved level if a temporary reduction is undone before closing.
+        let live_access = if mcp_access_rank(access) < mcp_access_rank(original_access) {
+            access
+        } else {
+            original_access
+        };
+        self.loaded.config.settings.mcp_access = live_access;
+        if let Err(error) = self.sync_control_listener() {
+            self.set_notice(format!("MCP control unavailable: {error:#}"));
         }
     }
 
@@ -3298,11 +3318,12 @@ impl App {
             runtimes.push(runtime);
         }
 
-        for mut runtime in previous
-            .into_iter()
-            .flatten()
-            .filter(|runtime| matches!(runtime.kind, RuntimePaneKind::SessionTerminal))
-        {
+        for mut runtime in previous.into_iter().flatten().filter(|runtime| {
+            matches!(
+                runtime.kind,
+                RuntimePaneKind::SessionTerminal | RuntimePaneKind::McpCommand
+            )
+        }) {
             let unique_name = unique_runtime_pane_name(&runtimes, &runtime.task.name);
             runtime.task.name = unique_name;
             runtimes.push(runtime);
@@ -3997,7 +4018,7 @@ impl App {
             FooterAction::CopyHistory => self.copy_focused_history(),
             FooterAction::SaveHistory => self.save_focused_history()?,
             FooterAction::AddTerminal => self.add_session_terminal(),
-            FooterAction::CloseSessionTerminal => self.close_focused_session_terminal(),
+            FooterAction::CloseSessionTerminal => self.close_focused_temporary_pane(),
             FooterAction::ShowMenu => self.open_menu(MenuTab::Help),
             FooterAction::RestartFocused => self.request_restart(self.focus),
             FooterAction::RestartAll => self.request_restart_all(),
@@ -4031,13 +4052,16 @@ impl App {
         self.set_notice(format!("Added session terminal {name}."));
     }
 
-    fn close_focused_session_terminal(&mut self) {
+    fn close_focused_temporary_pane(&mut self) {
         let index = self.focus;
         let Some(runtime) = self.tasks.get(index) else {
             return;
         };
-        if !matches!(runtime.kind, RuntimePaneKind::SessionTerminal) {
-            self.set_notice("Only session terminals can be closed with x.".to_owned());
+        if !matches!(
+            runtime.kind,
+            RuntimePaneKind::SessionTerminal | RuntimePaneKind::McpCommand
+        ) {
+            self.set_notice("Only temporary panes can be closed with x.".to_owned());
             return;
         }
         let name = runtime.task.name.clone();
@@ -4065,7 +4089,7 @@ impl App {
         }
         self.last_click = None;
         self.countdown_snapshot.clear();
-        self.set_notice(format!("Closed session terminal {name}."));
+        self.set_notice(format!("Closed temporary pane {name}."));
     }
 
     fn toggle_mode(&mut self) {
@@ -4867,7 +4891,10 @@ impl App {
                 command_footer_items(
                     self.selected_text().is_some(),
                     self.tasks.get(self.focus).is_some_and(|runtime| {
-                        matches!(runtime.kind, RuntimePaneKind::SessionTerminal)
+                        matches!(
+                            runtime.kind,
+                            RuntimePaneKind::SessionTerminal | RuntimePaneKind::McpCommand
+                        )
                     }),
                 ),
             ),
@@ -5217,6 +5244,7 @@ impl App {
 
     fn mark_stopping(&mut self) {
         self.stopping = true;
+        self.disable_control("Demons is shutting down");
         for task in &mut self.tasks {
             if task.pid.is_some() {
                 task.status = TaskStatus::Stopping;
@@ -5226,6 +5254,7 @@ impl App {
 
     fn shutdown(&mut self) -> Result<()> {
         self.stopping = true;
+        self.disable_control("Demons is shutting down");
         for task in &mut self.tasks {
             task.restart_requested = false;
             if let Some(pid) = task.pid {
@@ -12447,7 +12476,7 @@ mod tests {
     }
 
     #[test]
-    fn command_footer_only_offers_close_for_session_terminals() {
+    fn command_footer_only_offers_close_for_temporary_panes() {
         let regular = command_footer_items(false, false);
         let session = command_footer_items(false, true);
 
@@ -15185,6 +15214,38 @@ mod tests {
     }
 
     #[test]
+    fn structural_save_preserves_agent_command_panes() {
+        let mut app = test_app();
+        app.tasks_started = true;
+        app.stopping = true;
+        let generation = app.allocate_process_generation();
+        let mut command = TaskRuntime::new_mcp_command(
+            "agent".to_owned(),
+            "printf done".to_owned(),
+            PathBuf::from("."),
+        );
+        command.generation = generation;
+        command.status = TaskStatus::Exited {
+            code: 0,
+            success: true,
+            signal: None,
+        };
+        app.tasks.push(command);
+        app.focus = app.tasks.len() - 1;
+
+        let old = app.loaded.config.clone();
+        app.apply_saved_config(old.clone(), old, RestartMode::None);
+
+        let command = app
+            .tasks
+            .iter()
+            .find(|runtime| matches!(runtime.kind, RuntimePaneKind::McpCommand))
+            .expect("agent command pane should remain tracked");
+        assert_eq!(command.generation, generation);
+        assert_eq!(app.tasks[app.focus].generation, generation);
+    }
+
+    #[test]
     fn terminal_panes_use_sighup_for_graceful_shutdown() {
         let task = TaskRuntime::new_task(test_task("task"), PathBuf::from("."));
         let terminal = TaskRuntime::new_session_terminal(
@@ -15240,7 +15301,7 @@ mod tests {
             last_scroll: Instant::now(),
         });
 
-        app.close_focused_session_terminal();
+        app.close_focused_temporary_pane();
 
         assert_eq!(app.tasks.len(), 4);
         assert_eq!(app.loaded.config.terminals.len(), 1);
@@ -15261,6 +15322,31 @@ mod tests {
     }
 
     #[test]
+    fn close_key_removes_finished_agent_command_pane() {
+        let mut app = test_app();
+        let mut command = TaskRuntime::new_mcp_command(
+            "agent".to_owned(),
+            "printf done".to_owned(),
+            PathBuf::from("."),
+        );
+        command.status = TaskStatus::Exited {
+            code: 0,
+            success: true,
+            signal: None,
+        };
+        app.tasks.push(command);
+        app.focus = app.tasks.len() - 1;
+
+        app.close_focused_temporary_pane();
+
+        assert!(
+            app.tasks
+                .iter()
+                .all(|runtime| !matches!(runtime.kind, RuntimePaneKind::McpCommand))
+        );
+    }
+
+    #[test]
     fn close_key_does_not_remove_configured_panes() {
         let mut app = test_app();
         let original_count = app.tasks.len();
@@ -15272,7 +15358,7 @@ mod tests {
         assert!(
             app.notice
                 .as_ref()
-                .is_some_and(|notice| notice.text.contains("Only session terminals"))
+                .is_some_and(|notice| notice.text.contains("Only temporary panes"))
         );
     }
 
@@ -16358,6 +16444,58 @@ mod tests {
         assert_eq!(menu.draft.settings.mcp_access, McpAccess::ReadOnly);
         assert!(menu.draft.settings.mcp_scope_id.is_some());
         assert_eq!(app.loaded.config.settings.mcp_access, McpAccess::Off);
+    }
+
+    #[test]
+    fn settings_mcp_picker_restores_saved_live_access_when_reverted() {
+        let mut app = test_app();
+        app.loaded.config.settings.mcp_access = McpAccess::Full;
+        app.loaded.config.settings.mcp_scope_id = Some(uuid::Uuid::new_v4().to_string());
+        app.open_menu(MenuTab::Settings);
+
+        app.set_menu_mcp_access(McpAccess::Off);
+        assert_eq!(app.loaded.config.settings.mcp_access, McpAccess::Off);
+        assert!(app.control.is_none());
+
+        app.set_menu_mcp_access(McpAccess::Full);
+        assert_eq!(app.loaded.config.settings.mcp_access, McpAccess::Full);
+        assert!(app.control.is_some());
+        assert!(!app.menu.as_ref().unwrap().dirty());
+    }
+
+    #[test]
+    fn control_waits_are_bounded() {
+        let mut app = test_app();
+        let mut receivers = Vec::new();
+        for _ in 0..MAX_PENDING_CONTROL_WAITS {
+            let (reply, receiver) = mpsc::sync_channel(1);
+            app.start_control_wait(
+                "one".to_owned(),
+                Some("never appears".to_owned()),
+                None,
+                None,
+                60_000,
+                reply,
+            );
+            receivers.push(receiver);
+        }
+
+        let (reply, receiver) = mpsc::sync_channel(1);
+        app.start_control_wait(
+            "one".to_owned(),
+            Some("still absent".to_owned()),
+            None,
+            None,
+            60_000,
+            reply,
+        );
+
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            ControlResponse::Error { code, .. } if code == "busy"
+        ));
+        assert_eq!(app.pending_control_waits.len(), MAX_PENDING_CONTROL_WAITS);
+        drop(receivers);
     }
 
     #[test]
