@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver, SyncSender},
     },
     thread::{self, JoinHandle},
@@ -26,6 +26,7 @@ use crate::config::McpAccess;
 pub const CONTROL_PROTOCOL_VERSION: u32 = 1;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const CONTROL_QUEUE: usize = 64;
+const MAX_CONTROL_CLIENTS: usize = 32;
 const IO_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(65);
 
@@ -313,18 +314,23 @@ fn listener_loop(
     stop: Arc<AtomicBool>,
     info: InstanceInfo,
 ) {
+    let active_clients = Arc::new(AtomicUsize::new(0));
     while !stop.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _)) => {
                 if !peer_is_current_user(&stream) {
                     continue;
                 }
+                let Some(client_guard) = ControlClientGuard::reserve(&active_clients) else {
+                    continue;
+                };
                 let connection_tx = tx.clone();
                 let connection_stop = Arc::clone(&stop);
                 let connection_info = info.clone();
                 thread::Builder::new()
                     .name("demons-control-client".to_owned())
                     .spawn(move || {
+                        let _client_guard = client_guard;
                         connection_loop(stream, connection_tx, connection_stop, connection_info)
                     })
                     .ok();
@@ -337,6 +343,29 @@ fn listener_loop(
     }
 }
 
+struct ControlClientGuard {
+    active: Arc<AtomicUsize>,
+}
+
+impl ControlClientGuard {
+    fn reserve(active: &Arc<AtomicUsize>) -> Option<Self> {
+        active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < MAX_CONTROL_CLIENTS).then_some(count + 1)
+            })
+            .ok()?;
+        Some(Self {
+            active: Arc::clone(active),
+        })
+    }
+}
+
+impl Drop for ControlClientGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 fn connection_loop(
     mut stream: UnixStream,
     tx: SyncSender<ControlEnvelope>,
@@ -346,17 +375,9 @@ fn connection_loop(
     stream.set_read_timeout(Some(IO_POLL_INTERVAL)).ok();
     stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
     while !stop.load(Ordering::Acquire) {
-        let request = match read_frame::<ControlRequest>(&mut stream) {
+        let request = match read_frame_interruptible::<ControlRequest>(&mut stream, &stop) {
             Ok(Some(request)) => request,
             Ok(None) => break,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                ) =>
-            {
-                continue;
-            }
             Err(_) => break,
         };
         if matches!(request, ControlRequest::Ping) {
@@ -689,6 +710,62 @@ fn read_frame<T: for<'de> Deserialize<'de>>(stream: &mut UnixStream) -> io::Resu
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
+fn read_frame_interruptible<T: for<'de> Deserialize<'de>>(
+    stream: &mut UnixStream,
+    stop: &AtomicBool,
+) -> io::Result<Option<T>> {
+    let mut length = [0_u8; 4];
+    if !read_exact_interruptible(stream, &mut length, stop)? {
+        return Ok(None);
+    }
+    let length = u32::from_be_bytes(length) as usize;
+    if length > MAX_CONTROL_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "control frame is too large",
+        ));
+    }
+    let mut payload = vec![0_u8; length];
+    read_exact_interruptible(stream, &mut payload, stop)?;
+    serde_json::from_slice(&payload)
+        .map(Some)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn read_exact_interruptible(
+    stream: &mut UnixStream,
+    buffer: &mut [u8],
+    stop: &AtomicBool,
+) -> io::Result<bool> {
+    let mut offset = 0;
+    while offset < buffer.len() {
+        if stop.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "control listener stopped",
+            ));
+        }
+        match stream.read(&mut buffer[offset..]) {
+            Ok(0) if offset == 0 => return Ok(false),
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "control frame ended early",
+                ));
+            }
+            Ok(read) => offset += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -745,5 +822,48 @@ mod tests {
         assert_eq!(decode_cursor(&cursor, "instance-a", "server").unwrap(), 42);
         assert!(decode_cursor(&cursor, "instance-b", "server").is_err());
         assert!(decode_cursor(&cursor, "instance-a", "client").is_err());
+    }
+
+    #[test]
+    fn control_client_count_is_bounded() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let guards = (0..MAX_CONTROL_CLIENTS)
+            .map(|_| ControlClientGuard::reserve(&active).unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(ControlClientGuard::reserve(&active).is_none());
+        drop(guards);
+        assert!(ControlClientGuard::reserve(&active).is_some());
+    }
+
+    #[test]
+    fn interruptible_reader_preserves_fragmented_frames_across_timeouts() {
+        let request = ControlRequest::ReadOutput {
+            pane_id: "server".to_owned(),
+            cursor: None,
+            max_lines: 20,
+        };
+        let payload = serde_json::to_vec(&request).unwrap();
+        let mut frame = Vec::with_capacity(payload.len() + 4);
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_millis(5)))
+            .unwrap();
+        let writer_thread = thread::spawn(move || {
+            writer.write_all(&frame[..2]).unwrap();
+            thread::sleep(Duration::from_millis(20));
+            writer.write_all(&frame[2..7]).unwrap();
+            thread::sleep(Duration::from_millis(20));
+            writer.write_all(&frame[7..]).unwrap();
+        });
+
+        let stop = AtomicBool::new(false);
+        assert_eq!(
+            read_frame_interruptible(&mut reader, &stop).unwrap(),
+            Some(request)
+        );
+        writer_thread.join().unwrap();
     }
 }
