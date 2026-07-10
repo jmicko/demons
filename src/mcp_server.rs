@@ -39,7 +39,7 @@ struct ReadOutputRequest {
     /// Pane identifier returned by list_panes.
     pane_id: String,
     /// Opaque line cursor returned by a previous read. Omit to read the newest lines.
-    cursor: Option<u64>,
+    cursor: Option<String>,
     /// Maximum physical terminal lines to return. Defaults to 200 and is capped at 1000.
     max_lines: Option<u32>,
     /// Required only when more than one running Demons instance uses this project scope.
@@ -69,7 +69,7 @@ struct WaitOutputRequest {
     /// Optional status to wait for: running, exited, failed, stopped, or another list_panes status.
     status: Option<String>,
     /// Search only output at or after this cursor. Omit to wait for new output.
-    after_cursor: Option<u64>,
+    after_cursor: Option<String>,
     /// Timeout in milliseconds. Defaults to 30000 and is capped at 60000.
     timeout_ms: Option<u64>,
     /// Required only when more than one running Demons instance uses this project scope.

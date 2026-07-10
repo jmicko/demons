@@ -18,6 +18,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 
 use crate::config::McpAccess;
@@ -65,8 +66,8 @@ pub struct PaneInfo {
 pub struct OutputPage {
     pub pane_id: String,
     pub first_line: u64,
-    pub next_cursor: u64,
-    pub end_cursor: u64,
+    pub next_cursor: String,
+    pub end_cursor: String,
     pub truncated_before_cursor: bool,
     pub lines: Vec<String>,
 }
@@ -94,7 +95,7 @@ pub struct WaitResult {
     pub matched: bool,
     pub timed_out: bool,
     pub status: String,
-    pub cursor: u64,
+    pub cursor: String,
     pub line: Option<u64>,
 }
 
@@ -127,7 +128,7 @@ pub enum ControlRequest {
     ListPanes,
     ReadOutput {
         pane_id: String,
-        cursor: Option<u64>,
+        cursor: Option<String>,
         max_lines: u32,
     },
     SearchOutput {
@@ -140,7 +141,7 @@ pub enum ControlRequest {
         pane_id: String,
         query: Option<String>,
         status: Option<String>,
-        after_cursor: Option<u64>,
+        after_cursor: Option<String>,
         timeout_ms: u64,
     },
     RestartTask {
@@ -212,6 +213,36 @@ impl ControlResponse {
 pub struct ControlEnvelope {
     pub request: ControlRequest,
     pub reply: SyncSender<ControlResponse>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CursorToken {
+    version: u8,
+    instance_id: String,
+    pane_id: String,
+    line: u64,
+}
+
+pub fn encode_cursor(instance_id: &str, pane_id: &str, line: u64) -> String {
+    let token = CursorToken {
+        version: 1,
+        instance_id: instance_id.to_owned(),
+        pane_id: pane_id.to_owned(),
+        line,
+    };
+    URL_SAFE_NO_PAD.encode(serde_json::to_vec(&token).expect("cursor token serializes"))
+}
+
+pub fn decode_cursor(token: &str, instance_id: &str, pane_id: &str) -> Result<u64> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(token)
+        .context("cursor is not a valid Demons cursor")?;
+    let cursor: CursorToken =
+        serde_json::from_slice(&bytes).context("cursor is not a valid Demons cursor")?;
+    if cursor.version != 1 || cursor.instance_id != instance_id || cursor.pane_id != pane_id {
+        bail!("cursor belongs to a different Demons instance or pane");
+    }
+    Ok(cursor.line)
 }
 
 pub struct ControlListener {
@@ -375,39 +406,52 @@ fn connection_loop(
 
 pub fn discover_instances(scope_id: &str) -> Result<Vec<InstanceInfo>> {
     uuid::Uuid::parse_str(scope_id).context("invalid MCP project scope ID")?;
-    let dir = runtime_dir()?;
     let prefix = format!("{scope_id}-");
     let mut instances = Vec::new();
-    for entry in fs::read_dir(&dir).with_context(|| format!("failed to read {}", dir.display()))? {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => continue,
+    for dir in runtime_dir_candidates()? {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to read {}", dir.display()));
+            }
         };
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if !name.starts_with(&prefix) || !name.ends_with(".json") {
-            continue;
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => continue,
+            };
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with(&prefix) || !name.ends_with(".json") {
+                continue;
+            }
+            let path = entry.path();
+            if !owned_regular_file(&path) {
+                continue;
+            }
+            let info = match fs::read_to_string(&path)
+                .ok()
+                .and_then(|source| serde_json::from_str::<InstanceInfo>(&source).ok())
+            {
+                Some(info) => info,
+                None => continue,
+            };
+            if info.scope_id != scope_id || info.protocol_version != CONTROL_PROTOCOL_VERSION {
+                continue;
+            }
+            if !process_is_alive(info.pid) || !owned_socket(&info.socket_path) {
+                remove_owned_file_if_present(&path).ok();
+                remove_owned_file_if_present(&info.socket_path).ok();
+                continue;
+            }
+            if !instances
+                .iter()
+                .any(|existing: &InstanceInfo| existing.instance_id == info.instance_id)
+            {
+                instances.push(info);
+            }
         }
-        let path = entry.path();
-        if !owned_regular_file(&path) {
-            continue;
-        }
-        let info = match fs::read_to_string(&path)
-            .ok()
-            .and_then(|source| serde_json::from_str::<InstanceInfo>(&source).ok())
-        {
-            Some(info) => info,
-            None => continue,
-        };
-        if info.scope_id != scope_id || info.protocol_version != CONTROL_PROTOCOL_VERSION {
-            continue;
-        }
-        if !process_is_alive(info.pid) || !owned_socket(&info.socket_path) {
-            remove_owned_file_if_present(&path).ok();
-            remove_owned_file_if_present(&info.socket_path).ok();
-            continue;
-        }
-        instances.push(info);
     }
     instances.sort_by(|left, right| left.instance_id.cmp(&right.instance_id));
     Ok(instances)
@@ -436,15 +480,51 @@ pub fn authorize(access: McpAccess, request: &ControlRequest) -> Result<()> {
 }
 
 fn runtime_dir() -> Result<PathBuf> {
+    let candidates = runtime_dir_candidates()?;
+    let dir = candidates
+        .first()
+        .cloned()
+        .context("no safe runtime directory is available")?;
     let uid = unsafe { libc::geteuid() };
-    let base = env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .unwrap_or_else(|| env::temp_dir().join(format!("demons-{uid}")));
-    ensure_private_dir(&base, uid)?;
-    let dir = base.join("demons");
     ensure_private_dir(&dir, uid)?;
     Ok(dir)
+}
+
+fn runtime_dir_candidates() -> Result<Vec<PathBuf>> {
+    let uid = unsafe { libc::geteuid() };
+    let mut bases = Vec::new();
+    if let Some(path) = env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    {
+        bases.push(path);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let path = PathBuf::from(format!("/run/user/{uid}"));
+        if path.is_dir() && !bases.contains(&path) {
+            bases.push(path);
+        }
+    }
+    let fallback = env::temp_dir().join(format!("demons-{uid}"));
+    if !bases.contains(&fallback) {
+        bases.push(fallback);
+    }
+
+    let mut directories = Vec::new();
+    for base in bases {
+        if ensure_private_dir(&base, uid).is_err() {
+            continue;
+        }
+        let directory = base.join("demons");
+        if ensure_private_dir(&directory, uid).is_ok() {
+            directories.push(directory);
+        }
+    }
+    if directories.is_empty() {
+        bail!("no safe runtime directory is available");
+    }
+    Ok(directories)
 }
 
 fn ensure_private_dir(path: &Path, uid: u32) -> Result<()> {
@@ -611,5 +691,13 @@ mod tests {
             write_frame(&mut left, &request).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
+    }
+
+    #[test]
+    fn cursors_are_bound_to_instance_and_pane() {
+        let cursor = encode_cursor("instance-a", "server", 42);
+        assert_eq!(decode_cursor(&cursor, "instance-a", "server").unwrap(), 42);
+        assert!(decode_cursor(&cursor, "instance-b", "server").is_err());
+        assert!(decode_cursor(&cursor, "instance-a", "client").is_err());
     }
 }

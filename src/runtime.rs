@@ -938,6 +938,13 @@ impl App {
         self.tasks.iter().position(|task| task.task.name == pane_id)
     }
 
+    fn control_instance_id(&self) -> &str {
+        self.control
+            .as_ref()
+            .map(|control| control.listener.info.instance_id.as_str())
+            .unwrap_or("local-test-instance")
+    }
+
     fn control_panes(&self) -> Vec<PaneInfo> {
         self.tasks.iter().map(TaskRuntime::control_info).collect()
     }
@@ -945,7 +952,7 @@ impl App {
     fn control_read_output(
         &self,
         pane_id: &str,
-        cursor: Option<u64>,
+        cursor: Option<String>,
         max_lines: u32,
     ) -> ControlResponse {
         let Some(index) = self.control_pane_index(pane_id) else {
@@ -954,7 +961,14 @@ impl App {
         let history = &self.tasks[index].history;
         let limit = max_lines.clamp(1, 1_000) as u64;
         let end = history.line_count();
-        let requested = cursor.unwrap_or_else(|| end.saturating_sub(limit));
+        let instance_id = self.control_instance_id();
+        let requested = match cursor {
+            Some(cursor) => match control::decode_cursor(&cursor, instance_id, pane_id) {
+                Ok(line) => line,
+                Err(error) => return ControlResponse::error("invalid_cursor", error.to_string()),
+            },
+            None => end.saturating_sub(limit),
+        };
         let start = requested.max(history.first_index).min(end);
         let page_end = start.saturating_add(limit).min(end);
         let lines = (start..page_end)
@@ -968,8 +982,8 @@ impl App {
             output: OutputPage {
                 pane_id: pane_id.to_owned(),
                 first_line: start,
-                next_cursor: page_end,
-                end_cursor: end,
+                next_cursor: control::encode_cursor(instance_id, pane_id, page_end),
+                end_cursor: control::encode_cursor(instance_id, pane_id, end),
                 truncated_before_cursor: requested < history.first_index,
                 lines,
             },
@@ -1042,7 +1056,7 @@ impl App {
         pane_id: String,
         query: Option<String>,
         status: Option<String>,
-        after_cursor: Option<u64>,
+        after_cursor: Option<String>,
         timeout_ms: u64,
         reply: SyncSender<ControlResponse>,
     ) {
@@ -1060,7 +1074,21 @@ impl App {
             );
             return;
         }
-        let after_cursor = after_cursor.unwrap_or_else(|| self.tasks[index].history.line_count());
+        let after_cursor = match after_cursor {
+            Some(cursor) => {
+                match control::decode_cursor(&cursor, self.control_instance_id(), &pane_id) {
+                    Ok(line) => line,
+                    Err(error) => {
+                        self.reply_control(
+                            reply,
+                            ControlResponse::error("invalid_cursor", error.to_string()),
+                        );
+                        return;
+                    }
+                }
+            }
+            None => self.tasks[index].history.line_count(),
+        };
         let timeout = Duration::from_millis(timeout_ms.clamp(1, 60_000));
         self.pending_control_waits.push(PendingControlWait {
             pane_id,
@@ -1105,6 +1133,11 @@ impl App {
                 )
             });
             if status_match || line_match.is_some() || now >= wait.deadline {
+                let cursor = control::encode_cursor(
+                    self.control_instance_id(),
+                    &wait.pane_id,
+                    task.history.line_count(),
+                );
                 wait.reply
                     .try_send(ControlResponse::Wait {
                         result: WaitResult {
@@ -1114,7 +1147,7 @@ impl App {
                                 && !status_match
                                 && line_match.is_none(),
                             status,
-                            cursor: task.history.line_count(),
+                            cursor,
                             line: line_match,
                         },
                     })
