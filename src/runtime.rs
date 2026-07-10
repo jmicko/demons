@@ -8243,6 +8243,28 @@ fn render_scene(area: Rect, scene: SceneState, frame: u64, buffer: &mut Buffer) 
     if area.width == 0 || area.height == 0 {
         return;
     }
+    let visible = area.intersection(buffer.area);
+    if visible.width == 0 || visible.height == 0 {
+        return;
+    }
+
+    // Scene helpers can use frame-relative clipping primitives without ever
+    // reaching pane borders or neighboring slots.
+    let mut scene_buffer = Buffer::empty(area);
+    for y in visible.y..visible.bottom() {
+        for x in visible.x..visible.right() {
+            scene_buffer[(x, y)].clone_from(&buffer[(x, y)]);
+        }
+    }
+    render_scene_contents(area, scene, frame, &mut scene_buffer);
+    for y in visible.y..visible.bottom() {
+        for x in visible.x..visible.right() {
+            buffer[(x, y)].clone_from(&scene_buffer[(x, y)]);
+        }
+    }
+}
+
+fn render_scene_contents(area: Rect, scene: SceneState, frame: u64, buffer: &mut Buffer) {
     clear_rect(buffer, area, pane_style());
     match scene.kind {
         SceneKind::Fireplace => render_fireplace(area, scene.seed, frame, buffer),
@@ -8699,24 +8721,27 @@ fn render_skating_pines(area: Rect, snowbank_y: u16, seed: u64, buffer: &mut Buf
         if y <= area.y {
             continue;
         }
-        render_scene_text_clipped(
+        render_scene_text_in_rect(
             buffer,
+            area,
             i32::from(x).saturating_sub(1),
             i32::from(y),
             "▲",
             pane_style().fg(THEME_GREEN_HOVER),
         );
         if height >= 3 {
-            render_scene_text_clipped(
+            render_scene_text_in_rect(
                 buffer,
+                area,
                 i32::from(x).saturating_sub(2),
                 i32::from(y + 1),
                 "▲▲▲",
                 pane_style().fg(THEME_GREEN),
             );
         }
-        render_scene_text_clipped(
+        render_scene_text_in_rect(
             buffer,
+            area,
             i32::from(x).saturating_sub(1),
             i32::from(y + height.saturating_sub(1)),
             "▐▌",
@@ -13166,6 +13191,45 @@ mod tests {
     }
 
     #[test]
+    fn skating_pines_do_not_cross_scene_edges() {
+        let buffer_area = Rect::new(0, 0, 70, 16);
+        let scene_area = Rect::new(18, 2, 30, 11);
+        let snowbank_y = scene_area.bottom() - 5;
+
+        for seed in 0..128 {
+            let mut buffer = Buffer::empty(buffer_area);
+            fill_buffer_with_sentinel(&mut buffer, buffer_area);
+
+            render_skating_pines(scene_area, snowbank_y, seed, &mut buffer);
+
+            assert_scene_exterior_untouched(&buffer, buffer_area, scene_area);
+        }
+    }
+
+    #[test]
+    fn every_scene_is_clipped_to_its_assigned_rectangle() {
+        let buffer_area = Rect::new(0, 0, 100, 28);
+        let scene_area = Rect::new(20, 4, 60, 20);
+        for kind in [
+            SceneKind::Fireplace,
+            SceneKind::Snow,
+            SceneKind::Tree,
+            SceneKind::Santa,
+            SceneKind::Jack,
+            SceneKind::Skating,
+            SceneKind::Sleigh,
+            SceneKind::Road,
+        ] {
+            let mut buffer = Buffer::empty(buffer_area);
+            fill_buffer_with_sentinel(&mut buffer, buffer_area);
+
+            render_scene(scene_area, SceneState { kind, seed: 42 }, 24, &mut buffer);
+
+            assert_scene_exterior_untouched(&buffer, buffer_area, scene_area);
+        }
+    }
+
+    #[test]
     fn skating_tracks_do_not_look_like_extra_legs() {
         let area = Rect::new(0, 0, 34, 8);
         let lake_y = 4;
@@ -15348,6 +15412,29 @@ mod tests {
             false,
             false,
         )
+    }
+
+    fn fill_buffer_with_sentinel(buffer: &mut Buffer, area: Rect) {
+        let style = Style::default().fg(Color::Magenta).bg(Color::Blue);
+        for y in area.y..area.bottom() {
+            for x in area.x..area.right() {
+                buffer[(x, y)].set_symbol("!").set_style(style);
+            }
+        }
+    }
+
+    fn assert_scene_exterior_untouched(buffer: &Buffer, area: Rect, scene: Rect) {
+        for y in area.y..area.bottom() {
+            for x in area.x..area.right() {
+                if contains(scene, x, y) {
+                    continue;
+                }
+                let cell = &buffer[(x, y)];
+                assert_eq!(cell.symbol(), "!", "scene leaked to ({x}, {y})");
+                assert_eq!(cell.fg, Color::Magenta, "scene restyled ({x}, {y})");
+                assert_eq!(cell.bg, Color::Blue, "scene restyled ({x}, {y})");
+            }
+        }
     }
 
     fn buffer_line(buffer: &Buffer, row: u16, width: u16) -> String {
