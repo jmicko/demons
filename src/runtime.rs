@@ -3072,7 +3072,14 @@ impl App {
             let Some(menu) = self.menu.as_mut() else {
                 return;
             };
-            if access.allows_read() && menu.draft.settings.mcp_scope_id.is_none() {
+            if access.allows_read()
+                && menu
+                    .draft
+                    .settings
+                    .mcp_scope_id
+                    .as_deref()
+                    .is_none_or(|scope| uuid::Uuid::parse_str(scope).is_err())
+            {
                 menu.draft.settings.mcp_scope_id = Some(uuid::Uuid::new_v4().to_string());
             }
             menu.draft.settings.mcp_access = access;
@@ -16586,6 +16593,27 @@ mod tests {
         assert_eq!(menu.draft.settings.mcp_access, McpAccess::ReadOnly);
         assert!(menu.draft.settings.mcp_scope_id.is_some());
         assert_eq!(app.loaded.config.settings.mcp_access, McpAccess::Off);
+    }
+
+    #[test]
+    fn settings_mcp_picker_replaces_an_invalid_managed_scope() {
+        let mut app = test_app();
+        app.loaded.config.settings.mcp_scope_id = Some("not-a-uuid".to_owned());
+        app.open_menu(MenuTab::Settings);
+
+        app.open_menu_mcp_access_picker();
+        app.set_menu_mcp_access(McpAccess::ReadOnly);
+
+        let scope = app
+            .menu
+            .as_ref()
+            .unwrap()
+            .draft
+            .settings
+            .mcp_scope_id
+            .as_deref()
+            .unwrap();
+        assert!(uuid::Uuid::parse_str(scope).is_ok());
     }
 
     #[test]
