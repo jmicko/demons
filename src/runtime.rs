@@ -641,6 +641,8 @@ struct PendingCapture {
 }
 
 const MAX_PENDING_CONTROL_WAITS: usize = 64;
+const MAX_CONTROL_QUERY_BYTES: usize = 4 * 1024;
+const MAX_CONTROL_PANE_NAME_CHARS: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RenderView {
@@ -1007,8 +1009,8 @@ impl App {
         max_results: u32,
         context_lines: u32,
     ) -> ControlResponse {
-        if query.trim().is_empty() {
-            return ControlResponse::error("invalid_request", "search query cannot be empty");
+        if let Err(message) = validate_control_query(query) {
+            return ControlResponse::error("invalid_request", message);
         }
         let Some(index) = self.control_pane_index(pane_id) else {
             return ControlResponse::error("not_found", format!("pane {pane_id:?} was not found"));
@@ -1077,10 +1079,29 @@ impl App {
             );
             return;
         };
-        if query.as_deref().is_none_or(|query| query.trim().is_empty()) && status.is_none() {
+        if query.is_none() && status.is_none() {
             self.reply_control(
                 reply,
                 ControlResponse::error("invalid_request", "wait requires query or status"),
+            );
+            return;
+        }
+        if let Some(query) = query.as_deref()
+            && let Err(message) = validate_control_query(query)
+        {
+            self.reply_control(reply, ControlResponse::error("invalid_request", message));
+            return;
+        }
+        let status = status.map(|status| status.to_ascii_lowercase());
+        if let Some(status) = status.as_deref()
+            && !valid_control_status(status)
+        {
+            self.reply_control(
+                reply,
+                ControlResponse::error(
+                    "invalid_request",
+                    format!("unknown pane status {status:?}"),
+                ),
             );
             return;
         }
@@ -1110,7 +1131,7 @@ impl App {
         self.pending_control_waits.push(PendingControlWait {
             pane_id,
             query: query.map(|query| query.to_ascii_lowercase()),
-            status: status.map(|status| status.to_ascii_lowercase()),
+            status,
             after_cursor,
             deadline: Instant::now() + timeout,
             reply,
@@ -1214,7 +1235,7 @@ impl App {
         if submit {
             bytes.push(b'\r');
         }
-        match self.tasks[index].write_input(&bytes) {
+        match self.tasks[index].write_input_checked(&bytes) {
             Ok(()) => {
                 self.set_notice(format!("Agent sent input to pane {pane_id}."));
                 ControlResponse::Ok {
@@ -1258,11 +1279,25 @@ impl App {
             Ok(_) => return ControlResponse::error("invalid_cwd", "cwd is not a directory"),
             Err(error) => return ControlResponse::error("invalid_cwd", error.to_string()),
         };
-        let base = name
-            .as_deref()
-            .map(str::trim)
-            .filter(|name| !name.is_empty() && !name.chars().any(char::is_control))
-            .unwrap_or("agent");
+        let base = match name.as_deref() {
+            None => "agent",
+            Some(name)
+                if !name.is_empty()
+                    && name.trim() == name
+                    && !name.chars().any(char::is_control)
+                    && name.chars().count() <= MAX_CONTROL_PANE_NAME_CHARS =>
+            {
+                name
+            }
+            Some(_) => {
+                return ControlResponse::error(
+                    "invalid_request",
+                    format!(
+                        "pane name must be 1-{MAX_CONTROL_PANE_NAME_CHARS} characters with no surrounding whitespace or control characters"
+                    ),
+                );
+            }
+        };
         let name = unique_runtime_pane_name(&self.tasks, base);
         let mut runtime = TaskRuntime::new_mcp_command(name.clone(), command, cwd);
         runtime.start_requested = true;
@@ -5593,8 +5628,13 @@ impl TaskRuntime {
     }
 
     fn write_input(&mut self, bytes: &[u8]) -> Result<()> {
+        self.write_input_checked(bytes).ok();
+        Ok(())
+    }
+
+    fn write_input_checked(&mut self, bytes: &[u8]) -> Result<()> {
         let Some(writer) = self.writer.as_mut() else {
-            return Ok(());
+            anyhow::bail!("pane is not accepting input");
         };
         let result = writer.write_all(bytes).and_then(|()| writer.flush());
         if let Err(error) = result {
@@ -5602,6 +5642,7 @@ impl TaskRuntime {
             self.message(&format!(
                 "\r\n\x1b[31m[demons] task input closed: {error}\x1b[0m\r\n"
             ));
+            return Err(error).context("failed to write pane input");
         }
         Ok(())
     }
@@ -5825,6 +5866,32 @@ fn control_status_matches(wanted: &str, current: &str) -> bool {
         "stopped" => matches!(current, "exited" | "failed" | "not_started"),
         other => current == other,
     }
+}
+
+fn validate_control_query(query: &str) -> std::result::Result<(), &'static str> {
+    if query.trim().is_empty() {
+        return Err("search query cannot be empty");
+    }
+    if query.len() > MAX_CONTROL_QUERY_BYTES || query.chars().any(char::is_control) {
+        return Err("search query must be at most 4096 bytes and contain no control characters");
+    }
+    Ok(())
+}
+
+fn valid_control_status(status: &str) -> bool {
+    matches!(
+        status,
+        "not_started"
+            | "waiting"
+            | "starting"
+            | "running"
+            | "restarting"
+            | "stopping"
+            | "failed"
+            | "exited"
+            | "finished"
+            | "stopped"
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -12066,6 +12133,18 @@ mod tests {
 
     use super::*;
 
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "test failure"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
     }
@@ -16548,6 +16627,80 @@ mod tests {
         let app = test_app();
 
         assert!(app.capture_worker.is_none());
+    }
+
+    #[test]
+    fn control_search_rejects_empty_and_oversized_queries() {
+        let app = test_app();
+
+        for query in ["\n".to_owned(), "x".repeat(MAX_CONTROL_QUERY_BYTES + 1)] {
+            assert!(matches!(
+                app.control_search_output("one", &query, 10, 0),
+                ControlResponse::Error { code, .. } if code == "invalid_request"
+            ));
+        }
+    }
+
+    #[test]
+    fn control_wait_rejects_unknown_status_immediately() {
+        let mut app = test_app();
+        let (reply, receiver) = mpsc::sync_channel(1);
+
+        app.start_control_wait(
+            "one".to_owned(),
+            None,
+            Some("mystery".to_owned()),
+            None,
+            60_000,
+            reply,
+        );
+
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            ControlResponse::Error { code, .. } if code == "invalid_request"
+        ));
+        assert!(app.pending_control_waits.is_empty());
+    }
+
+    #[test]
+    fn control_send_input_reports_pty_write_failure() {
+        let mut app = test_app();
+        app.tasks[0].writer = Some(Box::new(FailingWriter));
+
+        let response = app.control_send_input("one", "hello", true);
+
+        assert!(matches!(
+            response,
+            ControlResponse::Error { code, .. } if code == "input_failed"
+        ));
+        assert!(app.tasks[0].writer.is_none());
+        assert!(
+            app.tasks[0]
+                .history
+                .all_text()
+                .contains("task input closed")
+        );
+    }
+
+    #[test]
+    fn control_run_command_rejects_invalid_pane_name() {
+        let mut app = test_app();
+
+        let response = app.control_run_command(
+            "printf ready".to_owned(),
+            None,
+            Some(" bad name ".to_owned()),
+        );
+
+        assert!(matches!(
+            response,
+            ControlResponse::Error { code, .. } if code == "invalid_request"
+        ));
+        assert!(
+            app.tasks
+                .iter()
+                .all(|runtime| !matches!(runtime.kind, RuntimePaneKind::McpCommand))
+        );
     }
 
     #[test]
