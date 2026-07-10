@@ -67,3 +67,19 @@ fn init_requires_an_interactive_terminal() {
             .contains("demons init requires an interactive terminal")
     );
 }
+
+#[test]
+fn mcp_serve_requires_an_explicit_config() {
+    let output = demons()
+        .args([
+            "mcp",
+            "serve",
+            "--scope",
+            "5c031294-e447-46cf-9381-622869ec6f06",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("demons mcp serve requires --config"));
+}
