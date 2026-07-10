@@ -66,7 +66,7 @@ const SCENE_FRAME_INTERVAL: Duration = Duration::from_millis(350);
 const NOTICE_DURATION: Duration = Duration::from_secs(6);
 #[cfg(not(test))]
 const SYSTEM_CLIPBOARD_WAIT: Duration = Duration::from_millis(150);
-const MAX_FULL_HISTORY_OSC52_BYTES: usize = 512 * 1024;
+const MAX_OSC52_BYTES: usize = 512 * 1024;
 const BRACKETED_PASTE_START: &str = "\x1b[200~";
 const BRACKETED_PASTE_END: &str = "\x1b[201~";
 const DEV_SCENE_ENV: &str = "DEMONS_DEV_SCENE";
@@ -3708,13 +3708,22 @@ impl App {
         };
         let pane = self.selection.as_ref().map(|selection| selection.pane);
         self.clipboard = text.clone();
-        let copied = write_clipboard(&text, true);
+        let copied = write_clipboard(&text);
         let chars = text.chars().count();
         let suffix = pane
             .and_then(|pane| self.tasks.get(pane))
             .map(|task| format!(" from {}", task.task.name))
             .unwrap_or_default();
-        if copied.system_or_terminal() {
+        if text.len() > MAX_OSC52_BYTES {
+            let destination = if copied.system {
+                "to the system clipboard"
+            } else {
+                "internally"
+            };
+            self.set_notice(format!(
+                "Copied {chars} characters{suffix} {destination}; too large for OSC 52."
+            ));
+        } else if copied.system_or_terminal() {
             self.set_notice(format!("Copied {chars} characters{suffix}."));
         } else {
             self.set_notice(format!("Copied {chars} characters internally{suffix}."));
@@ -3743,20 +3752,24 @@ impl App {
         }
 
         self.clipboard = text.clone();
-        let osc52_allowed = text.len() <= MAX_FULL_HISTORY_OSC52_BYTES;
-        let copied = write_clipboard(&text, osc52_allowed);
+        let copied = write_clipboard(&text);
         let chars = text.chars().count();
-        if copied.system_or_terminal() {
+        if text.len() > MAX_OSC52_BYTES {
+            let destination = if copied.system {
+                "to the system clipboard"
+            } else {
+                "internally"
+            };
+            self.set_notice(format!(
+                "Copied {chars} history characters from {task_name} {destination}; too large for OSC 52."
+            ));
+        } else if copied.system_or_terminal() {
             self.set_notice(format!(
                 "Copied {chars} history characters from {task_name}."
             ));
-        } else if osc52_allowed {
-            self.set_notice(format!(
-                "Copied {chars} history characters from {task_name} internally."
-            ));
         } else {
             self.set_notice(format!(
-                "Copied {chars} history characters from {task_name} internally; too large for OSC 52."
+                "Copied {chars} history characters from {task_name} internally."
             ));
         }
     }
@@ -3782,7 +3795,7 @@ impl App {
         let path = write_history_log(dir, &task_name, &text)?;
         let path_text = path.display().to_string();
         self.clipboard = path_text.clone();
-        let copied = write_clipboard(&path_text, true);
+        let copied = write_clipboard(&path_text);
         if copied.system_or_terminal() {
             self.set_notice(format!(
                 "Saved {task_name} scrollback to {path_text}; path copied."
@@ -10678,10 +10691,10 @@ impl ClipboardWrite {
     }
 }
 
-fn write_clipboard(text: &str, allow_osc52: bool) -> ClipboardWrite {
+fn write_clipboard(text: &str) -> ClipboardWrite {
     ClipboardWrite {
         system: write_system_clipboard(text).is_ok(),
-        terminal: allow_osc52 && write_osc52_clipboard(text).is_ok(),
+        terminal: text.len() <= MAX_OSC52_BYTES && write_osc52_clipboard(text).is_ok(),
     }
 }
 
@@ -12348,6 +12361,58 @@ mod tests {
             .unwrap();
 
         assert_eq!(app.clipboard, "XY");
+    }
+
+    #[test]
+    fn oversized_selection_skips_osc52_but_remains_copyable() {
+        let mut app = test_app();
+        let line = format!("{}\n", "x".repeat(79));
+        for _ in 0..7_000 {
+            app.tasks[0].history.process(line.as_bytes());
+        }
+        let first = app.tasks[0].history.first_index;
+        let last = app.tasks[0].history.line_count().saturating_sub(1);
+        app.selection = Some(Selection {
+            pane: 0,
+            anchor: SelectionPoint {
+                line: first,
+                column: 0,
+            },
+            cursor: SelectionPoint {
+                line: last,
+                column: u16::MAX,
+            },
+            granularity: SelectionGranularity::Character,
+            origin: None,
+            history_backed: true,
+            parser_anchor: None,
+            parser_cursor: None,
+            parser_origin: None,
+            dragging: false,
+            dragged: true,
+            last_mouse: None,
+            last_scroll: Instant::now(),
+        });
+
+        assert!(app.copy_selection());
+
+        assert!(app.clipboard.len() > MAX_OSC52_BYTES);
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|notice| notice.text.contains("too large for OSC 52"))
+        );
+    }
+
+    #[test]
+    fn clipboard_writer_enforces_osc52_byte_limit() {
+        let at_limit = write_clipboard(&"x".repeat(MAX_OSC52_BYTES));
+        let over_limit = write_clipboard(&"x".repeat(MAX_OSC52_BYTES + 1));
+
+        assert!(at_limit.system);
+        assert!(at_limit.terminal);
+        assert!(over_limit.system);
+        assert!(!over_limit.terminal);
     }
 
     #[test]

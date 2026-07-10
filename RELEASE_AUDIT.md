@@ -115,12 +115,17 @@ relevant broader checks pass.
 
 ## Hardening and Polish
 
-- [ ] **9. Bound OSC 52 writes for selected text.**
+- [x] **9. Bound OSC 52 writes for selected text.**
   - Severity: low.
   - Evidence: full-history copy has a 512 KiB OSC 52 limit, but selection copy
     always synchronously encodes and writes the full selection.
   - Required: apply a consistent limit and preserve the internal/system
     clipboard fallback with a clear notice.
+  - Completed: the 512 KiB byte limit is now enforced inside the shared
+    clipboard writer, so no copy path can accidentally bypass it. Oversized
+    selections and histories still populate the internal and system clipboards
+    and report that OSC 52 was skipped. Boundary and large-selection regressions
+    pass with the full suite and clippy.
 
 - [ ] **10. Tighten start-delay validation and scheduling.**
   - Severity: low.
