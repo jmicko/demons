@@ -176,13 +176,13 @@ relevant broader checks pass.
 
 ## Final Verification
 
-- [ ] Focused regression tests pass for every item above.
-- [ ] `cargo fmt -- --check` passes.
-- [ ] `cargo clippy --all-targets --all-features -- -D warnings` passes.
-- [ ] `cargo test --all-targets --all-features --locked` passes on stable.
-- [ ] The same test suite passes on Rust 1.88.
-- [ ] `cargo build --release --locked` passes.
-- [ ] `cargo audit -D warnings` passes.
-- [ ] `cargo package --locked --allow-dirty` passes and contents are reviewed.
-- [ ] Live TUI smoke tests cover structural saves, session terminals, selection,
+- [x] Focused regression tests pass for every item above.
+- [x] `cargo fmt -- --check` passes.
+- [x] `cargo clippy --all-targets --all-features -- -D warnings` passes.
+- [x] `cargo test --all-targets --all-features --locked` passes on stable.
+- [x] The same test suite passes on Rust 1.88.
+- [x] `cargo build --release --locked` passes.
+- [x] `cargo audit -D warnings` passes.
+- [x] `cargo package --locked --allow-dirty` passes and contents are reviewed.
+- [x] Live TUI smoke tests cover structural saves, session terminals, selection,
   paste, restart, and shutdown without descendant processes remaining.
