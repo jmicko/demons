@@ -11098,7 +11098,7 @@ mod tests {
             TerminalInputPoll::Timeout
         );
 
-        let byte = [b'x'];
+        let byte = *b"x";
         assert_eq!(
             unsafe { libc::write(write_fd, byte.as_ptr().cast(), byte.len()) },
             1
