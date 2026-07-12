@@ -14,6 +14,7 @@ pub enum IntegrationStatus {
     Missing,
     Managed,
     Conflict,
+    EmptyFile,
     Invalid(String),
 }
 
@@ -23,8 +24,38 @@ impl IntegrationStatus {
             Self::Missing => "not installed",
             Self::Managed => "installed",
             Self::Conflict => "conflicting entry",
+            Self::EmptyFile => "empty .codex file",
             Self::Invalid(_) => "registration blocked",
         }
+    }
+}
+
+#[derive(Debug)]
+pub struct EmptyCodexFileChange {
+    path: PathBuf,
+    permissions: fs::Permissions,
+}
+
+impl EmptyCodexFileChange {
+    pub fn rollback(self) -> Result<()> {
+        match fs::symlink_metadata(&self.path) {
+            Ok(metadata) if metadata.is_dir() => fs::remove_dir(&self.path).with_context(|| {
+                format!(
+                    "failed to remove replacement directory {}",
+                    self.path.display()
+                )
+            })?,
+            Ok(_) => bail!(
+                "cannot restore empty file because {} is no longer a directory",
+                self.path.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect {}", self.path.display()));
+            }
+        }
+        restore_empty_file(&self.path, self.permissions)
     }
 }
 
@@ -65,6 +96,15 @@ pub fn project_config_path(project_root: &Path) -> PathBuf {
 
 pub fn inspect(project_root: &Path) -> IntegrationStatus {
     let path = project_config_path(project_root);
+    let parent = path
+        .parent()
+        .expect("project Codex config always has a parent");
+    if let Ok(metadata) = fs::symlink_metadata(parent)
+        && metadata.is_file()
+        && metadata.len() == 0
+    {
+        return IntegrationStatus::EmptyFile;
+    }
     if let Err(error) = validate_config_target(&path, false) {
         return IntegrationStatus::Invalid(error.to_string());
     }
@@ -99,6 +139,40 @@ pub fn install(project_root: &Path, config_path: &Path, scope: &str) -> Result<C
 
 pub fn uninstall(project_root: &Path) -> Result<CodexConfigChange> {
     edit(project_root, None)
+}
+
+pub fn replace_empty_file(project_root: &Path) -> Result<EmptyCodexFileChange> {
+    let path = project_root.join(".codex");
+    let metadata = fs::symlink_metadata(&path)
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
+    if metadata.len() != 0 {
+        bail!("{} is not empty", path.display());
+    }
+    let contents =
+        fs::read(&path).with_context(|| format!("failed to verify {} is empty", path.display()))?;
+    if !contents.is_empty() {
+        bail!("{} is not empty", path.display());
+    }
+
+    let permissions = metadata.permissions();
+    fs::remove_file(&path).with_context(|| format!("failed to remove {}", path.display()))?;
+    if let Err(error) = fs::create_dir(&path) {
+        let restore_error = restore_empty_file(&path, permissions.clone()).err();
+        return match restore_error {
+            Some(restore_error) => Err(error).with_context(|| {
+                format!(
+                    "failed to create {}; restoring the empty file also failed: {restore_error:#}",
+                    path.display()
+                )
+            }),
+            None => Err(error).with_context(|| format!("failed to create {}", path.display())),
+        };
+    }
+
+    Ok(EmptyCodexFileChange { path, permissions })
 }
 
 fn edit(project_root: &Path, server: Option<(&str, &Path)>) -> Result<CodexConfigChange> {
@@ -270,6 +344,16 @@ fn remove_managed_server(document: &mut DocumentMut) {
     }
 }
 
+fn restore_empty_file(path: &Path, permissions: fs::Permissions) -> Result<()> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("failed to restore {}", path.display()))?;
+    fs::set_permissions(path, permissions)
+        .with_context(|| format!("failed to restore permissions on {}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,6 +426,11 @@ mod tests {
         let temp = tempdir().unwrap();
         let dot_codex = temp.path().join(".codex");
         fs::write(&dot_codex, "").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dot_codex, fs::Permissions::from_mode(0o444)).unwrap();
+        }
         let demons_config = temp.path().join("demons.toml");
 
         let error = install(temp.path(), &demons_config, SCOPE)
@@ -350,6 +439,50 @@ mod tests {
 
         assert!(error.contains(".codex is a file, not a directory"));
         assert!(error.contains("move or remove it"));
+    }
+
+    #[test]
+    fn identifies_and_replaces_only_an_empty_dot_codex_file() {
+        let temp = tempdir().unwrap();
+        let dot_codex = temp.path().join(".codex");
+        fs::write(&dot_codex, "").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dot_codex, fs::Permissions::from_mode(0o444)).unwrap();
+        }
+
+        assert_eq!(inspect(temp.path()), IntegrationStatus::EmptyFile);
+        let change = replace_empty_file(temp.path()).unwrap();
+        assert!(dot_codex.is_dir());
+        assert_eq!(inspect(temp.path()), IntegrationStatus::Missing);
+
+        change.rollback().unwrap();
+        assert!(dot_codex.is_file());
+        assert_eq!(fs::read(&dot_codex).unwrap(), Vec::<u8>::new());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&dot_codex).unwrap().permissions().mode() & 0o777,
+                0o444
+            );
+        }
+        assert_eq!(inspect(temp.path()), IntegrationStatus::EmptyFile);
+    }
+
+    #[test]
+    fn refuses_to_replace_a_nonempty_dot_codex_file() {
+        let temp = tempdir().unwrap();
+        let dot_codex = temp.path().join(".codex");
+        fs::write(&dot_codex, "keep me").unwrap();
+
+        assert!(matches!(
+            inspect(temp.path()),
+            IntegrationStatus::Invalid(_)
+        ));
+        assert!(replace_empty_file(temp.path()).is_err());
+        assert_eq!(fs::read_to_string(dot_codex).unwrap(), "keep me");
     }
 
     #[test]

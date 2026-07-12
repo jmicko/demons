@@ -1975,6 +1975,13 @@ impl App {
         if self
             .menu
             .as_ref()
+            .is_some_and(|menu| menu.mcp_empty_file_prompt.is_some())
+        {
+            return self.handle_menu_mcp_empty_file_key(key);
+        }
+        if self
+            .menu
+            .as_ref()
             .and_then(|menu| menu.edit.as_ref())
             .is_some()
         {
@@ -2105,6 +2112,34 @@ impl App {
         Ok(Action::Continue)
     }
 
+    fn handle_menu_mcp_empty_file_key(&mut self, key: KeyEvent) -> Result<Action> {
+        match key.code {
+            KeyCode::Esc => self.cancel_empty_codex_replacement(),
+            KeyCode::Up | KeyCode::Left | KeyCode::Char('k' | 'h') => {
+                self.move_menu_mcp_empty_file_cursor(-1);
+            }
+            KeyCode::Down | KeyCode::Right | KeyCode::Char('j' | 'l') => {
+                self.move_menu_mcp_empty_file_cursor(1);
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if self
+                    .menu
+                    .as_ref()
+                    .is_some_and(|menu| menu.mcp_empty_file_cursor == 0)
+                {
+                    self.confirm_empty_codex_replacement();
+                } else {
+                    self.cancel_empty_codex_replacement();
+                }
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Ok(self.request_quit());
+            }
+            _ => {}
+        }
+        Ok(Action::Continue)
+    }
+
     fn handle_menu_edit_key(&mut self, key: KeyEvent) -> Result<Action> {
         match key.code {
             KeyCode::Esc => {
@@ -2189,6 +2224,8 @@ impl App {
         menu.env_cursor = 0;
         menu.leader_picker = false;
         menu.mcp_access_picker = false;
+        menu.mcp_empty_file_prompt = None;
+        menu.mcp_empty_file_cursor = 0;
     }
 
     fn move_menu_cursor(&mut self, delta: isize) {
@@ -2256,6 +2293,13 @@ impl App {
         }
     }
 
+    fn move_menu_mcp_empty_file_cursor(&mut self, delta: isize) {
+        if let Some(menu) = self.menu.as_mut() {
+            menu.mcp_empty_file_cursor =
+                (menu.mcp_empty_file_cursor as isize + delta).rem_euclid(2) as usize;
+        }
+    }
+
     fn select_menu_leader(&mut self) {
         let Some(index) = self.menu.as_ref().map(|menu| menu.leader_cursor) else {
             return;
@@ -2273,7 +2317,51 @@ impl App {
         let Some(&access) = all_mcp_access_levels().get(index) else {
             return;
         };
+        self.request_menu_mcp_access(access);
+    }
+
+    fn request_menu_mcp_access(&mut self, access: McpAccess) {
+        let needs_confirmation = self.menu.as_ref().is_some_and(|menu| {
+            access.allows_read()
+                && matches!(
+                    menu.mcp_integration,
+                    codex_config::IntegrationStatus::EmptyFile
+                )
+                && !menu.replace_empty_codex_on_save
+        });
+        if needs_confirmation {
+            if let Some(menu) = self.menu.as_mut() {
+                menu.mcp_access_picker = false;
+                menu.mcp_empty_file_prompt = Some(access);
+                menu.mcp_empty_file_cursor = 0;
+            }
+            return;
+        }
         self.set_menu_mcp_access(access);
+    }
+
+    fn confirm_empty_codex_replacement(&mut self) {
+        let access = {
+            let Some(menu) = self.menu.as_mut() else {
+                return;
+            };
+            let Some(access) = menu.mcp_empty_file_prompt.take() else {
+                return;
+            };
+            menu.mcp_empty_file_cursor = 0;
+            menu.replace_empty_codex_on_save = true;
+            access
+        };
+        self.set_menu_mcp_access(access);
+    }
+
+    fn cancel_empty_codex_replacement(&mut self) {
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        menu.mcp_empty_file_prompt = None;
+        menu.mcp_empty_file_cursor = 0;
+        menu.mcp_access_picker = true;
     }
 
     fn activate_selected_menu_item(&mut self) -> Result<Action> {
@@ -2347,6 +2435,9 @@ impl App {
                     menu.env_detail_key = None;
                     menu.env_cursor = 0;
                     menu.leader_picker = false;
+                    menu.mcp_access_picker = false;
+                    menu.mcp_empty_file_prompt = None;
+                    menu.mcp_empty_file_cursor = 0;
                 }
             }
             MenuAction::Close => return Ok(self.menu_back_or_close()),
@@ -2389,7 +2480,11 @@ impl App {
             MenuAction::OpenLeaderPicker => self.open_menu_leader_picker(),
             MenuAction::SelectLeader(leader) => self.set_menu_leader(leader),
             MenuAction::OpenMcpAccessPicker => self.open_menu_mcp_access_picker(),
-            MenuAction::SelectMcpAccess(access) => self.set_menu_mcp_access(access),
+            MenuAction::SelectMcpAccess(access) => self.request_menu_mcp_access(access),
+            MenuAction::ConfirmEmptyCodexReplacement => {
+                self.confirm_empty_codex_replacement();
+            }
+            MenuAction::CancelEmptyCodexReplacement => self.cancel_empty_codex_replacement(),
             MenuAction::AdjustMultiClick(delta) => self.adjust_menu_multi_click(delta),
             MenuAction::SetMultiClick(value) => self.set_menu_multi_click(value),
             MenuAction::Exit(action) => return self.handle_menu_exit_action(action),
@@ -2519,6 +2614,12 @@ impl App {
         if menu.leader_picker {
             menu.leader_picker = false;
             menu.leader_cursor = 0;
+            return Action::Continue;
+        }
+        if menu.mcp_empty_file_prompt.is_some() {
+            menu.mcp_empty_file_prompt = None;
+            menu.mcp_empty_file_cursor = 0;
+            menu.mcp_access_picker = true;
             return Action::Continue;
         }
         if menu.mcp_access_picker {
@@ -3064,6 +3165,8 @@ impl App {
             .iter()
             .position(|access| *access == current)
             .unwrap_or(0);
+        menu.mcp_empty_file_prompt = None;
+        menu.mcp_empty_file_cursor = 0;
         menu.mcp_access_picker = true;
     }
 
@@ -3084,6 +3187,10 @@ impl App {
             }
             menu.draft.settings.mcp_access = access;
             menu.mcp_access_picker = false;
+            menu.mcp_empty_file_prompt = None;
+            if !access.allows_read() {
+                menu.replace_empty_codex_on_save = false;
+            }
             menu.original.settings.mcp_access
         };
 
@@ -3181,6 +3288,7 @@ impl App {
             return Ok(Action::Continue);
         }
         let draft = menu.draft.clone();
+        let replace_empty_codex = menu.replace_empty_codex_on_save;
         let loaded = LoadedConfig {
             path: self.loaded.path.clone(),
             root: self.loaded.root.clone(),
@@ -3191,30 +3299,62 @@ impl App {
         };
         let project_root = loaded.root.clone();
         let mut codex_change = None;
+        let mut empty_codex_change = None;
         if draft.settings.mcp_access.allows_read() {
             let Some(scope) = draft.settings.mcp_scope_id.as_deref() else {
                 self.set_notice("MCP access needs a valid project scope ID.".to_owned());
                 return Ok(Action::Continue);
             };
+            if replace_empty_codex {
+                match codex_config::replace_empty_file(&project_root) {
+                    Ok(change) => empty_codex_change = Some(change),
+                    Err(error) => {
+                        self.set_notice(format!(
+                            "MCP integration not installed: could not replace the empty .codex file: {error:#}"
+                        ));
+                        return Ok(Action::Continue);
+                    }
+                }
+            }
             match codex_config::install(&project_root, &self.loaded.path, scope) {
                 Ok(change) => codex_change = Some(change),
                 Err(error) => {
-                    self.set_notice(format!("MCP integration not installed: {error:#}"));
+                    let rollback_error = empty_codex_change
+                        .take()
+                        .and_then(|change| change.rollback().err());
+                    let suffix = rollback_error
+                        .map(|error| format!("; restoring the empty file also failed: {error:#}"))
+                        .unwrap_or_default();
+                    self.set_notice(format!("MCP integration not installed: {error:#}{suffix}"));
                     return Ok(Action::Continue);
                 }
             }
         }
         if let Err(error) = loaded.save() {
-            if let Some(change) = codex_change {
-                change.rollback().ok();
+            let mut rollback_errors = Vec::new();
+            if let Some(change) = codex_change.take()
+                && let Err(error) = change.rollback()
+            {
+                rollback_errors.push(format!("Codex config: {error:#}"));
             }
-            self.set_notice(format!("Config not saved: {error:#}"));
+            if let Some(change) = empty_codex_change.take()
+                && let Err(error) = change.rollback()
+            {
+                rollback_errors.push(format!("empty .codex file: {error:#}"));
+            }
+            let suffix = if rollback_errors.is_empty() {
+                String::new()
+            } else {
+                format!("; rollback failed: {}", rollback_errors.join("; "))
+            };
+            self.set_notice(format!("Config not saved: {error:#}{suffix}"));
             return Ok(Action::Continue);
         }
 
-        let integration_changed = codex_change
-            .as_ref()
-            .is_some_and(codex_config::CodexConfigChange::changed);
+        let integration_changed = empty_codex_change.is_some()
+            || codex_change
+                .as_ref()
+                .is_some_and(codex_config::CodexConfigChange::changed);
         let mut integration_warning = None;
         if !draft.settings.mcp_access.allows_read() {
             match codex_config::inspect(&project_root) {
@@ -3238,7 +3378,8 @@ impl App {
                     ));
                 }
                 codex_config::IntegrationStatus::Missing
-                | codex_config::IntegrationStatus::Conflict => {}
+                | codex_config::IntegrationStatus::Conflict
+                | codex_config::IntegrationStatus::EmptyFile => {}
             }
         }
 
@@ -4031,6 +4172,12 @@ impl App {
                 if self
                     .menu
                     .as_ref()
+                    .is_some_and(|menu| menu.mcp_empty_file_prompt.is_some())
+                {
+                    self.move_menu_mcp_empty_file_cursor(-1);
+                } else if self
+                    .menu
+                    .as_ref()
                     .is_some_and(|menu| menu.dependency_task.is_some())
                 {
                     self.move_menu_dependency_cursor(-1);
@@ -4049,6 +4196,12 @@ impl App {
             }
             MouseEventKind::ScrollDown => {
                 if self
+                    .menu
+                    .as_ref()
+                    .is_some_and(|menu| menu.mcp_empty_file_prompt.is_some())
+                {
+                    self.move_menu_mcp_empty_file_cursor(1);
+                } else if self
                     .menu
                     .as_ref()
                     .is_some_and(|menu| menu.dependency_task.is_some())
@@ -6951,6 +7104,9 @@ struct MenuState {
     leader_cursor: usize,
     mcp_access_picker: bool,
     mcp_access_cursor: usize,
+    mcp_empty_file_prompt: Option<McpAccess>,
+    mcp_empty_file_cursor: usize,
+    replace_empty_codex_on_save: bool,
     edit: Option<MenuEdit>,
     path: PathBuf,
     mcp_integration: codex_config::IntegrationStatus,
@@ -6984,6 +7140,9 @@ impl MenuState {
             leader_cursor: 0,
             mcp_access_picker: false,
             mcp_access_cursor: 0,
+            mcp_empty_file_prompt: None,
+            mcp_empty_file_cursor: 0,
+            replace_empty_codex_on_save: false,
             edit: None,
             path,
             mcp_integration,
@@ -6995,7 +7154,7 @@ impl MenuState {
     }
 
     fn dirty(&self) -> bool {
-        self.draft != self.original
+        self.draft != self.original || self.replace_empty_codex_on_save
     }
 }
 
@@ -7127,6 +7286,8 @@ enum MenuAction {
     SelectLeader(Leader),
     OpenMcpAccessPicker,
     SelectMcpAccess(McpAccess),
+    ConfirmEmptyCodexReplacement,
+    CancelEmptyCodexReplacement,
     AdjustMultiClick(i64),
     SetMultiClick(u64),
     Exit(MenuExitAction),
@@ -7497,6 +7658,10 @@ fn render_menu(
     }
     if menu.leader_picker {
         render_menu_leaders(body, buffer, menu, hover_position);
+        return;
+    }
+    if menu.mcp_empty_file_prompt.is_some() {
+        render_menu_mcp_empty_file(body, buffer, menu, hover_position);
         return;
     }
     if menu.mcp_access_picker {
@@ -7955,10 +8120,15 @@ fn render_menu_settings(
     );
     let mcp_rect = Rect::new(area.x, area.y.saturating_add(5), area.width, 1);
     let mcp_badges = setting_problem_badges(&problems, ConfigSettingField::McpAccess);
+    let integration_label = if menu.replace_empty_codex_on_save {
+        "replace empty file on save"
+    } else {
+        menu.mcp_integration.label()
+    };
     let text = format!(
         "MCP access: {} ({})",
         menu.draft.settings.mcp_access.label(),
-        menu.mcp_integration.label()
+        integration_label
     );
     render_menu_row(
         buffer,
@@ -8132,6 +8302,65 @@ fn render_menu_mcp_access(
             &text,
             row == menu.mcp_access_cursor,
             Some(MenuAction::SelectMcpAccess(*access)),
+            &mut menu.hits,
+            hover_position,
+        );
+    }
+}
+
+fn render_menu_mcp_empty_file(
+    area: Rect,
+    buffer: &mut Buffer,
+    menu: &mut MenuState,
+    hover_position: Option<(u16, u16)>,
+) {
+    render_text(
+        buffer,
+        Rect::new(area.x, area.y, area.width, 1),
+        "Replace empty .codex file?",
+        menu_heading_style(),
+    );
+    let explanation = [
+        "An empty .codex file is blocking project MCP setup.",
+        "Codex expects a .codex directory containing config.toml.",
+        "Demons can replace the empty file when you save.",
+        "Anything nonempty or unusual will remain untouched.",
+    ];
+    let options_y = area
+        .bottom()
+        .saturating_sub(2)
+        .max(area.y.saturating_add(1));
+    for (row, line) in explanation.iter().enumerate() {
+        let y = area.y.saturating_add(row as u16 + 2);
+        if y >= options_y {
+            break;
+        }
+        render_text(
+            buffer,
+            Rect::new(area.x, y, area.width, 1),
+            line,
+            menu_style(),
+        );
+    }
+
+    let options = [
+        (
+            "Replace empty file on save",
+            MenuAction::ConfirmEmptyCodexReplacement,
+        ),
+        ("Cancel", MenuAction::CancelEmptyCodexReplacement),
+    ];
+    for (row, (label, action)) in options.iter().enumerate() {
+        let y = options_y.saturating_add(row as u16);
+        if y >= area.bottom() {
+            break;
+        }
+        render_menu_row(
+            buffer,
+            Rect::new(area.x, y, area.width, 1),
+            label,
+            row == menu.mcp_empty_file_cursor,
+            Some(*action),
             &mut menu.hits,
             hover_position,
         );
@@ -16595,6 +16824,122 @@ mod tests {
         assert_eq!(menu.draft.settings.mcp_access, McpAccess::ReadOnly);
         assert!(menu.draft.settings.mcp_scope_id.is_some());
         assert_eq!(app.loaded.config.settings.mcp_access, McpAccess::Off);
+    }
+
+    #[test]
+    fn settings_mcp_picker_stages_empty_dot_codex_replacement_after_confirmation() {
+        let temp = tempdir().unwrap();
+        let dot_codex = temp.path().join(".codex");
+        fs::write(&dot_codex, "").unwrap();
+        let mut app = test_app();
+        app.loaded.root = temp.path().to_path_buf();
+        app.loaded.path = temp.path().join(CONFIG_FILE);
+        app.open_menu(MenuTab::Settings);
+
+        app.request_menu_mcp_access(McpAccess::ReadOnly);
+        let menu = app.menu.as_ref().unwrap();
+        assert_eq!(menu.mcp_empty_file_prompt, Some(McpAccess::ReadOnly));
+        assert!(!menu.replace_empty_codex_on_save);
+        assert!(dot_codex.is_file());
+
+        app.confirm_empty_codex_replacement();
+        let menu = app.menu.as_ref().unwrap();
+        assert_eq!(menu.draft.settings.mcp_access, McpAccess::ReadOnly);
+        assert!(menu.replace_empty_codex_on_save);
+        assert!(menu.dirty());
+        assert!(dot_codex.is_file(), "repair must wait for an explicit save");
+    }
+
+    #[test]
+    fn canceling_empty_dot_codex_replacement_leaves_the_file_and_access_unchanged() {
+        let temp = tempdir().unwrap();
+        let dot_codex = temp.path().join(".codex");
+        fs::write(&dot_codex, "").unwrap();
+        let mut app = test_app();
+        app.loaded.root = temp.path().to_path_buf();
+        app.loaded.path = temp.path().join(CONFIG_FILE);
+        app.open_menu(MenuTab::Settings);
+
+        app.request_menu_mcp_access(McpAccess::Full);
+        app.cancel_empty_codex_replacement();
+
+        let menu = app.menu.as_ref().unwrap();
+        assert_eq!(menu.draft.settings.mcp_access, McpAccess::Off);
+        assert!(!menu.replace_empty_codex_on_save);
+        assert!(menu.mcp_access_picker);
+        assert!(dot_codex.is_file());
+    }
+
+    #[test]
+    fn discarding_confirmed_empty_dot_codex_replacement_leaves_the_file_untouched() {
+        let temp = tempdir().unwrap();
+        let dot_codex = temp.path().join(".codex");
+        fs::write(&dot_codex, "").unwrap();
+        let mut app = test_app();
+        app.loaded.root = temp.path().to_path_buf();
+        app.loaded.path = temp.path().join(CONFIG_FILE);
+        app.open_menu(MenuTab::Settings);
+
+        app.request_menu_mcp_access(McpAccess::ReadOnly);
+        app.confirm_empty_codex_replacement();
+        app.handle_menu_exit_action(MenuExitAction::Discard)
+            .unwrap();
+
+        assert!(app.menu.is_none());
+        assert_eq!(app.loaded.config.settings.mcp_access, McpAccess::Off);
+        assert!(dot_codex.is_file());
+        assert!(fs::read(&dot_codex).unwrap().is_empty());
+    }
+
+    #[test]
+    fn saving_mcp_access_replaces_a_confirmed_empty_dot_codex_file() {
+        let temp = tempdir().unwrap();
+        let dot_codex = temp.path().join(".codex");
+        fs::write(&dot_codex, "").unwrap();
+        let mut app = test_app();
+        app.loaded.root = temp.path().to_path_buf();
+        app.loaded.path = temp.path().join(CONFIG_FILE);
+        app.open_menu(MenuTab::Settings);
+        app.request_menu_mcp_access(McpAccess::ReadOnly);
+        app.confirm_empty_codex_replacement();
+
+        app.save_menu_config(RestartMode::None).unwrap();
+
+        assert!(dot_codex.is_dir());
+        let registration = fs::read_to_string(dot_codex.join("config.toml")).unwrap();
+        assert!(registration.contains("Managed by Demons"));
+        assert!(registration.contains("mcp_servers.demons"));
+        assert!(
+            fs::read_to_string(temp.path().join(CONFIG_FILE))
+                .unwrap()
+                .contains("mcp_access = \"read_only\"")
+        );
+    }
+
+    #[test]
+    fn failed_config_save_restores_the_empty_dot_codex_file() {
+        let temp = tempdir().unwrap();
+        let dot_codex = temp.path().join(".codex");
+        fs::write(&dot_codex, "").unwrap();
+        let config_directory = temp.path().join("cannot-overwrite-directory");
+        fs::create_dir(&config_directory).unwrap();
+        let mut app = test_app();
+        app.loaded.root = temp.path().to_path_buf();
+        app.loaded.path = config_directory;
+        app.open_menu(MenuTab::Settings);
+        app.request_menu_mcp_access(McpAccess::ReadOnly);
+        app.confirm_empty_codex_replacement();
+
+        app.save_menu_config(RestartMode::None).unwrap();
+
+        assert!(dot_codex.is_file());
+        assert!(fs::read(&dot_codex).unwrap().is_empty());
+        assert!(app.menu.is_some(), "failed saves must keep the menu open");
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|notice| notice.text.contains("Config not saved"))
+        );
     }
 
     #[test]
