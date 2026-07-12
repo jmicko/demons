@@ -23,7 +23,7 @@ impl IntegrationStatus {
             Self::Missing => "not installed",
             Self::Managed => "installed",
             Self::Conflict => "conflicting entry",
-            Self::Invalid(_) => "invalid Codex config",
+            Self::Invalid(_) => "registration blocked",
         }
     }
 }
@@ -212,8 +212,20 @@ fn validate_config_target(path: &Path, create_parent: bool) -> Result<()> {
     let parent = path.parent().context("Codex config path has no parent")?;
     match fs::symlink_metadata(parent) {
         Ok(metadata) => {
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                bail!("{} is not a safe config directory", parent.display());
+            if metadata.file_type().is_symlink() {
+                bail!(
+                    "{} is a symlink; Demons does not write through symlinked Codex config directories",
+                    parent.display()
+                );
+            }
+            if !metadata.is_dir() {
+                if metadata.is_file() {
+                    bail!(
+                        "{} is a file, not a directory; move or remove it, then save MCP settings again",
+                        parent.display()
+                    );
+                }
+                bail!("{} is not a directory", parent.display());
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && create_parent => {
@@ -228,8 +240,14 @@ fn validate_config_target(path: &Path, create_parent: bool) -> Result<()> {
 
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
-            if metadata.file_type().is_symlink() || !metadata.is_file() {
-                bail!("{} is not a safe config file", path.display());
+            if metadata.file_type().is_symlink() {
+                bail!(
+                    "{} is a symlink; Demons does not overwrite symlinked Codex config files",
+                    path.display()
+                );
+            }
+            if !metadata.is_file() {
+                bail!("{} is not a regular config file", path.display());
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -317,6 +335,21 @@ mod tests {
 
         assert!(!uninstall(temp.path()).unwrap().changed());
         assert!(!temp.path().join(".codex").exists());
+    }
+
+    #[test]
+    fn explains_when_dot_codex_is_a_file_instead_of_a_directory() {
+        let temp = tempdir().unwrap();
+        let dot_codex = temp.path().join(".codex");
+        fs::write(&dot_codex, "").unwrap();
+        let demons_config = temp.path().join("demons.toml");
+
+        let error = install(temp.path(), &demons_config, SCOPE)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains(".codex is a file, not a directory"));
+        assert!(error.contains("move or remove it"));
     }
 
     #[test]
