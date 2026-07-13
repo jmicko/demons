@@ -1,10 +1,11 @@
-schema_version = 3
+schema_version = 4
 
 [settings]
 layout = "grid"
 leader = "alt-j"
 multi_click_ms = 500
 logging = false
+mcp_status_bar = true
 
 [[task]]
 name = "cpu"

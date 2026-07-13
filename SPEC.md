@@ -51,8 +51,8 @@ Demons is intentionally minimal: it is **not** a session manager, a process supe
 ```toml
 # Config schema version, separate from the Demons app/crate version.
 # Current unversioned configs are treated as the current schema and are
-# normalized after they successfully validate. Older configs migrate to v3.
-schema_version = 3
+# normalized after they successfully validate. Older configs migrate to v4.
+schema_version = 4
 
 # Optional. Demons-level settings.
 [settings]
@@ -68,6 +68,8 @@ multi_click_ms = 500
 logging = false
 # Optional project-scoped MCP access: "off" (default), "read_only", or "full".
 mcp_access = "off"
+# Show a compact MCP activity row while access is enabled.
+mcp_status_bar = true
 # Generated and managed by Demons when MCP access is enabled.
 # mcp_scope_id = "3f4a7f63-2492-477a-ae7f-92bffab78fa4"
 
@@ -104,9 +106,9 @@ env = { RUST_LOG = "debug" }
 
 Validation rules (enforced at startup, fail loudly):
 
-- `schema_version` must be `3` for this release. Missing `schema_version` is
+- `schema_version` must be `4` for this release. Missing `schema_version` is
   treated as the current schema for compatibility with existing configs.
-  Schema versions 1 and 2 migrate to version 3.
+  Schema versions 1 through 3 migrate to version 4.
 - At least one `[[task]]` or `[[terminal]]` is required.
 - Task and terminal `name` values are required and unique per file.
 - `command` is required and non-empty.
@@ -120,8 +122,8 @@ Validation rules (enforced at startup, fail loudly):
   full access require a valid UUID in `settings.mcp_scope_id`; the
   configurator generates it when needed.
 - Unknown keys are an error (no silent ignoring — the configurator owns the schema).
-- Reserved v3 fields are parseable so future files have a stable schema, but
-  v3 rejects `logging = true` and any task that sets `watch`,
+- Reserved fields are parseable so future files have a stable schema, but
+  schema v4 rejects `logging = true` and any task that sets `watch`,
   `run_on_change`, or `repeat`. Reserved behavior is never silently ignored.
 
 ### 4.3 Configurator
@@ -164,7 +166,8 @@ The runtime menu is opened with `?` in command mode or by clicking the footer's
   immediately and support Tab completion for directories relative to the config
   file.
 - **Settings** — app-level settings such as the leader key,
-  double/triple-click timing, and project-scoped MCP access.
+  double/triple-click timing, project-scoped MCP access, and MCP activity-bar
+  visibility.
 - **Exit** — discard, save without restarting, save and restart affected, save
   and restart all, and a Problems section when the draft has config problems.
   In `demons init`, save/discard closes the configurator without starting
@@ -207,6 +210,13 @@ capture of the terminal cell grid. `workspace` capture omits an active menu or
 dialog; `full` capture includes it. Capture is bounded by terminal dimensions,
 font lookup is lazy, and the response reports rendering metadata and missing
 glyphs.
+
+When `settings.mcp_status_bar` is true and MCP access is enabled, the runtime
+reserves one row above the command footer for the latest privacy-filtered
+activity summary. A right-edge arrow expands up to four recent entries above
+that row. Expansion grows upward so the arrow stays at the same terminal
+coordinate. The in-memory history is bounded and never includes command text,
+input contents, search terms, or pane output.
 
 ## 5. CLI
 
@@ -270,6 +280,8 @@ Each pane has:
   gold in command/search modes.
 - A footer shows the current mode and available controls, wrapping command
   buttons to additional lines when the terminal is narrow.
+- An optional MCP activity row sits immediately above the footer. Its fixed
+  right-edge arrow expands and collapses bounded history upward.
 - A fixed-width button at the left of the footer displays and toggles the
   current mode.
 - Footer command buttons are clickable. Paired shortcuts such as `y` / `Y` and
@@ -392,7 +404,7 @@ For each pane:
 ## 9. Example `demons.toml`
 
 ```toml
-schema_version = 3
+schema_version = 4
 
 [settings]
 layout = "grid"
@@ -400,6 +412,7 @@ leader = "alt-j"
 multi_click_ms = 500
 logging = false
 mcp_access = "off"
+mcp_status_bar = true
 
 [[task]]
 name = "server"

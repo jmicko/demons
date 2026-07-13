@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 pub const CONFIG_FILE: &str = "demons.toml";
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 pub const DEFAULT_MULTI_CLICK_MS: u64 = 500;
 pub const MIN_MULTI_CLICK_MS: u64 = 150;
 pub const MAX_MULTI_CLICK_MS: u64 = 1000;
@@ -51,6 +51,8 @@ pub struct Settings {
     pub logging: bool,
     #[serde(default)]
     pub mcp_access: McpAccess,
+    #[serde(default = "default_true")]
+    pub mcp_status_bar: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_scope_id: Option<String>,
 }
@@ -63,6 +65,7 @@ impl Default for Settings {
             multi_click_ms: DEFAULT_MULTI_CLICK_MS,
             logging: false,
             mcp_access: McpAccess::Off,
+            mcp_status_bar: true,
             mcp_scope_id: None,
         }
     }
@@ -70,6 +73,10 @@ impl Default for Settings {
 
 fn default_multi_click_ms() -> u64 {
     DEFAULT_MULTI_CLICK_MS
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -291,6 +298,7 @@ pub enum ConfigSettingField {
     MultiClick,
     Logging,
     McpAccess,
+    McpStatusBar,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -686,6 +694,7 @@ fn recover_settings(
             "multi_click_ms",
             "logging",
             "mcp_access",
+            "mcp_status_bar",
             "mcp_scope_id",
         ],
         ConfigProblemLocation::Settings,
@@ -790,6 +799,21 @@ fn recover_settings(
         },
         None => McpAccess::Off,
     };
+    let mcp_status_bar = match table.get("mcp_status_bar") {
+        Some(value) => match value.as_bool() {
+            Some(value) => value,
+            None => {
+                push_recovery_warning(
+                    warnings,
+                    problems,
+                    ConfigProblemLocation::Setting(ConfigSettingField::McpStatusBar),
+                    "Reset invalid settings.mcp_status_bar to true.".to_owned(),
+                );
+                true
+            }
+        },
+        None => true,
+    };
     let mut mcp_scope_id = table
         .get("mcp_scope_id")
         .and_then(toml::Value::as_str)
@@ -823,6 +847,7 @@ fn recover_settings(
         multi_click_ms,
         logging: false,
         mcp_access,
+        mcp_status_bar,
         mcp_scope_id,
     }
 }
@@ -2574,12 +2599,13 @@ mod tests {
 
         assert_eq!(loaded.config.schema_version, CURRENT_SCHEMA_VERSION);
         let saved = fs::read_to_string(path).unwrap();
-        assert!(saved.contains("schema_version = 3"));
+        assert!(saved.contains("schema_version = 4"));
         assert!(saved.contains("[settings]"));
         assert!(saved.contains("layout = \"grid\""));
         assert!(saved.contains("leader = \"alt-j\""));
         assert!(saved.contains("multi_click_ms = 500"));
         assert!(saved.contains("logging = false"));
+        assert!(saved.contains("mcp_status_bar = true"));
         assert!(saved.contains("cwd = \".\""));
         assert!(saved.contains("depends_on = []"));
         assert!(saved.contains("[task.env]"));
@@ -2618,7 +2644,7 @@ mod tests {
         assert!(
             fs::read_to_string(path)
                 .unwrap()
-                .contains("schema_version = 3")
+                .contains("schema_version = 4")
         );
     }
 
@@ -2768,7 +2794,7 @@ mod tests {
         fs::write(
             &path,
             r#"
-                schema_version = 4
+                schema_version = 5
                 future_setting = true
             "#,
         )
@@ -2778,7 +2804,7 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert!(error.contains("uses config schema_version 4"));
+        assert!(error.contains("uses config schema_version 5"));
     }
 
     #[test]
@@ -2898,7 +2924,7 @@ mod tests {
     fn load_does_not_rewrite_current_version_config() {
         let temp = tempdir().unwrap();
         let path = temp.path().join(CONFIG_FILE);
-        let original = r#"schema_version = 3
+        let original = r#"schema_version = 4
 
 [[task]]
 name = "server"
@@ -2918,7 +2944,7 @@ command = "echo ok"
         fs::write(
             &path,
             r#"
-                schema_version = 4
+                schema_version = 5
                 future_setting = true
             "#,
         )
@@ -2926,8 +2952,8 @@ command = "echo ok"
 
         let error = parse_file(&path).unwrap_err().to_string();
 
-        assert!(error.contains("uses config schema_version 4"));
-        assert!(error.contains("supports schema_version 3"));
+        assert!(error.contains("uses config schema_version 5"));
+        assert!(error.contains("supports schema_version 4"));
     }
 
     #[test]
@@ -3194,7 +3220,7 @@ command = "echo ok"
     }
 
     #[test]
-    fn schema_v2_migrates_to_v3_with_mcp_off() {
+    fn schema_v2_migrates_to_v4_with_mcp_defaults() {
         let temp = tempdir().unwrap();
         let path = temp.path().join(CONFIG_FILE);
         fs::write(
@@ -3211,11 +3237,68 @@ command = "echo ok"
 
         let loaded = LoadedConfig::load(path.clone()).unwrap();
 
-        assert_eq!(loaded.config.schema_version, 3);
+        assert_eq!(loaded.config.schema_version, 4);
         assert_eq!(loaded.config.settings.mcp_access, McpAccess::Off);
+        assert!(loaded.config.settings.mcp_status_bar);
         assert!(loaded.config.settings.mcp_scope_id.is_none());
         let saved = fs::read_to_string(path).unwrap();
         assert!(saved.contains("mcp_access = \"off\""));
+        assert!(saved.contains("mcp_status_bar = true"));
+    }
+
+    #[test]
+    fn schema_v3_migrates_to_v4_with_mcp_status_bar_enabled() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join(CONFIG_FILE);
+        fs::write(
+            &path,
+            r#"
+                schema_version = 3
+
+                [settings]
+                mcp_access = "read_only"
+                mcp_scope_id = "3f4a7f63-2492-477a-ae7f-92bffab78fa4"
+
+                [[task]]
+                name = "server"
+                command = "echo ready"
+            "#,
+        )
+        .unwrap();
+
+        let loaded = LoadedConfig::load(path.clone()).unwrap();
+
+        assert_eq!(loaded.config.schema_version, 4);
+        assert!(loaded.config.settings.mcp_status_bar);
+        let saved = fs::read_to_string(path).unwrap();
+        assert!(saved.contains("mcp_status_bar = true"));
+    }
+
+    #[test]
+    fn configurator_recovers_invalid_mcp_status_bar_without_rewriting() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join(CONFIG_FILE);
+        let original = r#"
+            schema_version = 4
+
+            [settings]
+            mcp_status_bar = "sometimes"
+
+            [[task]]
+            name = "server"
+            command = "echo ready"
+        "#;
+        fs::write(&path, original).unwrap();
+
+        let loaded = LoadedConfig::load_unvalidated_or_default(path.clone()).unwrap();
+
+        assert!(loaded.config.settings.mcp_status_bar);
+        assert!(loaded.config_problems.iter().any(|problem| {
+            problem.severity == ConfigProblemSeverity::Warning
+                && problem.location
+                    == ConfigProblemLocation::Setting(ConfigSettingField::McpStatusBar)
+        }));
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
     }
 
     #[test]

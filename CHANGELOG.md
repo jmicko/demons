@@ -4,8 +4,10 @@ All notable user-facing changes should be recorded here before a release.
 
 ## Unreleased
 
-- Added config schema v3 with Off, Read only, and Full project-scoped MCP
+- Added config schema v4 with Off, Read only, and Full project-scoped MCP
   access levels managed from the Settings tab.
+- Added an optional one-line MCP activity bar with a fixed-position control
+  that expands bounded, privacy-filtered history upward.
 - Added a Codex project registration that is bound to the exact active config
   path and generated project scope, refuses to replace user-owned entries, and
   shuts off live access immediately when disabled.
@@ -20,6 +22,8 @@ All notable user-facing changes should be recorded here before a release.
   sockets and discovery metadata to the current user.
 - Changed MCP uninstall to remove an otherwise empty managed Codex config and
   avoid creating `.codex` when no registration exists.
+- Added an explicit save-time repair for a zero-byte `.codex` file while
+  leaving nonempty files, symlinks, cancellation, and discarded edits intact.
 
 ## 0.3.0 - 2026-07-09
 

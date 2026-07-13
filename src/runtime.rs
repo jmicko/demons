@@ -70,6 +70,9 @@ const MODE_BUTTON_WIDTH: u16 = 13;
 const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(45);
 const SCENE_FRAME_INTERVAL: Duration = Duration::from_millis(350);
 const NOTICE_DURATION: Duration = Duration::from_secs(6);
+const MCP_ACTIVITY_HISTORY_LIMIT: usize = 64;
+const MCP_ACTIVITY_EXPANDED_ROWS: usize = 4;
+const MCP_ACTIVITY_BUTTON_WIDTH: u16 = 3;
 #[cfg(all(not(test), target_os = "linux"))]
 const SYSTEM_CLIPBOARD_WAIT: Duration = Duration::from_millis(150);
 const MAX_OSC52_BYTES: usize = 512 * 1024;
@@ -580,6 +583,7 @@ struct App {
     slot_rects: Vec<Rect>,
     pane_rects: Vec<Rect>,
     content_rects: Vec<Rect>,
+    mcp_activity_rect: Option<Rect>,
     footer_rect: Option<Rect>,
     mode_button_rect: Option<Rect>,
     footer_hits: Vec<FooterHit>,
@@ -615,6 +619,8 @@ struct App {
     scene_frame_override: Option<u64>,
     last_scene_frame: Instant,
     control: Option<ControlRuntime>,
+    mcp_activity: VecDeque<McpActivityEntry>,
+    mcp_activity_expanded: bool,
     pending_control_waits: Vec<PendingControlWait>,
     pending_captures: VecDeque<PendingCapture>,
     capture_worker: Option<CaptureWorker>,
@@ -624,6 +630,12 @@ struct App {
 struct ControlRuntime {
     listener: ControlListener,
     rx: Receiver<ControlEnvelope>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct McpActivityEntry {
+    message: String,
+    repeats: u32,
 }
 
 struct PendingControlWait {
@@ -692,6 +704,7 @@ impl App {
             slot_rects: Vec::new(),
             pane_rects: Vec::new(),
             content_rects: Vec::new(),
+            mcp_activity_rect: None,
             footer_rect: None,
             mode_button_rect: None,
             footer_hits: Vec::new(),
@@ -727,6 +740,8 @@ impl App {
             scene_frame_override,
             last_scene_frame: Instant::now(),
             control: None,
+            mcp_activity: VecDeque::new(),
+            mcp_activity_expanded: false,
             pending_control_waits: Vec::new(),
             pending_captures: VecDeque::new(),
             capture_worker: None,
@@ -810,12 +825,14 @@ impl App {
     fn handle_control_envelope(&mut self, envelope: ControlEnvelope) {
         let access = self.loaded.config.settings.mcp_access;
         if let Err(error) = control::authorize(access, &envelope.request) {
+            self.record_mcp_activity("blocked unauthorized request".to_owned());
             envelope
                 .reply
                 .try_send(ControlResponse::error("forbidden", error.to_string()))
                 .ok();
             return;
         }
+        self.record_mcp_activity(control_request_activity(&envelope.request));
         match envelope.request {
             ControlRequest::Ping => unreachable!("ping is handled by the listener"),
             ControlRequest::ListPanes => {
@@ -945,6 +962,22 @@ impl App {
 
     fn reply_control(&self, reply: SyncSender<ControlResponse>, response: ControlResponse) {
         reply.try_send(response).ok();
+    }
+
+    fn record_mcp_activity(&mut self, message: String) {
+        if let Some(entry) = self.mcp_activity.back_mut()
+            && entry.message == message
+        {
+            entry.repeats = entry.repeats.saturating_add(1);
+            return;
+        }
+        if self.mcp_activity.len() >= MCP_ACTIVITY_HISTORY_LIMIT {
+            self.mcp_activity.pop_front();
+        }
+        self.mcp_activity.push_back(McpActivityEntry {
+            message,
+            repeats: 1,
+        });
     }
 
     fn control_pane_index(&self, pane_id: &str) -> Option<usize> {
@@ -1157,12 +1190,15 @@ impl App {
         let now = Instant::now();
         let mut resolved = false;
         let mut remaining = Vec::new();
+        let mut activity = Vec::new();
         let pending = std::mem::take(&mut self.pending_control_waits);
         for mut wait in pending {
+            let activity_pane = activity_pane_name(&wait.pane_id);
             let Some(index) = self.control_pane_index(&wait.pane_id) else {
                 wait.reply
                     .try_send(ControlResponse::error("not_found", "pane no longer exists"))
                     .ok();
+                activity.push(format!("wait failed · {activity_pane} was removed"));
                 resolved = true;
                 continue;
             };
@@ -1195,6 +1231,7 @@ impl App {
                     .map(|line| (tail, line.text.to_ascii_lowercase()));
             }
             if status_match || line_match.is_some() || now >= wait.deadline {
+                let timed_out = now >= wait.deadline && !status_match && line_match.is_none();
                 let cursor = control::encode_cursor(
                     self.control_instance_id(),
                     &wait.pane_id,
@@ -1205,21 +1242,27 @@ impl App {
                         result: WaitResult {
                             pane_id: wait.pane_id,
                             matched: status_match || line_match.is_some(),
-                            timed_out: now >= wait.deadline
-                                && !status_match
-                                && line_match.is_none(),
+                            timed_out,
                             status,
                             cursor,
                             line: line_match,
                         },
                     })
                     .ok();
+                activity.push(if timed_out {
+                    format!("wait timed out · {activity_pane}")
+                } else {
+                    format!("wait completed · {activity_pane}")
+                });
                 resolved = true;
             } else {
                 remaining.push(wait);
             }
         }
         self.pending_control_waits = remaining;
+        for message in activity {
+            self.record_mcp_activity(message);
+        }
         resolved
     }
 
@@ -1396,24 +1439,45 @@ impl App {
 
     fn update_layout(&mut self, terminal_area: Rect) {
         let footer_height = self.footer_height(terminal_area.width, terminal_area.height);
-        let (pane_area, footer_rect) = if footer_height > 0 {
-            (
-                Rect::new(
-                    terminal_area.x,
-                    terminal_area.y,
-                    terminal_area.width,
-                    terminal_area.height.saturating_sub(footer_height),
-                ),
-                Some(Rect::new(
-                    terminal_area.x,
-                    terminal_area.bottom().saturating_sub(footer_height),
-                    terminal_area.width,
-                    footer_height,
-                )),
+        let footer_rect = (footer_height > 0).then(|| {
+            Rect::new(
+                terminal_area.x,
+                terminal_area.bottom().saturating_sub(footer_height),
+                terminal_area.width,
+                footer_height,
             )
+        });
+        let available_activity_height = terminal_area
+            .height
+            .saturating_sub(footer_height)
+            .saturating_sub(3);
+        let activity_height = if footer_height > 0 {
+            self.desired_mcp_activity_height()
+                .min(available_activity_height)
         } else {
-            (terminal_area, None)
+            0
         };
+        let mcp_activity_rect = (activity_height > 0).then(|| {
+            Rect::new(
+                terminal_area.x,
+                terminal_area
+                    .bottom()
+                    .saturating_sub(footer_height)
+                    .saturating_sub(activity_height),
+                terminal_area.width,
+                activity_height,
+            )
+        });
+        let pane_area = Rect::new(
+            terminal_area.x,
+            terminal_area.y,
+            terminal_area.width,
+            terminal_area
+                .height
+                .saturating_sub(footer_height)
+                .saturating_sub(activity_height),
+        );
+        self.mcp_activity_rect = mcp_activity_rect;
         self.footer_rect = footer_rect;
         self.mode_button_rect = footer_rect.map(|footer| {
             Rect::new(
@@ -1465,6 +1529,22 @@ impl App {
                 task.resize(area.width, area.height);
             }
         }
+    }
+
+    fn mcp_activity_visible(&self) -> bool {
+        self.loaded.config.settings.mcp_access.allows_read()
+            && self.loaded.config.settings.mcp_status_bar
+    }
+
+    fn desired_mcp_activity_height(&self) -> u16 {
+        if !self.mcp_activity_visible() {
+            return 0;
+        }
+        if !self.mcp_activity_expanded {
+            return 1;
+        }
+        let history_rows = self.mcp_activity.len().clamp(1, MCP_ACTIVITY_EXPANDED_ROWS);
+        u16::try_from(history_rows + 1).unwrap_or(u16::MAX)
     }
 
     fn task_output_rect(&self, index: usize) -> Option<Rect> {
@@ -1650,6 +1730,16 @@ impl App {
             }
         }
 
+        if let Some(activity_area) = self.mcp_activity_rect {
+            render_mcp_activity(
+                activity_area,
+                &self.mcp_activity,
+                self.mcp_activity_expanded,
+                buffer,
+                mouse_position,
+            );
+        }
+
         if let (Some(footer_area), Some(button_area)) = (self.footer_rect, self.mode_button_rect) {
             let help_area = Rect::new(
                 button_area.right(),
@@ -1699,7 +1789,12 @@ impl App {
         }
 
         if interactive && let Some(notice) = self.active_notice(now) {
-            render_notice(frame_area, self.footer_rect, notice, buffer);
+            render_notice(
+                frame_area,
+                self.mcp_activity_rect.or(self.footer_rect),
+                notice,
+                buffer,
+            );
         }
 
         if interactive
@@ -2407,6 +2502,7 @@ impl App {
                 1 => Some(MenuAction::OpenLeaderPicker),
                 2 => Some(MenuAction::AdjustMultiClick(MULTI_CLICK_STEP_MS as i64)),
                 4 => Some(MenuAction::OpenMcpAccessPicker),
+                5 => Some(MenuAction::ToggleMcpStatusBar),
                 _ => None,
             },
             MenuTab::Exit => {
@@ -2481,6 +2577,7 @@ impl App {
             MenuAction::SelectLeader(leader) => self.set_menu_leader(leader),
             MenuAction::OpenMcpAccessPicker => self.open_menu_mcp_access_picker(),
             MenuAction::SelectMcpAccess(access) => self.request_menu_mcp_access(access),
+            MenuAction::ToggleMcpStatusBar => self.toggle_menu_mcp_status_bar(),
             MenuAction::ConfirmEmptyCodexReplacement => {
                 self.confirm_empty_codex_replacement();
             }
@@ -3202,8 +3299,23 @@ impl App {
             original_access
         };
         self.loaded.config.settings.mcp_access = live_access;
+        if !live_access.allows_read() {
+            self.mcp_activity_expanded = false;
+        }
         if let Err(error) = self.sync_control_listener() {
             self.set_notice(format!("MCP control unavailable: {error:#}"));
+        }
+    }
+
+    fn toggle_menu_mcp_status_bar(&mut self) {
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        let visible = !menu.draft.settings.mcp_status_bar;
+        menu.draft.settings.mcp_status_bar = visible;
+        self.loaded.config.settings.mcp_status_bar = visible;
+        if !visible {
+            self.mcp_activity_expanded = false;
         }
     }
 
@@ -4038,6 +4150,20 @@ impl App {
             return Ok(Action::Continue);
         }
 
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && self.mcp_activity_button_hit(mouse.column, mouse.row)
+        {
+            self.mcp_activity_expanded = !self.mcp_activity_expanded;
+            return Ok(Action::Continue);
+        }
+
+        if self
+            .mcp_activity_rect
+            .is_some_and(|rect| contains(rect, mouse.column, mouse.row))
+        {
+            return Ok(Action::Continue);
+        }
+
         if let Some(action) = self.footer_action_at(mouse) {
             return self.apply_footer_action(action);
         }
@@ -4243,6 +4369,23 @@ impl App {
             .iter()
             .find(|hit| contains(hit.rect, mouse.column, mouse.row))
             .map(|hit| hit.action)
+    }
+
+    fn mcp_activity_button_hit(&self, column: u16, row: u16) -> bool {
+        let Some(area) = self.mcp_activity_rect else {
+            return false;
+        };
+        let width = area.width.min(MCP_ACTIVITY_BUTTON_WIDTH);
+        contains(
+            Rect::new(
+                area.right().saturating_sub(width),
+                area.bottom().saturating_sub(1),
+                width,
+                1,
+            ),
+            column,
+            row,
+        )
     }
 
     fn apply_footer_action(&mut self, action: FooterAction) -> Result<Action> {
@@ -6081,6 +6224,61 @@ fn validate_control_query(query: &str) -> std::result::Result<(), &'static str> 
     Ok(())
 }
 
+fn control_request_activity(request: &ControlRequest) -> String {
+    match request {
+        ControlRequest::Ping => "checked connection".to_owned(),
+        ControlRequest::ListPanes => "listed panes".to_owned(),
+        ControlRequest::ReadOutput { pane_id, .. } => {
+            format!("read output · {}", activity_pane_name(pane_id))
+        }
+        ControlRequest::SearchOutput { pane_id, .. } => {
+            format!("searched output · {}", activity_pane_name(pane_id))
+        }
+        ControlRequest::WaitForOutput { pane_id, .. } => {
+            format!("waiting for output · {}", activity_pane_name(pane_id))
+        }
+        ControlRequest::WaitForCommand { pane_id, .. } => {
+            format!("waiting for command · {}", activity_pane_name(pane_id))
+        }
+        ControlRequest::RestartTask { pane_id } => {
+            format!("requested restart · {}", activity_pane_name(pane_id))
+        }
+        ControlRequest::RestartAll => "requested restart of all tasks".to_owned(),
+        ControlRequest::InterruptPane { pane_id } => {
+            format!("requested interrupt · {}", activity_pane_name(pane_id))
+        }
+        ControlRequest::SendInput { pane_id, .. } => {
+            format!("requested input · {}", activity_pane_name(pane_id))
+        }
+        ControlRequest::RunCommand { .. } => "requested command pane".to_owned(),
+        ControlRequest::CloseCommand { pane_id } => {
+            format!("requested close · {}", activity_pane_name(pane_id))
+        }
+        ControlRequest::CaptureTui { .. } => "requested TUI capture".to_owned(),
+    }
+}
+
+fn activity_pane_name(name: &str) -> String {
+    const MAX_CHARS: usize = 32;
+    let mut result = String::new();
+    let mut characters = name.chars();
+    for character in characters.by_ref().take(MAX_CHARS) {
+        result.push(if character.is_control() {
+            ' '
+        } else {
+            character
+        });
+    }
+    if characters.next().is_some() {
+        result.push('…');
+    }
+    if result.trim().is_empty() {
+        "pane".to_owned()
+    } else {
+        result
+    }
+}
+
 fn valid_control_status(status: &str) -> bool {
     matches!(
         status,
@@ -7286,6 +7484,7 @@ enum MenuAction {
     SelectLeader(Leader),
     OpenMcpAccessPicker,
     SelectMcpAccess(McpAccess),
+    ToggleMcpStatusBar,
     ConfirmEmptyCodexReplacement,
     CancelEmptyCodexReplacement,
     AdjustMultiClick(i64),
@@ -8148,6 +8347,34 @@ fn render_menu_settings(
             hover_position.is_some_and(|(x, y)| contains(mcp_rect, x, y)),
         ),
     );
+    let status_rect = Rect::new(area.x, area.y.saturating_add(6), area.width, 1);
+    let status_badges = setting_problem_badges(&problems, ConfigSettingField::McpStatusBar);
+    let status_text = format!(
+        "MCP activity bar: {}",
+        if menu.draft.settings.mcp_status_bar {
+            "shown"
+        } else {
+            "hidden"
+        }
+    );
+    render_menu_row(
+        buffer,
+        status_rect,
+        &text_with_problem_badges(&status_text, status_badges),
+        menu.cursor == 5,
+        Some(MenuAction::ToggleMcpStatusBar),
+        &mut menu.hits,
+        hover_position,
+    );
+    render_problem_badges(
+        buffer,
+        status_rect,
+        status_badges,
+        row_bg_color(
+            menu.cursor == 5,
+            hover_position.is_some_and(|(x, y)| contains(status_rect, x, y)),
+        ),
+    );
 }
 
 fn render_menu_static_setting_row(
@@ -8724,7 +8951,7 @@ fn menu_item_count(menu: &MenuState, exit_mode: MenuExitMode) -> usize {
         MenuTab::Tasks if menu.task_detail.is_some() => task_detail_fields().len(),
         MenuTab::Tasks if menu.terminal_detail.is_some() => terminal_detail_fields().len(),
         MenuTab::Tasks => task_list_count(menu),
-        MenuTab::Settings => 5,
+        MenuTab::Settings => 6,
         MenuTab::Exit => exit_actions(exit_mode).len() + menu_problems(menu).len(),
     }
 }
@@ -8782,6 +9009,9 @@ fn setting_value_unchanged(menu: &MenuState, field: ConfigSettingField) -> bool 
         ConfigSettingField::McpAccess => {
             menu.draft.settings.mcp_access == menu.original.settings.mcp_access
                 && menu.draft.settings.mcp_scope_id == menu.original.settings.mcp_scope_id
+        }
+        ConfigSettingField::McpStatusBar => {
+            menu.draft.settings.mcp_status_bar == menu.original.settings.mcp_status_bar
         }
     }
 }
@@ -9145,6 +9375,7 @@ fn setting_cursor(field: ConfigSettingField) -> usize {
         ConfigSettingField::MultiClick => 2,
         ConfigSettingField::Logging => 3,
         ConfigSettingField::McpAccess => 4,
+        ConfigSettingField::McpStatusBar => 5,
     }
 }
 
@@ -9155,6 +9386,7 @@ fn setting_field_label(field: ConfigSettingField) -> &'static str {
         ConfigSettingField::MultiClick => "multi-click timing",
         ConfigSettingField::Logging => "logging",
         ConfigSettingField::McpAccess => "MCP access",
+        ConfigSettingField::McpStatusBar => "MCP activity bar",
     }
 }
 
@@ -11452,6 +11684,82 @@ fn render_quit_confirm(area: Rect, buffer: &mut Buffer) {
     .render(popup, buffer);
 }
 
+fn render_mcp_activity(
+    area: Rect,
+    activity: &VecDeque<McpActivityEntry>,
+    expanded: bool,
+    buffer: &mut Buffer,
+    mouse_position: Option<(u16, u16)>,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    clear_rect(buffer, area, footer_base_style());
+    let status_y = area.bottom().saturating_sub(1);
+    let button_width = area.width.min(MCP_ACTIVITY_BUTTON_WIDTH);
+    let button = Rect::new(
+        area.right().saturating_sub(button_width),
+        status_y,
+        button_width,
+        1,
+    );
+    let status = Rect::new(area.x, status_y, area.width.saturating_sub(button_width), 1);
+
+    if expanded && area.height > 1 {
+        let history_rows = usize::from(area.height.saturating_sub(1));
+        if activity.is_empty() {
+            Paragraph::new("  No MCP requests yet.")
+                .style(footer_base_style().fg(THEME_HOLLY))
+                .render(Rect::new(area.x, area.y, area.width, 1), buffer);
+        } else {
+            let visible = history_rows.min(activity.len());
+            let start = activity.len().saturating_sub(visible);
+            for (row, entry) in activity.iter().skip(start).enumerate() {
+                let text = mcp_activity_entry_text(entry);
+                Paragraph::new(format!("  {text}"))
+                    .style(footer_base_style().fg(THEME_SNOW))
+                    .render(
+                        Rect::new(area.x, area.y + row as u16, area.width, 1),
+                        buffer,
+                    );
+            }
+        }
+    }
+
+    let detail = if expanded {
+        "activity history".to_owned()
+    } else {
+        activity
+            .back()
+            .map(mcp_activity_entry_text)
+            .unwrap_or_else(|| "ready for agent requests".to_owned())
+    };
+    Paragraph::new(Line::from(vec![
+        Span::styled(" MCP ", Style::default().fg(THEME_BLACK).bg(THEME_GREEN)),
+        Span::styled(format!(" {detail}"), footer_base_style()),
+    ]))
+    .style(footer_base_style())
+    .render(status, buffer);
+
+    let hovered = mouse_position.is_some_and(|(x, y)| contains(button, x, y));
+    Paragraph::new(if expanded { " ▼ " } else { " ▲ " })
+        .alignment(ratatui::layout::Alignment::Center)
+        .style(Style::default().fg(THEME_BLACK).bg(if hovered {
+            THEME_GOLD_HOVER
+        } else {
+            THEME_GOLD
+        }))
+        .render(button, buffer);
+}
+
+fn mcp_activity_entry_text(entry: &McpActivityEntry) -> String {
+    if entry.repeats > 1 {
+        format!("{} ×{}", entry.message, entry.repeats)
+    } else {
+        entry.message.clone()
+    }
+}
+
 fn render_notice(area: Rect, footer_rect: Option<Rect>, notice: &str, buffer: &mut Buffer) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -12692,6 +13000,136 @@ mod tests {
     }
 
     #[test]
+    fn mcp_activity_expand_button_stays_anchored() {
+        let mut app = test_app();
+        app.loaded.config.settings.mcp_access = McpAccess::ReadOnly;
+        for index in 0..6 {
+            app.record_mcp_activity(format!("activity {index}"));
+        }
+        let terminal = Rect::new(0, 0, 100, 30);
+        app.update_layout(terminal);
+
+        let collapsed = app.mcp_activity_rect.unwrap();
+        assert_eq!(collapsed.height, 1);
+        let button_column = collapsed.right() - 1;
+        let button_row = collapsed.bottom() - 1;
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            button_column,
+            button_row,
+        ))
+        .unwrap();
+        app.update_layout(terminal);
+
+        let expanded = app.mcp_activity_rect.unwrap();
+        assert_eq!(expanded.height, 5);
+        assert_eq!(expanded.right() - 1, button_column);
+        assert_eq!(expanded.bottom() - 1, button_row);
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            button_column,
+            button_row,
+        ))
+        .unwrap();
+        app.update_layout(terminal);
+        assert_eq!(app.mcp_activity_rect.unwrap(), collapsed);
+    }
+
+    #[test]
+    fn mcp_activity_is_bounded_coalesced_and_content_free() {
+        let mut app = test_app();
+        for index in 0..70 {
+            app.record_mcp_activity(format!("activity {index}"));
+        }
+        assert_eq!(app.mcp_activity.len(), MCP_ACTIVITY_HISTORY_LIMIT);
+        assert_eq!(app.mcp_activity.front().unwrap().message, "activity 6");
+
+        app.record_mcp_activity("same action".to_owned());
+        app.record_mcp_activity("same action".to_owned());
+        assert_eq!(app.mcp_activity.back().unwrap().repeats, 2);
+
+        let search = control_request_activity(&ControlRequest::SearchOutput {
+            pane_id: "frontend".to_owned(),
+            query: "SECRET_SEARCH_TERM".to_owned(),
+            max_results: 10,
+            context_lines: 2,
+        });
+        let command = control_request_activity(&ControlRequest::RunCommand {
+            command: "echo SECRET_COMMAND".to_owned(),
+            cwd: None,
+            name: None,
+        });
+        let input = control_request_activity(&ControlRequest::SendInput {
+            pane_id: "frontend".to_owned(),
+            text: "SECRET_INPUT".to_owned(),
+            submit: true,
+        });
+        assert!(!search.contains("SECRET"));
+        assert!(!command.contains("SECRET"));
+        assert!(!input.contains("SECRET"));
+    }
+
+    #[test]
+    fn mcp_activity_setting_applies_live_and_discard_reverts_it() {
+        let mut app = test_app();
+        assert!(app.loaded.config.settings.mcp_status_bar);
+        app.open_menu(MenuTab::Settings);
+
+        app.apply_menu_action(MenuAction::ToggleMcpStatusBar)
+            .unwrap();
+        assert!(!app.loaded.config.settings.mcp_status_bar);
+        assert!(!app.menu.as_ref().unwrap().draft.settings.mcp_status_bar);
+
+        app.handle_menu_exit_action(MenuExitAction::Discard)
+            .unwrap();
+        assert!(app.loaded.config.settings.mcp_status_bar);
+    }
+
+    #[test]
+    fn mcp_activity_bar_requires_access_and_visibility_setting() {
+        let mut app = test_app();
+        let terminal = Rect::new(0, 0, 100, 30);
+
+        app.update_layout(terminal);
+        assert!(app.mcp_activity_rect.is_none());
+
+        app.loaded.config.settings.mcp_access = McpAccess::ReadOnly;
+        app.loaded.config.settings.mcp_status_bar = false;
+        app.update_layout(terminal);
+        assert!(app.mcp_activity_rect.is_none());
+
+        app.loaded.config.settings.mcp_status_bar = true;
+        app.update_layout(terminal);
+        assert_eq!(app.mcp_activity_rect.unwrap().height, 1);
+    }
+
+    #[test]
+    fn mcp_activity_render_shows_latest_or_bounded_history() {
+        let activity = (0..6)
+            .map(|index| McpActivityEntry {
+                message: format!("activity {index}"),
+                repeats: 1,
+            })
+            .collect::<VecDeque<_>>();
+
+        let collapsed_area = Rect::new(0, 0, 50, 1);
+        let mut collapsed = Buffer::empty(collapsed_area);
+        render_mcp_activity(collapsed_area, &activity, false, &mut collapsed, None);
+        assert!(buffer_text(&collapsed, collapsed_area).contains("activity 5"));
+        assert_eq!(collapsed[(48, 0)].symbol(), "▲");
+
+        let expanded_area = Rect::new(0, 0, 50, 5);
+        let mut expanded = Buffer::empty(expanded_area);
+        render_mcp_activity(expanded_area, &activity, true, &mut expanded, None);
+        let text = buffer_text(&expanded, expanded_area);
+        assert!(!text.contains("activity 1"));
+        assert!(text.contains("activity 2"));
+        assert!(text.contains("activity 5"));
+        assert_eq!(expanded[(48, 4)].symbol(), "▼");
+    }
+
+    #[test]
     fn esc_does_not_leave_command_mode() {
         let mut app = test_app();
         app.loaded.config.settings.leader = Leader::CtrlB;
@@ -12798,6 +13236,22 @@ mod tests {
                 .iter()
                 .any(|item| item.text.contains("Edit not applied"))
         );
+    }
+
+    #[test]
+    fn notice_renders_above_mcp_activity_without_hiding_it() {
+        let mut app = test_app();
+        app.loaded.config.settings.mcp_access = McpAccess::ReadOnly;
+        app.set_notice("No selection to copy.".to_owned());
+        let area = Rect::new(0, 0, 100, 30);
+        let mut buffer = Buffer::empty(area);
+
+        app.draw_buffer(area, &mut buffer, RenderView::Full);
+
+        let activity = app.mcp_activity_rect.unwrap();
+        assert!(buffer_line(&buffer, activity.y - 1, area.width).contains("No selection to copy"));
+        assert!(buffer_line(&buffer, activity.y, area.width).contains("MCP"));
+        assert!(buffer_line(&buffer, app.footer_rect.unwrap().y, area.width).contains("COMMAND"));
     }
 
     #[test]

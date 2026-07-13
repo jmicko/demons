@@ -72,7 +72,7 @@ then starts them after you fix red problems and save.
 Or create `demons.toml` yourself:
 
 ```toml
-schema_version = 3
+schema_version = 4
 
 [settings]
 layout = "grid"
@@ -80,6 +80,7 @@ leader = "alt-j"
 multi_click_ms = 500
 logging = false
 mcp_access = "off"
+mcp_status_bar = true
 
 [[task]]
 name = "server"
@@ -194,7 +195,7 @@ can save or discard that change. `Alt+Backtick` is available for one-hand use,
 but some desktops use it for window switching, so it is not the default.
 
 ```toml
-schema_version = 3
+schema_version = 4
 
 [settings]
 leader = "alt-backtick" # also: "tab", "ctrl-b", "ctrl-q", "ctrl-\\"
@@ -224,7 +225,7 @@ while true; do date; sleep 1; done
 String commands run through `$SHELL -c` (falling back to `/bin/sh`):
 
 ```toml
-schema_version = 3
+schema_version = 4
 
 [[task]]
 name = "api"
@@ -238,7 +239,7 @@ depends_on = []
 Array commands execute directly, without shell parsing:
 
 ```toml
-schema_version = 3
+schema_version = 4
 
 [[task]]
 name = "api"
@@ -256,7 +257,7 @@ a task also restarts its dependents. While a task is waiting for a delayed
 start, the pane body shows the countdown to launch.
 
 ```toml
-schema_version = 3
+schema_version = 4
 
 [[task]]
 name = "server"
@@ -279,7 +280,7 @@ start_delay = "3s"
 Use `[[terminal]]` for a regular shell pane that starts alongside tasks:
 
 ```toml
-schema_version = 3
+schema_version = 4
 
 [[terminal]]
 name = "scratch"
@@ -301,8 +302,8 @@ it.
 
 `schema_version` is the Demons config schema version, not the Demons app or
 crate version. Existing unversioned configs are treated as the current schema
-and are normalized after they successfully validate. Schema version 1 and 2
-configs migrate to version 3 when they are next saved.
+and are normalized after they successfully validate. Schema versions 1 through
+3 migrate to version 4 when they are next saved.
 
 `logging`, `watch`, `run_on_change`, and `repeat` are reserved schema fields.
 Demons rejects reserved task fields when set, and rejects `logging = true`, so
@@ -341,13 +342,19 @@ matters; it renders Demons' current terminal cell grid into a PNG without using
 an operating-system screenshot. Its `workspace` view shows the panes beneath
 dialogs, while `full` includes the current menu or confirmation overlay.
 
+When MCP access is enabled, `mcp_status_bar = true` shows a single activity row
+above the command footer. It reports action summaries without command text,
+input contents, search terms, or pane output. Click the arrow at the right to
+expand a bounded recent history upward; the arrow remains fixed in place.
+
 The generated config fields normally do not need to be edited by hand:
 
 ```toml
-schema_version = 3
+schema_version = 4
 
 [settings]
 mcp_access = "read_only" # also: "off", "full"
+mcp_status_bar = true
 mcp_scope_id = "3f4a7f63-2492-477a-ae7f-92bffab78fa4"
 ```
 
