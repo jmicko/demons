@@ -126,6 +126,7 @@ pub struct CaptureResult {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlRequest {
     Ping,
+    ObserveListInstances,
     ListPanes,
     ReadOutput {
         pane_id: String,
@@ -498,6 +499,16 @@ pub fn request(instance: &InstanceInfo, request: &ControlRequest) -> Result<Cont
     read_frame(&mut stream)?.context("Demons closed the control connection")
 }
 
+pub fn notify(instance: &InstanceInfo, request: &ControlRequest) -> Result<()> {
+    if !owned_socket(&instance.socket_path) {
+        bail!("Demons control socket is missing or not owned by this user");
+    }
+    let mut stream = UnixStream::connect(&instance.socket_path)
+        .with_context(|| format!("failed to connect to {}", instance.socket_path.display()))?;
+    stream.set_write_timeout(Some(Duration::from_secs(1)))?;
+    write_frame(&mut stream, request).context("failed to send Demons control notification")
+}
+
 pub fn authorize(access: McpAccess, request: &ControlRequest) -> Result<()> {
     if !access.allows_read() {
         bail!("MCP access is disabled");
@@ -774,8 +785,21 @@ mod tests {
     fn authorization_distinguishes_read_and_write_access() {
         assert!(authorize(McpAccess::Off, &ControlRequest::ListPanes).is_err());
         assert!(authorize(McpAccess::ReadOnly, &ControlRequest::ListPanes).is_ok());
+        assert!(authorize(McpAccess::ReadOnly, &ControlRequest::ObserveListInstances).is_ok());
         assert!(authorize(McpAccess::ReadOnly, &ControlRequest::RestartAll).is_err());
         assert!(authorize(McpAccess::Full, &ControlRequest::RestartAll).is_ok());
+    }
+
+    #[test]
+    fn notification_enqueues_request_without_waiting_for_response() {
+        let scope_id = uuid::Uuid::new_v4().to_string();
+        let config_path = PathBuf::from(format!("/tmp/demons-notify-{scope_id}.toml"));
+        let (listener, receiver) = ControlListener::start(&scope_id, &config_path).unwrap();
+
+        notify(&listener.info, &ControlRequest::ObserveListInstances).unwrap();
+
+        let envelope = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(envelope.request, ControlRequest::ObserveListInstances);
     }
 
     #[test]

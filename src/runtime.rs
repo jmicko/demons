@@ -835,6 +835,14 @@ impl App {
         self.record_mcp_activity(control_request_activity(&envelope.request));
         match envelope.request {
             ControlRequest::Ping => unreachable!("ping is handled by the listener"),
+            ControlRequest::ObserveListInstances => {
+                self.reply_control(
+                    envelope.reply,
+                    ControlResponse::Ok {
+                        message: "instance listing recorded".to_owned(),
+                    },
+                );
+            }
             ControlRequest::ListPanes => {
                 self.reply_control(
                     envelope.reply,
@@ -6227,6 +6235,7 @@ fn validate_control_query(query: &str) -> std::result::Result<(), &'static str> 
 fn control_request_activity(request: &ControlRequest) -> String {
     match request {
         ControlRequest::Ping => "checked connection".to_owned(),
+        ControlRequest::ObserveListInstances => "listed instances".to_owned(),
         ControlRequest::ListPanes => "listed panes".to_owned(),
         ControlRequest::ReadOutput { pane_id, .. } => {
             format!("read output · {}", activity_pane_name(pane_id))
@@ -13068,6 +13077,10 @@ mod tests {
         assert!(!search.contains("SECRET"));
         assert!(!command.contains("SECRET"));
         assert!(!input.contains("SECRET"));
+        assert_eq!(
+            control_request_activity(&ControlRequest::ObserveListInstances),
+            "listed instances"
+        );
     }
 
     #[test]

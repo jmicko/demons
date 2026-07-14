@@ -138,11 +138,14 @@ impl DemonsMcpServer {
     async fn list_instances(&self) -> Result<CallToolResult, McpError> {
         let scope = self.scope_id.clone();
         let config_path = self.config_path.clone();
-        let instances =
-            tokio::task::spawn_blocking(move || control::discover_instances(&scope, &config_path))
-                .await
-                .map_err(|error| McpError::internal_error(error.to_string(), None))?
-                .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        let instances = tokio::task::spawn_blocking(move || {
+            let instances = control::discover_instances(&scope, &config_path)?;
+            notify_instance_listing(&instances);
+            Ok::<_, anyhow::Error>(instances)
+        })
+        .await
+        .map_err(|error| McpError::internal_error(error.to_string(), None))?
+        .map_err(|error| McpError::internal_error(error.to_string(), None))?;
         json_result(&instances)
     }
 
@@ -475,6 +478,12 @@ impl DemonsMcpServer {
     }
 }
 
+fn notify_instance_listing(instances: &[InstanceInfo]) {
+    for instance in instances {
+        control::notify(instance, &ControlRequest::ObserveListInstances).ok();
+    }
+}
+
 #[tool_handler]
 impl ServerHandler for DemonsMcpServer {
     fn get_info(&self) -> ServerInfo {
@@ -517,7 +526,7 @@ pub fn serve(scope_id: String, config_path: PathBuf) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, time::Duration};
 
     use super::*;
 
@@ -557,6 +566,23 @@ mod tests {
                 "unexpected annotation for {}",
                 tool.name
             );
+        }
+    }
+
+    #[test]
+    fn list_instances_activity_is_fanned_out_to_every_instance() {
+        let scope_id = uuid::Uuid::new_v4().to_string();
+        let config_path = PathBuf::from(format!("/tmp/demons-list-{scope_id}.toml"));
+        let (first, first_requests) =
+            control::ControlListener::start(&scope_id, &config_path).unwrap();
+        let (second, second_requests) =
+            control::ControlListener::start(&scope_id, &config_path).unwrap();
+
+        notify_instance_listing(&[first.info.clone(), second.info.clone()]);
+
+        for requests in [first_requests, second_requests] {
+            let envelope = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(envelope.request, ControlRequest::ObserveListInstances);
         }
     }
 }

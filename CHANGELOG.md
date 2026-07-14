@@ -8,6 +8,8 @@ All notable user-facing changes should be recorded here before a release.
   access levels managed from the Settings tab.
 - Added an optional one-line MCP activity bar with a fixed-position control
   that expands bounded, privacy-filtered history upward.
+- Fixed `list_instances` so every instance returned by discovery records the
+  call in its MCP activity bar.
 - Added a Codex project registration that is bound to the exact active config
   path and generated project scope, refuses to replace user-owned entries, and
   shuts off live access immediately when disabled.
