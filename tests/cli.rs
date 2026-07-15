@@ -18,6 +18,7 @@ fn prints_help_and_version() {
         String::from_utf8_lossy(&version.stdout).trim(),
         format!("demons {}", env!("CARGO_PKG_VERSION"))
     );
+    assert!(String::from_utf8_lossy(&help.stdout).contains("--no-watch"));
 }
 
 #[test]

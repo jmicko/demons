@@ -13,6 +13,10 @@ pub struct Cli {
     #[arg(short, long, global = true, value_name = "PATH")]
     pub config: Option<PathBuf>,
 
+    /// Disable file watching for this session without changing the config.
+    #[arg(long, global = true)]
+    pub no_watch: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }

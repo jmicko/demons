@@ -295,7 +295,7 @@ fn parse_dev_u64(value: &str) -> Option<u64> {
     }
 }
 
-pub fn run(loaded: LoadedConfig) -> Result<()> {
+pub fn run(loaded: LoadedConfig, watch_enabled: bool) -> Result<()> {
     run_with_options(
         loaded,
         RunOptions {
@@ -303,6 +303,7 @@ pub fn run(loaded: LoadedConfig) -> Result<()> {
             open_menu: false,
             quit_when_menu_closes: false,
             start_after_config_save: false,
+            watch_enabled,
         },
     )
 }
@@ -315,11 +316,12 @@ pub fn configure(loaded: LoadedConfig) -> Result<()> {
             open_menu: true,
             quit_when_menu_closes: true,
             start_after_config_save: false,
+            watch_enabled: true,
         },
     )
 }
 
-pub fn recover_then_run(loaded: LoadedConfig) -> Result<()> {
+pub fn recover_then_run(loaded: LoadedConfig, watch_enabled: bool) -> Result<()> {
     run_with_options(
         loaded,
         RunOptions {
@@ -327,6 +329,7 @@ pub fn recover_then_run(loaded: LoadedConfig) -> Result<()> {
             open_menu: true,
             quit_when_menu_closes: false,
             start_after_config_save: true,
+            watch_enabled,
         },
     )
 }
@@ -377,6 +380,7 @@ struct RunOptions {
     open_menu: bool,
     quit_when_menu_closes: bool,
     start_after_config_save: bool,
+    watch_enabled: bool,
 }
 
 fn run_loop(
@@ -2768,7 +2772,9 @@ impl App {
             env: BTreeMap::new(),
             depends_on: Vec::new(),
             start_delay: None,
-            watch: None,
+            watch: Vec::new(),
+            watch_ignore: Vec::new(),
+            watch_delay: None,
             run_on_change: None,
             repeat: None,
         });
@@ -5775,7 +5781,9 @@ impl TaskRuntime {
                 env: BTreeMap::new(),
                 depends_on: Vec::new(),
                 start_delay: None,
-                watch: None,
+                watch: Vec::new(),
+                watch_ignore: Vec::new(),
+                watch_delay: None,
                 run_on_change: None,
                 repeat: None,
             },
@@ -7709,7 +7717,9 @@ fn terminal_runtime_task(terminal: TerminalPane) -> Task {
         env: terminal.env,
         depends_on: Vec::new(),
         start_delay: None,
-        watch: None,
+        watch: Vec::new(),
+        watch_ignore: Vec::new(),
+        watch_delay: None,
         run_on_change: None,
         repeat: None,
     }
@@ -9022,6 +9032,12 @@ fn setting_value_unchanged(menu: &MenuState, field: ConfigSettingField) -> bool 
         ConfigSettingField::McpStatusBar => {
             menu.draft.settings.mcp_status_bar == menu.original.settings.mcp_status_bar
         }
+        ConfigSettingField::WatchMode => {
+            menu.draft.settings.watch_mode == menu.original.settings.watch_mode
+        }
+        ConfigSettingField::WatchPollInterval => {
+            menu.draft.settings.watch_poll_interval == menu.original.settings.watch_poll_interval
+        }
     }
 }
 
@@ -9039,6 +9055,9 @@ fn task_value_unchanged(menu: &MenuState, index: usize, field: Option<ConfigTask
         Some(ConfigTaskField::Env) => current.env == original.env,
         Some(ConfigTaskField::Dependencies) => current.depends_on == original.depends_on,
         Some(ConfigTaskField::StartDelay) => current.start_delay == original.start_delay,
+        Some(ConfigTaskField::Watch) => current.watch == original.watch,
+        Some(ConfigTaskField::WatchIgnore) => current.watch_ignore == original.watch_ignore,
+        Some(ConfigTaskField::WatchDelay) => current.watch_delay == original.watch_delay,
         None => current == original,
     }
 }
@@ -9385,6 +9404,8 @@ fn setting_cursor(field: ConfigSettingField) -> usize {
         ConfigSettingField::Logging => 3,
         ConfigSettingField::McpAccess => 4,
         ConfigSettingField::McpStatusBar => 5,
+        ConfigSettingField::WatchMode => 6,
+        ConfigSettingField::WatchPollInterval => 7,
     }
 }
 
@@ -9396,6 +9417,8 @@ fn setting_field_label(field: ConfigSettingField) -> &'static str {
         ConfigSettingField::Logging => "logging",
         ConfigSettingField::McpAccess => "MCP access",
         ConfigSettingField::McpStatusBar => "MCP activity bar",
+        ConfigSettingField::WatchMode => "watcher mode",
+        ConfigSettingField::WatchPollInterval => "watch polling interval",
     }
 }
 
@@ -9407,6 +9430,9 @@ fn config_task_field_label(field: ConfigTaskField) -> &'static str {
         ConfigTaskField::Env => "environment",
         ConfigTaskField::Dependencies => "dependencies",
         ConfigTaskField::StartDelay => "start delay",
+        ConfigTaskField::Watch => "watched paths",
+        ConfigTaskField::WatchIgnore => "ignored paths",
+        ConfigTaskField::WatchDelay => "watch delay",
     }
 }
 
@@ -17667,7 +17693,9 @@ mod tests {
             env: BTreeMap::new(),
             depends_on: Vec::new(),
             start_delay: None,
-            watch: None,
+            watch: Vec::new(),
+            watch_ignore: Vec::new(),
+            watch_delay: None,
             run_on_change: None,
             repeat: None,
         }

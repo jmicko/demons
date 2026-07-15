@@ -52,7 +52,7 @@ Demons is intentionally minimal: it is **not** a session manager, a process supe
 # Config schema version, separate from the Demons app/crate version.
 # Current unversioned configs are treated as the current schema and are
 # normalized after they successfully validate. Older configs migrate to v4.
-schema_version = 4
+schema_version = 5
 
 # Optional. Demons-level settings.
 [settings]
@@ -404,7 +404,7 @@ For each pane:
 ## 9. Example `demons.toml`
 
 ```toml
-schema_version = 4
+schema_version = 5
 
 [settings]
 layout = "grid"

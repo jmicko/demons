@@ -9,11 +9,17 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 pub const CONFIG_FILE: &str = "demons.toml";
-pub const CURRENT_SCHEMA_VERSION: u32 = 4;
+pub const CURRENT_SCHEMA_VERSION: u32 = 5;
 pub const DEFAULT_MULTI_CLICK_MS: u64 = 500;
 pub const MIN_MULTI_CLICK_MS: u64 = 150;
 pub const MAX_MULTI_CLICK_MS: u64 = 1000;
 pub const MULTI_CLICK_STEP_MS: u64 = 50;
+pub const DEFAULT_WATCH_DELAY: &str = "250ms";
+pub const DEFAULT_WATCH_POLL_INTERVAL: &str = "1s";
+pub const MIN_WATCH_DELAY: Duration = Duration::from_millis(25);
+pub const MAX_WATCH_DELAY: Duration = Duration::from_secs(60);
+pub const MIN_WATCH_POLL_INTERVAL: Duration = Duration::from_millis(250);
+pub const MAX_WATCH_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_RECOVERY_WARNINGS: usize = 6;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -55,6 +61,10 @@ pub struct Settings {
     pub mcp_status_bar: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_scope_id: Option<String>,
+    #[serde(default)]
+    pub watch_mode: WatchMode,
+    #[serde(default = "default_watch_poll_interval")]
+    pub watch_poll_interval: String,
 }
 
 impl Default for Settings {
@@ -67,6 +77,8 @@ impl Default for Settings {
             mcp_access: McpAccess::Off,
             mcp_status_bar: true,
             mcp_scope_id: None,
+            watch_mode: WatchMode::Auto,
+            watch_poll_interval: DEFAULT_WATCH_POLL_INTERVAL.to_owned(),
         }
     }
 }
@@ -77,6 +89,38 @@ fn default_multi_click_ms() -> u64 {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_watch_poll_interval() -> String {
+    DEFAULT_WATCH_POLL_INTERVAL.to_owned()
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchMode {
+    #[default]
+    Auto,
+    Native,
+    Polling,
+}
+
+impl WatchMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Native => "Native",
+            Self::Polling => "Polling",
+        }
+    }
+
+    fn from_config(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(Self::Auto),
+            "native" => Some(Self::Native),
+            "polling" => Some(Self::Polling),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -179,8 +223,12 @@ pub struct Task {
     pub depends_on: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_delay: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub watch: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub watch_ignore: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub watch: Option<Vec<String>>,
+    pub watch_delay: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_on_change: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -299,6 +347,8 @@ pub enum ConfigSettingField {
     Logging,
     McpAccess,
     McpStatusBar,
+    WatchMode,
+    WatchPollInterval,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -309,6 +359,9 @@ pub enum ConfigTaskField {
     Env,
     Dependencies,
     StartDelay,
+    Watch,
+    WatchIgnore,
+    WatchDelay,
 }
 
 impl LoadedConfig {
@@ -696,6 +749,8 @@ fn recover_settings(
             "mcp_access",
             "mcp_status_bar",
             "mcp_scope_id",
+            "watch_mode",
+            "watch_poll_interval",
         ],
         ConfigProblemLocation::Settings,
         warnings,
@@ -841,6 +896,39 @@ fn recover_settings(
         mcp_scope_id = Some(scope);
     }
 
+    let watch_mode = match table.get("watch_mode") {
+        Some(value) => match value.as_str().and_then(WatchMode::from_config) {
+            Some(mode) => mode,
+            None => {
+                push_recovery_warning(
+                    warnings,
+                    problems,
+                    ConfigProblemLocation::Setting(ConfigSettingField::WatchMode),
+                    "Reset invalid settings.watch_mode to \"auto\".".to_owned(),
+                );
+                WatchMode::Auto
+            }
+        },
+        None => WatchMode::Auto,
+    };
+    let watch_poll_interval = match table.get("watch_poll_interval") {
+        Some(value) => match value.as_str() {
+            Some(value) if parse_watch_poll_interval(value).is_ok() => value.to_owned(),
+            _ => {
+                push_recovery_warning(
+                    warnings,
+                    problems,
+                    ConfigProblemLocation::Setting(ConfigSettingField::WatchPollInterval),
+                    format!(
+                        "Reset invalid settings.watch_poll_interval to {DEFAULT_WATCH_POLL_INTERVAL:?}."
+                    ),
+                );
+                DEFAULT_WATCH_POLL_INTERVAL.to_owned()
+            }
+        },
+        None => DEFAULT_WATCH_POLL_INTERVAL.to_owned(),
+    };
+
     Settings {
         layout,
         leader,
@@ -849,6 +937,8 @@ fn recover_settings(
         mcp_access,
         mcp_status_bar,
         mcp_scope_id,
+        watch_mode,
+        watch_poll_interval,
     }
 }
 
@@ -1178,6 +1268,8 @@ fn recover_task(
             "depends_on",
             "start_delay",
             "watch",
+            "watch_ignore",
+            "watch_delay",
             "run_on_change",
             "repeat",
         ],
@@ -1199,6 +1291,34 @@ fn recover_task(
         warnings,
         problems,
         index,
+        ConfigTaskField::StartDelay,
+    );
+    let watch = recover_path_list(
+        &name,
+        "watch",
+        table.get("watch"),
+        warnings,
+        problems,
+        index,
+        ConfigTaskField::Watch,
+    );
+    let watch_ignore = recover_path_list(
+        &name,
+        "watch_ignore",
+        table.get("watch_ignore"),
+        warnings,
+        problems,
+        index,
+        ConfigTaskField::WatchIgnore,
+    );
+    let watch_delay = recover_optional_string(
+        &name,
+        "watch_delay",
+        table.get("watch_delay"),
+        warnings,
+        problems,
+        index,
+        ConfigTaskField::WatchDelay,
     );
     warn_reserved_task_fields(&name, table, warnings, problems, index);
 
@@ -1210,7 +1330,9 @@ fn recover_task(
             env,
             depends_on: Vec::new(),
             start_delay,
-            watch: None,
+            watch,
+            watch_ignore,
+            watch_delay,
             run_on_change: None,
             repeat: None,
         },
@@ -1484,6 +1606,7 @@ fn recover_optional_string(
     warnings: &mut Vec<String>,
     problems: &mut Vec<ConfigProblem>,
     index: usize,
+    config_field: ConfigTaskField,
 ) -> Option<String> {
     match value {
         Some(value) => match value.as_str() {
@@ -1495,7 +1618,7 @@ fn recover_optional_string(
                     problems,
                     ConfigProblemLocation::Task {
                         index,
-                        field: Some(ConfigTaskField::StartDelay),
+                        field: Some(config_field),
                     },
                     format!("Ignored {field} for task {task_name:?} because it was not a string."),
                 );
@@ -1506,6 +1629,63 @@ fn recover_optional_string(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn recover_path_list(
+    task_name: &str,
+    field: &str,
+    value: Option<&toml::Value>,
+    warnings: &mut Vec<String>,
+    problems: &mut Vec<ConfigProblem>,
+    index: usize,
+    config_field: ConfigTaskField,
+) -> Vec<PathBuf> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    let Some(values) = value.as_array() else {
+        push_recovery_warning(
+            warnings,
+            problems,
+            ConfigProblemLocation::Task {
+                index,
+                field: Some(config_field),
+            },
+            format!("Ignored {field} for task {task_name:?} because it was not a list."),
+        );
+        return Vec::new();
+    };
+
+    let mut paths = Vec::new();
+    for value in values {
+        let Some(path) = value.as_str() else {
+            push_recovery_warning(
+                warnings,
+                problems,
+                ConfigProblemLocation::Task {
+                    index,
+                    field: Some(config_field),
+                },
+                format!("Ignored a non-string {field} entry for task {task_name:?}."),
+            );
+            continue;
+        };
+        if path.is_empty() || path.chars().any(char::is_control) {
+            push_recovery_warning(
+                warnings,
+                problems,
+                ConfigProblemLocation::Task {
+                    index,
+                    field: Some(config_field),
+                },
+                format!("Ignored an invalid {field} path for task {task_name:?}."),
+            );
+            continue;
+        }
+        paths.push(PathBuf::from(path));
+    }
+    paths
+}
+
 fn warn_reserved_task_fields(
     task_name: &str,
     table: &toml::map::Map<String, toml::Value>,
@@ -1513,7 +1693,7 @@ fn warn_reserved_task_fields(
     problems: &mut Vec<ConfigProblem>,
     index: usize,
 ) {
-    for field in ["watch", "run_on_change", "repeat"] {
+    for field in ["run_on_change", "repeat"] {
         if table.contains_key(field) {
             push_recovery_warning(
                 warnings,
@@ -1665,6 +1845,17 @@ fn repair_config_for_configurator(
             problems,
             ConfigProblemLocation::Setting(ConfigSettingField::MultiClick),
             format!("Reset invalid settings.multi_click_ms to {DEFAULT_MULTI_CLICK_MS}."),
+        );
+    }
+    if parse_watch_poll_interval(&config.settings.watch_poll_interval).is_err() {
+        config.settings.watch_poll_interval = DEFAULT_WATCH_POLL_INTERVAL.to_owned();
+        push_recovery_warning(
+            warnings,
+            problems,
+            ConfigProblemLocation::Setting(ConfigSettingField::WatchPollInterval),
+            format!(
+                "Reset invalid settings.watch_poll_interval to {DEFAULT_WATCH_POLL_INTERVAL:?}."
+            ),
         );
     }
     if config.settings.mcp_access.allows_read()
@@ -1878,14 +2069,6 @@ fn repair_reserved_task_fields(
     problems: &mut Vec<ConfigProblem>,
 ) {
     for (index, task) in config.tasks.iter_mut().enumerate() {
-        if task.watch.take().is_some() {
-            push_recovery_warning(
-                warnings,
-                problems,
-                ConfigProblemLocation::Task { index, field: None },
-                format!("Ignored reserved field watch for task {:?}.", task.name),
-            );
-        }
         if task.run_on_change.take().is_some() {
             push_recovery_warning(
                 warnings,
@@ -1939,6 +2122,12 @@ pub fn config_blocking_problems(config: &Config, path: &Path) -> Vec<ConfigProbl
             format!(
                 "settings.multi_click_ms must be between {MIN_MULTI_CLICK_MS} and {MAX_MULTI_CLICK_MS}."
             ),
+        ));
+    }
+    if let Err(error) = parse_watch_poll_interval(&config.settings.watch_poll_interval) {
+        problems.push(ConfigProblem::error(
+            ConfigProblemLocation::Setting(ConfigSettingField::WatchPollInterval),
+            format!("Watcher polling interval is invalid: {error:#}."),
         ));
     }
     if config.settings.mcp_access.allows_read()
@@ -2074,10 +2263,39 @@ pub fn config_blocking_problems(config: &Config, path: &Path) -> Vec<ConfigProbl
             ));
         }
 
-        if task.watch.is_some() || task.run_on_change.is_some() || task.repeat.is_some() {
+        if let Some(delay) = task.watch_delay.as_deref()
+            && let Err(error) = parse_watch_delay(delay)
+        {
+            problems.push(task_problem(
+                index,
+                ConfigTaskField::WatchDelay,
+                format!("Watch delay {delay:?} is invalid: {error:#}."),
+            ));
+        }
+
+        append_watch_path_problems(
+            &mut problems,
+            index,
+            ConfigTaskField::Watch,
+            "Watched path",
+            &cwd,
+            &task.watch,
+            true,
+        );
+        append_watch_path_problems(
+            &mut problems,
+            index,
+            ConfigTaskField::WatchIgnore,
+            "Ignored path",
+            &cwd,
+            &task.watch_ignore,
+            false,
+        );
+
+        if task.run_on_change.is_some() || task.repeat.is_some() {
             problems.push(ConfigProblem::error(
                 ConfigProblemLocation::Task { index, field: None },
-                "Task uses reserved watch, run_on_change, or repeat fields.",
+                "Task uses reserved run_on_change or repeat fields.",
             ));
         }
     }
@@ -2142,6 +2360,69 @@ pub fn config_blocking_problems(config: &Config, path: &Path) -> Vec<ConfigProbl
     problems
 }
 
+fn append_watch_path_problems(
+    problems: &mut Vec<ConfigProblem>,
+    task_index: usize,
+    field: ConfigTaskField,
+    label: &str,
+    task_cwd: &Path,
+    paths: &[PathBuf],
+    must_exist: bool,
+) {
+    let mut seen = HashSet::new();
+    for path in paths {
+        if let Some(error) = configured_path_error(path) {
+            problems.push(task_problem(task_index, field, format!("{label} {error}.")));
+            continue;
+        }
+        if !seen.insert(path) {
+            problems.push(task_problem(
+                task_index,
+                field,
+                format!("{label} {:?} is repeated.", path.display().to_string()),
+            ));
+            continue;
+        }
+        if must_exist {
+            let resolved = resolve_from_task_cwd(task_cwd, path);
+            match fs::metadata(&resolved) {
+                Ok(metadata) if metadata.is_file() || metadata.is_dir() => {}
+                Ok(_) => problems.push(task_problem(
+                    task_index,
+                    field,
+                    format!("{label} {} is not a file or directory.", resolved.display()),
+                )),
+                Err(error) => problems.push(task_problem(
+                    task_index,
+                    field,
+                    format!("{label} {} cannot be opened: {error}.", resolved.display()),
+                )),
+            }
+        }
+    }
+}
+
+fn configured_path_error(path: &Path) -> Option<&'static str> {
+    if path.as_os_str().is_empty() {
+        return Some("cannot be empty");
+    }
+    if path
+        .to_str()
+        .is_some_and(|value| value.chars().any(char::is_control))
+    {
+        return Some("cannot contain control characters");
+    }
+    None
+}
+
+pub fn resolve_from_task_cwd(task_cwd: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        task_cwd.join(path)
+    }
+}
+
 fn task_problem(index: usize, field: ConfigTaskField, message: impl Into<String>) -> ConfigProblem {
     ConfigProblem::error(
         ConfigProblemLocation::Task {
@@ -2193,6 +2474,13 @@ pub fn validate_for_path(config: &Config, path: &Path) -> Result<()> {
             path.display()
         );
     }
+    parse_watch_poll_interval(&config.settings.watch_poll_interval).with_context(|| {
+        format!(
+            "{}: settings.watch_poll_interval {:?} is invalid",
+            path.display(),
+            config.settings.watch_poll_interval
+        )
+    })?;
     if config.settings.mcp_access.allows_read()
         && config
             .settings
@@ -2295,6 +2583,16 @@ pub fn validate_for_path(config: &Config, path: &Path) -> Result<()> {
                 )
             })?;
         }
+        if let Some(delay) = task.watch_delay.as_deref() {
+            parse_watch_delay(delay).with_context(|| {
+                format!(
+                    "{}: task {:?} has invalid watch_delay {:?}",
+                    path.display(),
+                    task.name,
+                    delay
+                )
+            })?;
+        }
 
         let cwd = if task.cwd.is_absolute() {
             task.cwd.clone()
@@ -2310,9 +2608,19 @@ pub fn validate_for_path(config: &Config, path: &Path) -> Result<()> {
             );
         }
 
-        if task.watch.is_some() || task.run_on_change.is_some() || task.repeat.is_some() {
+        validate_watch_paths(&task.name, &cwd, "watch", &task.watch, true, path)?;
+        validate_watch_paths(
+            &task.name,
+            &cwd,
+            "watch_ignore",
+            &task.watch_ignore,
+            false,
+            path,
+        )?;
+
+        if task.run_on_change.is_some() || task.repeat.is_some() {
             bail!(
-                "{}: task {:?} uses watch, run_on_change, or repeat; these fields are reserved for \
+                "{}: task {:?} uses run_on_change or repeat; these fields are reserved for \
                  a future release",
                 path.display(),
                 task.name
@@ -2383,7 +2691,91 @@ pub fn validate_for_path(config: &Config, path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn validate_watch_paths(
+    task_name: &str,
+    task_cwd: &Path,
+    field: &str,
+    paths: &[PathBuf],
+    must_exist: bool,
+    config_path: &Path,
+) -> Result<()> {
+    let mut seen = HashSet::new();
+    for watch_path in paths {
+        if let Some(error) = configured_path_error(watch_path) {
+            bail!(
+                "{}: task {:?} {field} path {}",
+                config_path.display(),
+                task_name,
+                error
+            );
+        }
+        if !seen.insert(watch_path) {
+            bail!(
+                "{}: task {:?} repeats {field} path {:?}",
+                config_path.display(),
+                task_name,
+                watch_path
+            );
+        }
+        if !must_exist {
+            continue;
+        }
+        let resolved = resolve_from_task_cwd(task_cwd, watch_path);
+        let metadata = fs::metadata(&resolved).with_context(|| {
+            format!(
+                "{}: task {:?} {field} path does not exist: {}",
+                config_path.display(),
+                task_name,
+                resolved.display()
+            )
+        })?;
+        if !metadata.is_file() && !metadata.is_dir() {
+            bail!(
+                "{}: task {:?} {field} path is not a file or directory: {}",
+                config_path.display(),
+                task_name,
+                resolved.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn parse_start_delay(value: &str) -> Result<Duration> {
+    parse_duration(value)
+}
+
+pub fn parse_watch_delay(value: &str) -> Result<Duration> {
+    parse_bounded_duration(value, "watch delay", MIN_WATCH_DELAY, MAX_WATCH_DELAY)
+}
+
+pub fn parse_watch_poll_interval(value: &str) -> Result<Duration> {
+    parse_bounded_duration(
+        value,
+        "watch polling interval",
+        MIN_WATCH_POLL_INTERVAL,
+        MAX_WATCH_POLL_INTERVAL,
+    )
+}
+
+fn parse_bounded_duration(
+    value: &str,
+    label: &str,
+    minimum: Duration,
+    maximum: Duration,
+) -> Result<Duration> {
+    let duration = parse_duration(value)?;
+    if !(minimum..=maximum).contains(&duration) {
+        bail!(
+            "{label} must be between {}ms and {}ms",
+            minimum.as_millis(),
+            maximum.as_millis()
+        );
+    }
+    Ok(duration)
+}
+
+fn parse_duration(value: &str) -> Result<Duration> {
     let value = value.trim();
     if value.is_empty() {
         bail!("delay cannot be empty");
@@ -2599,7 +2991,7 @@ mod tests {
 
         assert_eq!(loaded.config.schema_version, CURRENT_SCHEMA_VERSION);
         let saved = fs::read_to_string(path).unwrap();
-        assert!(saved.contains("schema_version = 4"));
+        assert!(saved.contains("schema_version = 5"));
         assert!(saved.contains("[settings]"));
         assert!(saved.contains("layout = \"grid\""));
         assert!(saved.contains("leader = \"alt-j\""));
@@ -2644,7 +3036,7 @@ mod tests {
         assert!(
             fs::read_to_string(path)
                 .unwrap()
-                .contains("schema_version = 4")
+                .contains("schema_version = 5")
         );
     }
 
@@ -2765,8 +3157,6 @@ mod tests {
             name = "server"
             command = "echo one"
             depends_on = ["missing", "server"]
-            watch = ["src/**/*.rs"]
-
             [[task]]
             name = "server"
             command = "echo two"
@@ -2782,7 +3172,7 @@ mod tests {
         assert_eq!(loaded.config.tasks[0].name, "server");
         assert_eq!(loaded.config.tasks[1].name, "server2");
         assert!(loaded.config.tasks[0].depends_on.is_empty());
-        assert!(loaded.config.tasks[0].watch.is_none());
+        assert!(loaded.config.tasks[0].watch.is_empty());
         assert!(loaded.config.tasks[1].repeat.is_none());
         validate_for_path(&loaded.config, &path).unwrap();
     }
@@ -2794,7 +3184,7 @@ mod tests {
         fs::write(
             &path,
             r#"
-                schema_version = 5
+                schema_version = 6
                 future_setting = true
             "#,
         )
@@ -2804,7 +3194,7 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert!(error.contains("uses config schema_version 5"));
+        assert!(error.contains("uses config schema_version 6"));
     }
 
     #[test]
@@ -2924,7 +3314,7 @@ mod tests {
     fn load_does_not_rewrite_current_version_config() {
         let temp = tempdir().unwrap();
         let path = temp.path().join(CONFIG_FILE);
-        let original = r#"schema_version = 4
+        let original = r#"schema_version = 5
 
 [[task]]
 name = "server"
@@ -2944,7 +3334,7 @@ command = "echo ok"
         fs::write(
             &path,
             r#"
-                schema_version = 5
+                schema_version = 6
                 future_setting = true
             "#,
         )
@@ -2952,8 +3342,8 @@ command = "echo ok"
 
         let error = parse_file(&path).unwrap_err().to_string();
 
-        assert!(error.contains("uses config schema_version 5"));
-        assert!(error.contains("supports schema_version 4"));
+        assert!(error.contains("uses config schema_version 6"));
+        assert!(error.contains("supports schema_version 5"));
     }
 
     #[test]
@@ -3220,7 +3610,7 @@ command = "echo ok"
     }
 
     #[test]
-    fn schema_v2_migrates_to_v4_with_mcp_defaults() {
+    fn schema_v2_migrates_to_v5_with_current_defaults() {
         let temp = tempdir().unwrap();
         let path = temp.path().join(CONFIG_FILE);
         fs::write(
@@ -3237,17 +3627,22 @@ command = "echo ok"
 
         let loaded = LoadedConfig::load(path.clone()).unwrap();
 
-        assert_eq!(loaded.config.schema_version, 4);
+        assert_eq!(loaded.config.schema_version, 5);
         assert_eq!(loaded.config.settings.mcp_access, McpAccess::Off);
         assert!(loaded.config.settings.mcp_status_bar);
         assert!(loaded.config.settings.mcp_scope_id.is_none());
+        assert_eq!(loaded.config.settings.watch_mode, WatchMode::Auto);
+        assert_eq!(
+            loaded.config.settings.watch_poll_interval,
+            DEFAULT_WATCH_POLL_INTERVAL
+        );
         let saved = fs::read_to_string(path).unwrap();
         assert!(saved.contains("mcp_access = \"off\""));
         assert!(saved.contains("mcp_status_bar = true"));
     }
 
     #[test]
-    fn schema_v3_migrates_to_v4_with_mcp_status_bar_enabled() {
+    fn schema_v3_migrates_to_v5_with_current_defaults() {
         let temp = tempdir().unwrap();
         let path = temp.path().join(CONFIG_FILE);
         fs::write(
@@ -3268,7 +3663,7 @@ command = "echo ok"
 
         let loaded = LoadedConfig::load(path.clone()).unwrap();
 
-        assert_eq!(loaded.config.schema_version, 4);
+        assert_eq!(loaded.config.schema_version, 5);
         assert!(loaded.config.settings.mcp_status_bar);
         let saved = fs::read_to_string(path).unwrap();
         assert!(saved.contains("mcp_status_bar = true"));
@@ -3313,7 +3708,9 @@ command = "echo ok"
             env: BTreeMap::new(),
             depends_on: Vec::new(),
             start_delay: None,
-            watch: None,
+            watch: Vec::new(),
+            watch_ignore: Vec::new(),
+            watch_delay: None,
             run_on_change: None,
             repeat: None,
         });
@@ -3350,5 +3747,166 @@ command = "echo ok"
                 .any(|warning| warning.contains("scope ID"))
         );
         assert_eq!(fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
+    fn validates_and_serializes_watcher_configuration() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join(CONFIG_FILE);
+        fs::create_dir(temp.path().join("src")).unwrap();
+        fs::write(temp.path().join("Cargo.toml"), "[package]\n").unwrap();
+        let config: Config = toml::from_str(
+            r#"
+                schema_version = 5
+
+                [settings]
+                watch_mode = "polling"
+                watch_poll_interval = "750ms"
+
+                [[task]]
+                name = "server"
+                command = "echo ready"
+                watch = ["src", "Cargo.toml"]
+                watch_ignore = ["src/generated", "missing-output"]
+                watch_delay = "125ms"
+            "#,
+        )
+        .unwrap();
+
+        validate_for_path(&config, &path).unwrap();
+        assert_eq!(config.settings.watch_mode, WatchMode::Polling);
+        assert_eq!(config.tasks[0].watch.len(), 2);
+        assert_eq!(config.tasks[0].watch_ignore.len(), 2);
+        assert_eq!(
+            parse_watch_delay("125ms").unwrap(),
+            Duration::from_millis(125)
+        );
+        assert_eq!(
+            parse_watch_poll_interval("750ms").unwrap(),
+            Duration::from_millis(750)
+        );
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        assert!(serialized.contains("watch = ["));
+        assert!(serialized.contains("watch_ignore = ["));
+        assert!(serialized.contains("watch_delay = \"125ms\""));
+    }
+
+    #[test]
+    fn missing_watched_target_is_blocking_and_does_not_rewrite() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join(CONFIG_FILE);
+        let original = r#"schema_version = 5
+
+[[task]]
+name = "server"
+command = "echo ready"
+watch = ["missing"]
+"#;
+        fs::write(&path, original).unwrap();
+
+        let error = LoadedConfig::load(path.clone()).unwrap_err().to_string();
+        assert!(error.contains("watch path does not exist"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+
+        let loaded = LoadedConfig::load_unvalidated_or_default(path.clone()).unwrap();
+        assert!(loaded.config_problems.iter().any(|problem| {
+            problem.severity == ConfigProblemSeverity::Error
+                && problem.location
+                    == ConfigProblemLocation::Task {
+                        index: 0,
+                        field: Some(ConfigTaskField::Watch),
+                    }
+        }));
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
+    fn watcher_rejects_duplicate_paths_and_out_of_range_timings() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join(CONFIG_FILE);
+        fs::create_dir(temp.path().join("src")).unwrap();
+        let mut config: Config = toml::from_str(
+            r#"
+                schema_version = 5
+
+                [[task]]
+                name = "server"
+                command = "echo ready"
+                watch = ["src", "src"]
+            "#,
+        )
+        .unwrap();
+
+        assert!(validate_for_path(&config, &path).is_err());
+        config.tasks[0].watch.pop();
+        config.tasks[0].watch_delay = Some("24ms".to_owned());
+        assert!(validate_for_path(&config, &path).is_err());
+        config.tasks[0].watch_delay = Some("60s".to_owned());
+        config.settings.watch_poll_interval = "249ms".to_owned();
+        assert!(validate_for_path(&config, &path).is_err());
+        config.settings.watch_poll_interval = "60s".to_owned();
+        validate_for_path(&config, &path).unwrap();
+        assert!(parse_watch_delay("60001ms").is_err());
+        assert!(parse_watch_poll_interval("61s").is_err());
+    }
+
+    #[test]
+    fn configurator_recovers_invalid_watcher_settings_without_rewriting() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join(CONFIG_FILE);
+        let original = r#"schema_version = 5
+
+[settings]
+watch_mode = "turbo"
+watch_poll_interval = "immediately"
+
+[[task]]
+name = "server"
+command = "echo ready"
+"#;
+        fs::write(&path, original).unwrap();
+
+        let loaded = LoadedConfig::load_unvalidated_or_default(path.clone()).unwrap();
+
+        assert_eq!(loaded.config.settings.watch_mode, WatchMode::Auto);
+        assert_eq!(
+            loaded.config.settings.watch_poll_interval,
+            DEFAULT_WATCH_POLL_INTERVAL
+        );
+        assert!(loaded.config_problems.iter().any(|problem| {
+            problem.location == ConfigProblemLocation::Setting(ConfigSettingField::WatchMode)
+        }));
+        assert!(loaded.config_problems.iter().any(|problem| {
+            problem.location
+                == ConfigProblemLocation::Setting(ConfigSettingField::WatchPollInterval)
+        }));
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watcher_accepts_symlinks_to_files_and_directories() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let path = temp.path().join(CONFIG_FILE);
+        fs::create_dir(temp.path().join("real-dir")).unwrap();
+        fs::write(temp.path().join("real-file"), "ready").unwrap();
+        symlink("real-dir", temp.path().join("dir-link")).unwrap();
+        symlink("real-file", temp.path().join("file-link")).unwrap();
+        let config: Config = toml::from_str(
+            r#"
+                schema_version = 5
+
+                [[task]]
+                name = "server"
+                command = "echo ready"
+                watch = ["dir-link", "file-link"]
+                watch_ignore = ["future-link"]
+            "#,
+        )
+        .unwrap();
+
+        validate_for_path(&config, &path).unwrap();
     }
 }

@@ -102,12 +102,12 @@ fn try_main() -> Result<()> {
         Ok(loaded) => loaded,
         Err(error) => match LoadedConfig::load_unvalidated_or_default(path) {
             Ok(loaded) if !loaded.config_problems.is_empty() => {
-                return runtime::recover_then_run(loaded);
+                return runtime::recover_then_run(loaded, !cli.no_watch);
             }
             _ => return Err(error),
         },
     };
-    runtime::run(loaded)
+    runtime::run(loaded, !cli.no_watch)
 }
 
 fn init_path(explicit: Option<PathBuf>, cwd: &std::path::Path) -> Result<PathBuf> {
