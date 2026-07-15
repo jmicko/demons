@@ -9,6 +9,7 @@ mod layout;
 #[cfg(unix)]
 mod mcp_server;
 mod runtime;
+mod watch;
 
 use std::{
     env,

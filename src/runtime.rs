@@ -5,7 +5,7 @@ use std::os::{
 };
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     env, fs,
     io::{self, IsTerminal, Read, Stdout, Write},
     path::{Path, PathBuf},
@@ -46,15 +46,17 @@ use crate::{
     codex_config,
     config::{
         ConfigProblem, ConfigProblemLocation, ConfigProblemSeverity, ConfigSettingField,
-        ConfigTaskField, ConfigTerminalField, Leader, LoadedConfig, MAX_MULTI_CLICK_MS,
-        MIN_MULTI_CLICK_MS, MULTI_CLICK_STEP_MS, McpAccess, Task, TaskCommand, TerminalPane,
-        config_blocking_problems, parse_start_delay,
+        ConfigTaskField, ConfigTerminalField, DEFAULT_WATCH_DELAY, Leader, LoadedConfig,
+        MAX_MULTI_CLICK_MS, MIN_MULTI_CLICK_MS, MULTI_CLICK_STEP_MS, McpAccess, Task, TaskCommand,
+        TerminalPane, WatchMode, config_blocking_problems, parse_start_delay, parse_watch_delay,
+        parse_watch_poll_interval, resolve_from_task_cwd,
     },
     control::{
         self, ControlEnvelope, ControlListener, ControlRequest, ControlResponse, OutputPage,
         PaneInfo, PaneKind, SearchMatch, SearchResults, WaitResult,
     },
     layout::{Grid, choose_grid, grid_rects, pane_rects},
+    watch::{WatchEvent, WatchService},
 };
 
 // Keep the long archive compact; vt100 remains authoritative for the live
@@ -76,6 +78,7 @@ const MCP_ACTIVITY_BUTTON_WIDTH: u16 = 3;
 #[cfg(all(not(test), target_os = "linux"))]
 const SYSTEM_CLIPBOARD_WAIT: Duration = Duration::from_millis(150);
 const MAX_OSC52_BYTES: usize = 512 * 1024;
+const MAX_WATCH_CHANGE_PATHS: usize = 16;
 const BRACKETED_PASTE_START: &str = "\x1b[200~";
 const BRACKETED_PASTE_END: &str = "\x1b[201~";
 const DEV_SCENE_ENV: &str = "DEMONS_DEV_SCENE";
@@ -352,6 +355,7 @@ fn run_with_options(loaded: LoadedConfig, options: RunOptions) -> Result<()> {
         registry,
         options.quit_when_menu_closes,
         options.start_after_config_save,
+        options.watch_enabled,
     );
     if let Err(error) = app.sync_control_listener() {
         app.set_notice(format!("MCP control unavailable: {error:#}"));
@@ -363,6 +367,7 @@ fn run_with_options(loaded: LoadedConfig, options: RunOptions) -> Result<()> {
     let initial_area = Rect::new(0, 0, initial_size.width, initial_size.height);
     app.update_layout(initial_area);
     if options.start_tasks {
+        app.sync_watch_service()?;
         app.spawn_all();
     }
 
@@ -629,6 +634,16 @@ struct App {
     pending_captures: VecDeque<PendingCapture>,
     capture_worker: Option<CaptureWorker>,
     last_cursor_position: Option<(u16, u16)>,
+    watch_enabled: bool,
+    watcher: Option<WatchService>,
+    pending_watch_changes: BTreeMap<String, PendingWatchChange>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingWatchChange {
+    deadline: Instant,
+    paths: BTreeSet<PathBuf>,
+    overflow: bool,
 }
 
 struct ControlRuntime {
@@ -675,6 +690,7 @@ impl App {
         registry: ProcessRegistry,
         quit_when_menu_closes: bool,
         start_after_config_save: bool,
+        watch_enabled: bool,
     ) -> Self {
         let mut tasks = loaded
             .config
@@ -750,7 +766,21 @@ impl App {
             pending_captures: VecDeque::new(),
             capture_worker: None,
             last_cursor_position: None,
+            watch_enabled,
+            watcher: None,
+            pending_watch_changes: BTreeMap::new(),
         }
+    }
+
+    fn sync_watch_service(&mut self) -> Result<()> {
+        let watcher = if self.quit_when_menu_closes {
+            None
+        } else {
+            WatchService::start(&self.loaded.root, &self.loaded.config, self.watch_enabled)?
+        };
+        self.watcher = watcher;
+        self.pending_watch_changes.clear();
+        Ok(())
     }
 
     fn spawn_all(&mut self) {
@@ -2109,8 +2139,22 @@ impl App {
         {
             return self.handle_menu_env_key(key);
         }
+        if self
+            .menu
+            .as_ref()
+            .is_some_and(|menu| menu.watch_owner.is_some())
+        {
+            return self.handle_menu_watch_key(key);
+        }
         if self.menu.as_ref().is_some_and(|menu| menu.leader_picker) {
             return self.handle_menu_leader_key(key);
+        }
+        if self
+            .menu
+            .as_ref()
+            .is_some_and(|menu| menu.watch_mode_picker)
+        {
+            return self.handle_menu_watch_mode_key(key);
         }
         if self
             .menu
@@ -2181,6 +2225,23 @@ impl App {
         Ok(Action::Continue)
     }
 
+    fn handle_menu_watch_key(&mut self, key: KeyEvent) -> Result<Action> {
+        match key.code {
+            KeyCode::Esc => return Ok(self.menu_back_or_close()),
+            KeyCode::Up | KeyCode::Char('k') => self.move_menu_watch_cursor(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_menu_watch_cursor(1),
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                return self.activate_selected_menu_item();
+            }
+            KeyCode::Delete => self.delete_selected_watch_path(),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Ok(self.request_quit());
+            }
+            _ => {}
+        }
+        Ok(Action::Continue)
+    }
+
     fn handle_menu_leader_key(&mut self, key: KeyEvent) -> Result<Action> {
         match key.code {
             KeyCode::Esc => {
@@ -2192,6 +2253,25 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => self.move_menu_leader_cursor(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_menu_leader_cursor(1),
             KeyCode::Enter | KeyCode::Char(' ') => self.select_menu_leader(),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Ok(self.request_quit());
+            }
+            _ => {}
+        }
+        Ok(Action::Continue)
+    }
+
+    fn handle_menu_watch_mode_key(&mut self, key: KeyEvent) -> Result<Action> {
+        match key.code {
+            KeyCode::Esc => {
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.watch_mode_picker = false;
+                    menu.watch_mode_cursor = 0;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.move_menu_watch_mode_cursor(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_menu_watch_mode_cursor(1),
+            KeyCode::Enter | KeyCode::Char(' ') => self.select_menu_watch_mode(),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 return Ok(self.request_quit());
             }
@@ -2258,7 +2338,7 @@ impl App {
                 return Ok(self.request_quit());
             }
             KeyCode::Enter => self.submit_menu_edit(),
-            KeyCode::Tab => self.complete_menu_cwd(),
+            KeyCode::Tab => self.complete_menu_path(),
             KeyCode::Backspace => self.delete_menu_edit_char_before_cursor(),
             KeyCode::Delete => self.delete_menu_edit_char_at_cursor(),
             KeyCode::Left => {
@@ -2329,7 +2409,12 @@ impl App {
         menu.env_owner = None;
         menu.env_detail_key = None;
         menu.env_cursor = 0;
+        menu.watch_owner = None;
+        menu.watch_detail = None;
+        menu.watch_cursor = 0;
         menu.leader_picker = false;
+        menu.watch_mode_picker = false;
+        menu.watch_mode_cursor = 0;
         menu.mcp_access_picker = false;
         menu.mcp_empty_file_prompt = None;
         menu.mcp_empty_file_cursor = 0;
@@ -2384,11 +2469,30 @@ impl App {
         }
     }
 
+    fn move_menu_watch_cursor(&mut self, delta: isize) {
+        let count = self.menu.as_ref().map(watch_item_count).unwrap_or(0);
+        if count == 0 {
+            return;
+        }
+        if let Some(menu) = self.menu.as_mut() {
+            menu.watch_cursor =
+                (menu.watch_cursor as isize + delta).rem_euclid(count as isize) as usize;
+        }
+    }
+
     fn move_menu_leader_cursor(&mut self, delta: isize) {
         let count = all_leaders().len();
         if let Some(menu) = self.menu.as_mut() {
             menu.leader_cursor =
                 (menu.leader_cursor as isize + delta).rem_euclid(count as isize) as usize;
+        }
+    }
+
+    fn move_menu_watch_mode_cursor(&mut self, delta: isize) {
+        let count = all_watch_modes().len();
+        if let Some(menu) = self.menu.as_mut() {
+            menu.watch_mode_cursor =
+                (menu.watch_mode_cursor as isize + delta).rem_euclid(count as isize) as usize;
         }
     }
 
@@ -2486,6 +2590,9 @@ impl App {
                 if menu.env_owner.is_some() {
                     return selected_env_action(menu);
                 }
+                if menu.watch_owner.is_some() {
+                    return selected_watch_action(menu);
+                }
                 if menu.task_detail.is_some() {
                     return task_detail_fields()
                         .get(menu.cursor)
@@ -2515,6 +2622,8 @@ impl App {
                 2 => Some(MenuAction::AdjustMultiClick(MULTI_CLICK_STEP_MS as i64)),
                 4 => Some(MenuAction::OpenMcpAccessPicker),
                 5 => Some(MenuAction::ToggleMcpStatusBar),
+                6 => Some(MenuAction::OpenWatchModePicker),
+                7 => Some(MenuAction::EditWatchPollInterval),
                 _ => None,
             },
             MenuTab::Exit => {
@@ -2542,7 +2651,12 @@ impl App {
                     menu.env_owner = None;
                     menu.env_detail_key = None;
                     menu.env_cursor = 0;
+                    menu.watch_owner = None;
+                    menu.watch_detail = None;
+                    menu.watch_cursor = 0;
                     menu.leader_picker = false;
+                    menu.watch_mode_picker = false;
+                    menu.watch_mode_cursor = 0;
                     menu.mcp_access_picker = false;
                     menu.mcp_empty_file_prompt = None;
                     menu.mcp_empty_file_cursor = 0;
@@ -2560,6 +2674,9 @@ impl App {
                     menu.env_owner = None;
                     menu.env_detail_key = None;
                     menu.env_cursor = 0;
+                    menu.watch_owner = None;
+                    menu.watch_detail = None;
+                    menu.watch_cursor = 0;
                 }
             }
             MenuAction::OpenTerminal(index) => {
@@ -2573,6 +2690,9 @@ impl App {
                     menu.env_owner = None;
                     menu.env_detail_key = None;
                     menu.env_cursor = 0;
+                    menu.watch_owner = None;
+                    menu.watch_detail = None;
+                    menu.watch_cursor = 0;
                 }
             }
             MenuAction::AddTask => self.add_menu_task(),
@@ -2585,8 +2705,16 @@ impl App {
             MenuAction::EnvField(field) => self.activate_env_field(field),
             MenuAction::DeleteEnvVar => self.delete_selected_env_var(),
             MenuAction::BackEnv => self.back_env_menu(),
+            MenuAction::OpenWatchPath(index) => self.open_watch_path(index),
+            MenuAction::AddWatchPath => self.start_watch_path_edit(None),
+            MenuAction::EditWatchPath => self.edit_selected_watch_path(),
+            MenuAction::DeleteWatchPath => self.delete_selected_watch_path(),
+            MenuAction::BackWatchPaths => self.back_watch_paths(),
             MenuAction::OpenLeaderPicker => self.open_menu_leader_picker(),
             MenuAction::SelectLeader(leader) => self.set_menu_leader(leader),
+            MenuAction::OpenWatchModePicker => self.open_menu_watch_mode_picker(),
+            MenuAction::SelectWatchMode(mode) => self.set_menu_watch_mode(mode),
+            MenuAction::EditWatchPollInterval => self.start_watch_poll_interval_edit(),
             MenuAction::OpenMcpAccessPicker => self.open_menu_mcp_access_picker(),
             MenuAction::SelectMcpAccess(access) => self.request_menu_mcp_access(access),
             MenuAction::ToggleMcpStatusBar => self.toggle_menu_mcp_status_bar(),
@@ -2619,7 +2747,11 @@ impl App {
         menu.env_owner = None;
         menu.env_detail_key = None;
         menu.env_cursor = 0;
+        menu.watch_owner = None;
+        menu.watch_detail = None;
+        menu.watch_cursor = 0;
         menu.leader_picker = false;
+        menu.watch_mode_picker = false;
         match problem.location {
             ConfigProblemLocation::Root => {
                 menu.tab = MenuTab::Exit;
@@ -2720,9 +2852,31 @@ impl App {
             };
             return Action::Continue;
         }
+        if menu.watch_detail.is_some() {
+            menu.watch_detail = None;
+            menu.watch_cursor = 0;
+            return Action::Continue;
+        }
+        if let Some(owner) = menu.watch_owner.take() {
+            menu.watch_cursor = 0;
+            menu.cursor = match owner.kind {
+                WatchPathKind::Watched => {
+                    config_task_field_cursor(ConfigTaskField::Watch).unwrap_or(menu.cursor)
+                }
+                WatchPathKind::Ignored => {
+                    config_task_field_cursor(ConfigTaskField::WatchIgnore).unwrap_or(menu.cursor)
+                }
+            };
+            return Action::Continue;
+        }
         if menu.leader_picker {
             menu.leader_picker = false;
             menu.leader_cursor = 0;
+            return Action::Continue;
+        }
+        if menu.watch_mode_picker {
+            menu.watch_mode_picker = false;
+            menu.watch_mode_cursor = 0;
             return Action::Continue;
         }
         if menu.mcp_empty_file_prompt.is_some() {
@@ -2810,7 +2964,11 @@ impl App {
             return;
         };
         match field {
-            TaskField::Name | TaskField::Command | TaskField::Cwd | TaskField::StartDelay => {
+            TaskField::Name
+            | TaskField::Command
+            | TaskField::Cwd
+            | TaskField::StartDelay
+            | TaskField::WatchDelay => {
                 self.start_menu_edit(task, field);
             }
             TaskField::Env => {
@@ -2824,6 +2982,20 @@ impl App {
                 if let Some(menu) = self.menu.as_mut() {
                     menu.dependency_task = Some(task);
                     menu.dependency_cursor = 0;
+                }
+            }
+            TaskField::Watch | TaskField::WatchIgnore => {
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.watch_owner = Some(WatchPathOwner {
+                        task,
+                        kind: if field == TaskField::Watch {
+                            WatchPathKind::Watched
+                        } else {
+                            WatchPathKind::Ignored
+                        },
+                    });
+                    menu.watch_detail = None;
+                    menu.watch_cursor = 0;
                 }
             }
             TaskField::Delete => self.delete_menu_task(task),
@@ -2874,6 +3046,10 @@ impl App {
             TaskField::Command => task.command.display(),
             TaskField::Cwd => task.cwd.to_string_lossy().into_owned(),
             TaskField::StartDelay => task.start_delay.clone().unwrap_or_default(),
+            TaskField::WatchDelay => task
+                .watch_delay
+                .clone()
+                .unwrap_or_else(|| DEFAULT_WATCH_DELAY.to_owned()),
             _ => return,
         };
         menu.edit = Some(MenuEdit {
@@ -2923,6 +3099,23 @@ impl App {
 
     fn apply_menu_edit(&mut self, edit: &MenuEdit) -> Result<()> {
         let root = self.loaded.root.clone();
+        if matches!(edit.target, MenuEditTarget::WatchPollInterval) {
+            let value = edit.value.trim().to_owned();
+            parse_watch_poll_interval(&value)?;
+            let previous = self.loaded.config.settings.watch_poll_interval.clone();
+            if let Some(menu) = self.menu.as_mut() {
+                menu.draft.settings.watch_poll_interval = value.clone();
+            }
+            self.loaded.config.settings.watch_poll_interval = value;
+            if let Err(error) = self.sync_watch_service() {
+                self.loaded.config.settings.watch_poll_interval = previous.clone();
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.draft.settings.watch_poll_interval = previous;
+                }
+                return Err(error.context("could not apply watcher polling interval"));
+            }
+            return Ok(());
+        }
         let Some(menu) = self.menu.as_mut() else {
             return Ok(());
         };
@@ -2955,6 +3148,14 @@ impl App {
                         } else {
                             parse_start_delay(&value)?;
                             task.start_delay = Some(value);
+                        }
+                    }
+                    TaskField::WatchDelay => {
+                        if value.is_empty() || value == DEFAULT_WATCH_DELAY {
+                            task.watch_delay = None;
+                        } else {
+                            parse_watch_delay(&value)?;
+                            task.watch_delay = Some(value);
                         }
                     }
                     _ => {}
@@ -3013,30 +3214,97 @@ impl App {
                 }
                 env.insert(key.clone(), edit.value.clone());
             }
+            MenuEditTarget::WatchPath { owner, index } => {
+                let value = edit.value.trim();
+                if value.is_empty() {
+                    anyhow::bail!("path cannot be empty");
+                }
+                if value.chars().any(char::is_control) {
+                    anyhow::bail!("path cannot contain control characters");
+                }
+                let path = PathBuf::from(value);
+                let task = menu
+                    .draft
+                    .tasks
+                    .get(owner.task)
+                    .context("task no longer exists")?;
+                let task_cwd = if task.cwd.is_absolute() {
+                    task.cwd.clone()
+                } else {
+                    root.join(&task.cwd)
+                };
+                if owner.kind == WatchPathKind::Watched {
+                    let resolved = resolve_from_task_cwd(&task_cwd, &path);
+                    match fs::metadata(&resolved) {
+                        Ok(metadata) if metadata.is_file() || metadata.is_dir() => {}
+                        Ok(_) => anyhow::bail!(
+                            "watched path is not a file or directory: {}",
+                            resolved.display()
+                        ),
+                        Err(error) => anyhow::bail!(
+                            "watched path cannot be opened: {}: {error}",
+                            resolved.display()
+                        ),
+                    }
+                }
+                let paths = menu_watch_paths_mut(menu, *owner).context("task no longer exists")?;
+                if paths
+                    .iter()
+                    .enumerate()
+                    .any(|(candidate_index, candidate)| {
+                        Some(candidate_index) != *index && candidate == &path
+                    })
+                {
+                    anyhow::bail!("path is already listed");
+                }
+                match index {
+                    Some(index) => {
+                        let entry = paths.get_mut(*index).context("path no longer exists")?;
+                        *entry = path;
+                        menu.watch_detail = Some(*index);
+                    }
+                    None => {
+                        paths.push(path);
+                        menu.watch_detail = Some(paths.len() - 1);
+                    }
+                }
+                menu.watch_cursor = 0;
+            }
+            MenuEditTarget::WatchPollInterval => unreachable!(),
         }
         Ok(())
     }
 
-    fn complete_menu_cwd(&mut self) {
-        let root = self.loaded.root.clone();
-        let Some((value, cursor)) = self.menu.as_ref().and_then(|menu| {
+    fn complete_menu_path(&mut self) {
+        let config_root = self.loaded.root.clone();
+        let Some((root, value, cursor, kind)) = self.menu.as_ref().and_then(|menu| {
             let edit = menu.edit.as_ref()?;
-            matches!(
-                &edit.target,
+            let (root, kind) = match &edit.target {
                 MenuEditTarget::TaskField {
                     field: TaskField::Cwd,
                     ..
-                } | MenuEditTarget::TerminalField {
+                }
+                | MenuEditTarget::TerminalField {
                     field: TerminalField::Cwd,
                     ..
+                } => (config_root.clone(), CompletionKind::Directories),
+                MenuEditTarget::WatchPath { owner, .. } => {
+                    let task = menu.draft.tasks.get(owner.task)?;
+                    let root = if task.cwd.is_absolute() {
+                        task.cwd.clone()
+                    } else {
+                        config_root.join(&task.cwd)
+                    };
+                    (root, CompletionKind::FilesAndDirectories)
                 }
-            )
-            .then(|| (edit.value.clone(), edit.cursor))
+                _ => return None,
+            };
+            Some((root, edit.value.clone(), edit.cursor, kind))
         }) else {
             return;
         };
 
-        match complete_directory(&root, &value, cursor) {
+        match complete_path(&root, &value, cursor, kind) {
             Ok(DirectoryCompletion::Updated { value, cursor }) => {
                 if let Some(edit) = self.menu.as_mut().and_then(|menu| menu.edit.as_mut()) {
                     edit.value = value;
@@ -3044,10 +3312,10 @@ impl App {
                 }
             }
             Ok(DirectoryCompletion::NoMatches) => {
-                self.set_notice("No matching directories.".to_owned());
+                self.set_notice("No matching paths.".to_owned());
             }
             Ok(DirectoryCompletion::Ambiguous { matches }) => {
-                self.set_notice(format!("{matches} matching directories. Keep typing."));
+                self.set_notice(format!("{matches} matching paths. Keep typing."));
             }
             Err(error) => {
                 self.set_notice(format!("Completion failed: {error:#}"));
@@ -3071,6 +3339,9 @@ impl App {
         menu.env_owner = None;
         menu.env_detail_key = None;
         menu.env_cursor = 0;
+        menu.watch_owner = None;
+        menu.watch_detail = None;
+        menu.watch_cursor = 0;
         menu.cursor = if menu.draft.tasks.is_empty() {
             0
         } else {
@@ -3246,6 +3517,91 @@ impl App {
         }
     }
 
+    fn open_watch_path(&mut self, index: usize) {
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        let Some(owner) = menu.watch_owner else {
+            return;
+        };
+        if menu_watch_paths(menu, owner).is_some_and(|paths| index < paths.len()) {
+            menu.watch_detail = Some(index);
+            menu.watch_cursor = 0;
+        }
+    }
+
+    fn start_watch_path_edit(&mut self, index: Option<usize>) {
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        let Some(owner) = menu.watch_owner else {
+            return;
+        };
+        let value = index
+            .and_then(|index| menu_watch_paths(menu, owner)?.get(index))
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        menu.edit = Some(MenuEdit {
+            target: MenuEditTarget::WatchPath { owner, index },
+            cursor: char_count(&value),
+            value,
+        });
+    }
+
+    fn edit_selected_watch_path(&mut self) {
+        let index = self.menu.as_ref().and_then(|menu| menu.watch_detail);
+        if let Some(index) = index {
+            self.start_watch_path_edit(Some(index));
+        }
+    }
+
+    fn delete_selected_watch_path(&mut self) {
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        let Some(owner) = menu.watch_owner else {
+            return;
+        };
+        let Some(index) = menu.watch_detail else {
+            return;
+        };
+        let remaining = if let Some(paths) = menu_watch_paths_mut(menu, owner) {
+            if index >= paths.len() {
+                return;
+            }
+            paths.remove(index);
+            paths.len()
+        } else {
+            return;
+        };
+        menu.watch_detail = None;
+        menu.watch_cursor = if remaining == 0 {
+            0
+        } else {
+            index.min(remaining - 1) + 1
+        };
+    }
+
+    fn back_watch_paths(&mut self) {
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        if menu.watch_detail.is_some() {
+            menu.watch_detail = None;
+            menu.watch_cursor = 0;
+        } else if let Some(owner) = menu.watch_owner.take() {
+            menu.watch_cursor = 0;
+            menu.cursor = match owner.kind {
+                WatchPathKind::Watched => {
+                    config_task_field_cursor(ConfigTaskField::Watch).unwrap_or(menu.cursor)
+                }
+                WatchPathKind::Ignored => {
+                    config_task_field_cursor(ConfigTaskField::WatchIgnore).unwrap_or(menu.cursor)
+                }
+            };
+        }
+    }
+
     fn open_menu_leader_picker(&mut self) {
         let Some(menu) = self.menu.as_mut() else {
             return;
@@ -3257,6 +3613,58 @@ impl App {
             .position(|leader| *leader == current)
             .unwrap_or(0);
         menu.leader_picker = true;
+    }
+
+    fn open_menu_watch_mode_picker(&mut self) {
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        let current = menu.draft.settings.watch_mode;
+        menu.watch_mode_cursor = all_watch_modes()
+            .iter()
+            .position(|mode| *mode == current)
+            .unwrap_or(0);
+        menu.watch_mode_picker = true;
+    }
+
+    fn select_menu_watch_mode(&mut self) {
+        let Some(index) = self.menu.as_ref().map(|menu| menu.watch_mode_cursor) else {
+            return;
+        };
+        let Some(&mode) = all_watch_modes().get(index) else {
+            return;
+        };
+        self.set_menu_watch_mode(mode);
+    }
+
+    fn set_menu_watch_mode(&mut self, mode: WatchMode) {
+        let previous = self.loaded.config.settings.watch_mode;
+        if let Some(menu) = self.menu.as_mut() {
+            menu.draft.settings.watch_mode = mode;
+            menu.watch_mode_picker = false;
+        } else {
+            return;
+        }
+        self.loaded.config.settings.watch_mode = mode;
+        if let Err(error) = self.sync_watch_service() {
+            self.loaded.config.settings.watch_mode = previous;
+            if let Some(menu) = self.menu.as_mut() {
+                menu.draft.settings.watch_mode = previous;
+            }
+            self.set_notice(format!("Watcher mode not applied: {error:#}"));
+        }
+    }
+
+    fn start_watch_poll_interval_edit(&mut self) {
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        let value = menu.draft.settings.watch_poll_interval.clone();
+        menu.edit = Some(MenuEdit {
+            target: MenuEditTarget::WatchPollInterval,
+            cursor: char_count(&value),
+            value,
+        });
     }
 
     fn set_menu_leader(&mut self, leader: Leader) {
@@ -3372,6 +3780,9 @@ impl App {
                         self.rebuild_unstarted_tasks();
                     }
                 }
+                if let Err(error) = self.sync_watch_service() {
+                    self.set_notice(format!("File watcher unavailable: {error:#}"));
+                }
                 if let Err(error) = self.sync_control_listener() {
                     self.set_notice(format!("MCP control unavailable: {error:#}"));
                 }
@@ -3424,6 +3835,17 @@ impl App {
             created_from_missing_file: false,
         };
         let project_root = loaded.root.clone();
+        let staged_watcher = if self.quit_when_menu_closes {
+            None
+        } else {
+            match WatchService::start(&loaded.root, &draft, self.watch_enabled) {
+                Ok(watcher) => watcher,
+                Err(error) => {
+                    self.set_notice(format!("Config not saved: file watcher failed: {error:#}"));
+                    return Ok(Action::Continue);
+                }
+            }
+        };
         let mut codex_change = None;
         let mut empty_codex_change = None;
         if draft.settings.mcp_access.allows_read() {
@@ -3510,6 +3932,8 @@ impl App {
         }
 
         let old = self.loaded.config.clone();
+        self.watcher = staged_watcher;
+        self.pending_watch_changes.clear();
         self.menu = None;
         self.apply_saved_config(old, draft, restart);
         if let Err(error) = self.sync_control_listener() {
@@ -4327,8 +4751,20 @@ impl App {
                     .is_some_and(|menu| menu.env_owner.is_some())
                 {
                     self.move_menu_env_cursor(-1);
+                } else if self
+                    .menu
+                    .as_ref()
+                    .is_some_and(|menu| menu.watch_owner.is_some())
+                {
+                    self.move_menu_watch_cursor(-1);
                 } else if self.menu.as_ref().is_some_and(|menu| menu.leader_picker) {
                     self.move_menu_leader_cursor(-1);
+                } else if self
+                    .menu
+                    .as_ref()
+                    .is_some_and(|menu| menu.watch_mode_picker)
+                {
+                    self.move_menu_watch_mode_cursor(-1);
                 } else {
                     self.move_menu_cursor(-1);
                 }
@@ -4353,8 +4789,20 @@ impl App {
                     .is_some_and(|menu| menu.env_owner.is_some())
                 {
                     self.move_menu_env_cursor(1);
+                } else if self
+                    .menu
+                    .as_ref()
+                    .is_some_and(|menu| menu.watch_owner.is_some())
+                {
+                    self.move_menu_watch_cursor(1);
                 } else if self.menu.as_ref().is_some_and(|menu| menu.leader_picker) {
                     self.move_menu_leader_cursor(1);
+                } else if self
+                    .menu
+                    .as_ref()
+                    .is_some_and(|menu| menu.watch_mode_picker)
+                {
+                    self.move_menu_watch_mode_cursor(1);
                 } else {
                     self.move_menu_cursor(1);
                 }
@@ -5318,6 +5766,15 @@ impl App {
     }
 
     fn request_restart_set(&mut self, indexes: &[usize]) {
+        self.request_restart_set_with_reasons(indexes, &BTreeMap::new(), false);
+    }
+
+    fn request_restart_set_with_reasons(
+        &mut self,
+        indexes: &[usize],
+        reasons: &BTreeMap<usize, String>,
+        coalesce: bool,
+    ) {
         if self.stopping {
             return;
         }
@@ -5327,10 +5784,17 @@ impl App {
             if index >= self.tasks.len() {
                 continue;
             }
+            let already_scheduled =
+                self.tasks[index].start_requested && self.tasks[index].pid.is_none();
             self.tasks[index].start_requested = true;
-            self.tasks[index].pending_start = None;
+            if !coalesce || !already_scheduled {
+                self.tasks[index].pending_start = None;
+            }
             if self.tasks[index].pid.is_none() {
                 self.tasks[index].restart_requested = false;
+                if let Some(reason) = reasons.get(&index) {
+                    self.tasks[index].message(&format!("\r\n\x1b[33m[demons] {reason}\x1b[0m\r\n"));
+                }
             }
         }
         for &index in indexes.iter().rev() {
@@ -5338,10 +5802,18 @@ impl App {
                 continue;
             }
             if let Some(pid) = self.tasks[index].pid {
+                let already_restarting = self.tasks[index].restart_requested;
+                if let Some(reason) = reasons.get(&index) {
+                    self.tasks[index].message(&format!("\r\n\x1b[33m[demons] {reason}\x1b[0m\r\n"));
+                } else if !coalesce || !already_restarting {
+                    self.tasks[index].message("\r\n\x1b[33m[demons] restarting...\x1b[0m\r\n");
+                }
+                if coalesce && already_restarting {
+                    continue;
+                }
                 self.tasks[index].restart_requested = true;
                 self.tasks[index].kill_deadline = Some(now + RESTART_GRACE);
                 self.tasks[index].status = TaskStatus::Restarting;
-                self.tasks[index].message("\r\n\x1b[33m[demons] restarting...\x1b[0m\r\n");
                 if self.tasks[index].signal_graceful_stop(pid).is_err() {
                     self.tasks[index].kill_deadline = Some(now);
                 }
@@ -5483,6 +5955,150 @@ impl App {
         changed
     }
 
+    fn drain_watch_events(&mut self, now: Instant) -> bool {
+        let mut events = Vec::new();
+        let mut disconnected = false;
+        if let Some(watcher) = self.watcher.as_ref() {
+            for _ in 0..256 {
+                match watcher.try_recv() {
+                    Ok(Some(event)) => events.push(event),
+                    Ok(None) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                }
+            }
+        }
+
+        let changed = disconnected || !events.is_empty();
+        if disconnected {
+            self.watcher = None;
+            self.set_notice("File watcher stopped unexpectedly.".to_owned());
+        }
+        for event in events {
+            self.handle_watch_event(event, now);
+        }
+        changed
+    }
+
+    fn handle_watch_event(&mut self, event: WatchEvent, now: Instant) {
+        match event {
+            WatchEvent::Changed {
+                task,
+                paths,
+                overflow,
+                ..
+            } => {
+                let Some(index) = self.tasks.iter().position(|runtime| {
+                    matches!(runtime.kind, RuntimePaneKind::Task) && runtime.task.name == task
+                }) else {
+                    return;
+                };
+                let delay = self.tasks[index]
+                    .task
+                    .watch_delay
+                    .as_deref()
+                    .unwrap_or(DEFAULT_WATCH_DELAY);
+                let delay = parse_watch_delay(delay).unwrap_or(Duration::from_millis(250));
+                let deadline = now.checked_add(delay).unwrap_or(now);
+                let pending =
+                    self.pending_watch_changes
+                        .entry(task)
+                        .or_insert_with(|| PendingWatchChange {
+                            deadline,
+                            paths: BTreeSet::new(),
+                            overflow: false,
+                        });
+                pending.deadline = deadline;
+                for path in paths {
+                    if pending.paths.len() >= MAX_WATCH_CHANGE_PATHS {
+                        pending.overflow = true;
+                        break;
+                    }
+                    pending.paths.insert(path);
+                }
+                pending.overflow |= overflow;
+            }
+            WatchEvent::Warning { task, message } => {
+                let message = sanitize_terminal_text(&message);
+                if let Some(task_name) = task
+                    && let Some(runtime) = self.tasks.iter_mut().find(|runtime| {
+                        matches!(runtime.kind, RuntimePaneKind::Task)
+                            && runtime.task.name == task_name
+                    })
+                {
+                    runtime.message(&format!(
+                        "\r\n\x1b[33m[demons] file watcher: {message}\x1b[0m\r\n"
+                    ));
+                }
+                self.set_notice(format!("File watcher: {message}"));
+            }
+            WatchEvent::Fatal(message) => {
+                self.watcher = None;
+                self.pending_watch_changes.clear();
+                self.set_notice(format!(
+                    "File watcher stopped: {}",
+                    sanitize_terminal_text(&message)
+                ));
+            }
+        }
+    }
+
+    fn apply_due_watch_changes(&mut self, now: Instant) -> bool {
+        let due_names = self
+            .pending_watch_changes
+            .iter()
+            .filter_map(|(name, pending)| (pending.deadline <= now).then_some(name.clone()))
+            .collect::<Vec<_>>();
+        if due_names.is_empty() {
+            return false;
+        }
+
+        let mut due = Vec::new();
+        for name in due_names {
+            let Some(pending) = self.pending_watch_changes.remove(&name) else {
+                continue;
+            };
+            let Some(index) = self.tasks.iter().position(|runtime| {
+                matches!(runtime.kind, RuntimePaneKind::Task) && runtime.task.name == name
+            }) else {
+                continue;
+            };
+            due.push((index, name, pending));
+        }
+        if due.is_empty() {
+            return false;
+        }
+
+        let mut indexes = BTreeSet::new();
+        let mut reasons = BTreeMap::new();
+        for (index, _, pending) in &due {
+            reasons.insert(
+                *index,
+                format!(
+                    "changed: {}; restarting...",
+                    watch_change_summary(&self.tasks[*index], pending)
+                ),
+            );
+        }
+        for (index, name, _) in &due {
+            for dependent in self.restart_closure(*index) {
+                indexes.insert(dependent);
+                reasons
+                    .entry(dependent)
+                    .or_insert_with(|| format!("dependency changed: {name}; restarting..."));
+            }
+        }
+        self.request_restart_set_with_reasons(
+            &indexes.into_iter().collect::<Vec<_>>(),
+            &reasons,
+            true,
+        );
+        true
+    }
+
     fn apply_process_event(&mut self, event: ProcessEvent) {
         match event {
             ProcessEvent::Output { generation, bytes } => {
@@ -5565,6 +6181,12 @@ impl App {
     fn tick(&mut self) -> Result<bool> {
         let now = Instant::now();
         let mut changed = false;
+        if self.drain_watch_events(now) {
+            changed = true;
+        }
+        if self.apply_due_watch_changes(now) {
+            changed = true;
+        }
         if self
             .pending_escape
             .is_some_and(|started| now.duration_since(started) >= ALT_ESCAPE_TIMEOUT)
@@ -5640,6 +6262,8 @@ impl App {
 
     fn mark_stopping(&mut self) {
         self.stopping = true;
+        self.watcher = None;
+        self.pending_watch_changes.clear();
         self.disable_control("Demons is shutting down");
         for task in &mut self.tasks {
             if task.pid.is_some() {
@@ -5650,6 +6274,8 @@ impl App {
 
     fn shutdown(&mut self) -> Result<()> {
         self.stopping = true;
+        self.watcher = None;
+        self.pending_watch_changes.clear();
         self.disable_control("Demons is shutting down");
         for task in &mut self.tasks {
             task.restart_requested = false;
@@ -7315,8 +7941,13 @@ struct MenuState {
     env_owner: Option<EnvOwner>,
     env_detail_key: Option<String>,
     env_cursor: usize,
+    watch_owner: Option<WatchPathOwner>,
+    watch_detail: Option<usize>,
+    watch_cursor: usize,
     leader_picker: bool,
     leader_cursor: usize,
+    watch_mode_picker: bool,
+    watch_mode_cursor: usize,
     mcp_access_picker: bool,
     mcp_access_cursor: usize,
     mcp_empty_file_prompt: Option<McpAccess>,
@@ -7351,8 +7982,13 @@ impl MenuState {
             env_owner: None,
             env_detail_key: None,
             env_cursor: 0,
+            watch_owner: None,
+            watch_detail: None,
+            watch_cursor: 0,
             leader_picker: false,
             leader_cursor: 0,
+            watch_mode_picker: false,
+            watch_mode_cursor: 0,
             mcp_access_picker: false,
             mcp_access_cursor: 0,
             mcp_empty_file_prompt: None,
@@ -7398,6 +8034,11 @@ enum MenuEditTarget {
         owner: EnvOwner,
         key: String,
     },
+    WatchPath {
+        owner: WatchPathOwner,
+        index: Option<usize>,
+    },
+    WatchPollInterval,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7410,6 +8051,18 @@ enum EnvOwner {
 enum EnvField {
     Key,
     Value,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WatchPathKind {
+    Watched,
+    Ignored,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WatchPathOwner {
+    task: usize,
+    kind: WatchPathKind,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7445,6 +8098,9 @@ enum TaskField {
     Env,
     Dependencies,
     StartDelay,
+    Watch,
+    WatchIgnore,
+    WatchDelay,
     Delete,
     Back,
 }
@@ -7497,8 +8153,16 @@ enum MenuAction {
     EnvField(EnvField),
     DeleteEnvVar,
     BackEnv,
+    OpenWatchPath(usize),
+    AddWatchPath,
+    EditWatchPath,
+    DeleteWatchPath,
+    BackWatchPaths,
     OpenLeaderPicker,
     SelectLeader(Leader),
+    OpenWatchModePicker,
+    SelectWatchMode(WatchMode),
+    EditWatchPollInterval,
     OpenMcpAccessPicker,
     SelectMcpAccess(McpAccess),
     ToggleMcpStatusBar,
@@ -7534,6 +8198,12 @@ enum DirectoryCompletion {
     Updated { value: String, cursor: usize },
     NoMatches,
     Ambiguous { matches: usize },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompletionKind {
+    Directories,
+    FilesAndDirectories,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7725,6 +8395,42 @@ fn terminal_runtime_task(terminal: TerminalPane) -> Task {
     }
 }
 
+fn watch_change_summary(task: &TaskRuntime, pending: &PendingWatchChange) -> String {
+    let Some(first) = pending.paths.iter().next() else {
+        return if pending.overflow {
+            "multiple filesystem changes".to_owned()
+        } else {
+            "filesystem activity".to_owned()
+        };
+    };
+    let display = first.strip_prefix(&task.cwd).unwrap_or(first);
+    let display = if display.as_os_str().is_empty() {
+        ".".to_owned()
+    } else {
+        sanitize_terminal_text(&display.to_string_lossy())
+    };
+    let additional = pending.paths.len().saturating_sub(1);
+    if pending.overflow {
+        format!("{display} (+more)")
+    } else if additional > 0 {
+        format!("{display} (+{additional} more)")
+    } else {
+        display
+    }
+}
+
+fn sanitize_terminal_text(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character.is_control() {
+                '?'
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
 fn dependency_graph(tasks: &[Task]) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
     let names = tasks
         .iter()
@@ -7870,12 +8576,20 @@ fn render_menu(
         render_menu_dependencies(body, buffer, menu, task, hover_position);
         return;
     }
+    if let Some(owner) = menu.watch_owner {
+        render_menu_watch_paths(body, buffer, menu, owner, hover_position);
+        return;
+    }
     if let Some(owner) = menu.env_owner {
         render_menu_env(body, buffer, menu, owner, hover_position);
         return;
     }
     if menu.leader_picker {
         render_menu_leaders(body, buffer, menu, hover_position);
+        return;
+    }
+    if menu.watch_mode_picker {
+        render_menu_watch_modes(body, buffer, menu, hover_position);
         return;
     }
     if menu.mcp_empty_file_prompt.is_some() {
@@ -8080,14 +8794,17 @@ fn render_menu_task_detail(
     );
     let fields = task_detail_fields();
     let problems = menu_problems(menu);
-    for (row, field) in fields.iter().enumerate() {
-        if row + 1 >= usize::from(area.height) {
+    let rows = area.height.saturating_sub(1);
+    let start = scroll_start(menu.cursor, fields.len(), usize::from(rows));
+    for row in 0..rows {
+        let index = start + usize::from(row);
+        let Some(field) = fields.get(index) else {
             break;
-        }
+        };
         let badges = task_field_problem_badges(&problems, task_index, *field);
         let text = text_with_problem_badges(&task_field_text(task, *field), badges);
-        let rect = Rect::new(area.x, area.y + row as u16 + 1, area.width, 1);
-        let selected = row == menu.cursor;
+        let rect = Rect::new(area.x, area.y + row + 1, area.width, 1);
+        let selected = index == menu.cursor;
         let hovered = hover_position.is_some_and(|(x, y)| contains(rect, x, y));
         render_menu_row(
             buffer,
@@ -8150,6 +8867,131 @@ fn render_menu_dependencies(
             &text,
             start + usize::from(row) == menu.dependency_cursor,
             Some(MenuAction::ToggleDependency(*candidate)),
+            &mut menu.hits,
+            hover_position,
+        );
+    }
+}
+
+fn render_menu_watch_paths(
+    area: Rect,
+    buffer: &mut Buffer,
+    menu: &mut MenuState,
+    owner: WatchPathOwner,
+    hover_position: Option<(u16, u16)>,
+) {
+    if menu.watch_detail.is_some() {
+        render_menu_watch_path_detail(area, buffer, menu, owner, hover_position);
+    } else {
+        render_menu_watch_path_list(area, buffer, menu, owner, hover_position);
+    }
+}
+
+fn render_menu_watch_path_list(
+    area: Rect,
+    buffer: &mut Buffer,
+    menu: &mut MenuState,
+    owner: WatchPathOwner,
+    hover_position: Option<(u16, u16)>,
+) {
+    let Some(task_name) = menu
+        .draft
+        .tasks
+        .get(owner.task)
+        .map(|task| task.name.clone())
+    else {
+        return;
+    };
+    let paths = menu_watch_paths(menu, owner).cloned().unwrap_or_default();
+    let label = match owner.kind {
+        WatchPathKind::Watched => "Watched paths",
+        WatchPathKind::Ignored => "Ignored paths",
+    };
+    render_text(
+        buffer,
+        Rect::new(area.x, area.y, area.width, 1),
+        &format!("{label} for {task_name}"),
+        menu_heading_style(),
+    );
+    let rows = area.height.saturating_sub(1);
+    let count = paths.len() + 2;
+    let start = scroll_start(menu.watch_cursor, count, usize::from(rows));
+    for row in 0..rows {
+        let index = start + usize::from(row);
+        let (text, action) = if index == 0 {
+            ("+ Add path".to_owned(), MenuAction::AddWatchPath)
+        } else if index <= paths.len() {
+            let path_index = index - 1;
+            let path = &paths[path_index];
+            (
+                format!(
+                    "{}  ({})",
+                    path.display(),
+                    watch_path_type(menu, owner, path)
+                ),
+                MenuAction::OpenWatchPath(path_index),
+            )
+        } else if index == paths.len() + 1 {
+            ("Back to task".to_owned(), MenuAction::BackWatchPaths)
+        } else {
+            break;
+        };
+        render_menu_row(
+            buffer,
+            Rect::new(area.x, area.y + row + 1, area.width, 1),
+            &text,
+            index == menu.watch_cursor,
+            Some(action),
+            &mut menu.hits,
+            hover_position,
+        );
+    }
+}
+
+fn render_menu_watch_path_detail(
+    area: Rect,
+    buffer: &mut Buffer,
+    menu: &mut MenuState,
+    owner: WatchPathOwner,
+    hover_position: Option<(u16, u16)>,
+) {
+    let Some(index) = menu.watch_detail else {
+        return;
+    };
+    let Some(path) = menu_watch_paths(menu, owner)
+        .and_then(|paths| paths.get(index))
+        .cloned()
+    else {
+        return;
+    };
+    render_text(
+        buffer,
+        Rect::new(area.x, area.y, area.width, 1),
+        "Watch path",
+        menu_heading_style(),
+    );
+    let rows = [
+        (
+            format!(
+                "Path: {}  ({})",
+                path.display(),
+                watch_path_type(menu, owner, &path)
+            ),
+            MenuAction::EditWatchPath,
+        ),
+        ("Delete path".to_owned(), MenuAction::DeleteWatchPath),
+        ("Back to paths".to_owned(), MenuAction::BackWatchPaths),
+    ];
+    for (row, (text, action)) in rows.iter().enumerate() {
+        if row + 1 >= usize::from(area.height) {
+            break;
+        }
+        render_menu_row(
+            buffer,
+            Rect::new(area.x, area.y + row as u16 + 1, area.width, 1),
+            text,
+            row == menu.watch_cursor,
+            Some(*action),
             &mut menu.hits,
             hover_position,
         );
@@ -8394,6 +9236,58 @@ fn render_menu_settings(
             hover_position.is_some_and(|(x, y)| contains(status_rect, x, y)),
         ),
     );
+    let watch_mode_rect = Rect::new(area.x, area.y.saturating_add(7), area.width, 1);
+    let watch_mode_badges = setting_problem_badges(&problems, ConfigSettingField::WatchMode);
+    render_menu_row(
+        buffer,
+        watch_mode_rect,
+        &text_with_problem_badges(
+            &format!(
+                "File watcher mode: {}",
+                menu.draft.settings.watch_mode.label()
+            ),
+            watch_mode_badges,
+        ),
+        menu.cursor == 6,
+        Some(MenuAction::OpenWatchModePicker),
+        &mut menu.hits,
+        hover_position,
+    );
+    render_problem_badges(
+        buffer,
+        watch_mode_rect,
+        watch_mode_badges,
+        row_bg_color(
+            menu.cursor == 6,
+            hover_position.is_some_and(|(x, y)| contains(watch_mode_rect, x, y)),
+        ),
+    );
+    let poll_rect = Rect::new(area.x, area.y.saturating_add(8), area.width, 1);
+    let poll_badges = setting_problem_badges(&problems, ConfigSettingField::WatchPollInterval);
+    render_menu_row(
+        buffer,
+        poll_rect,
+        &text_with_problem_badges(
+            &format!(
+                "Polling interval: {}",
+                menu.draft.settings.watch_poll_interval
+            ),
+            poll_badges,
+        ),
+        menu.cursor == 7,
+        Some(MenuAction::EditWatchPollInterval),
+        &mut menu.hits,
+        hover_position,
+    );
+    render_problem_badges(
+        buffer,
+        poll_rect,
+        poll_badges,
+        row_bg_color(
+            menu.cursor == 7,
+            hover_position.is_some_and(|(x, y)| contains(poll_rect, x, y)),
+        ),
+    );
 }
 
 fn render_menu_static_setting_row(
@@ -8518,6 +9412,45 @@ fn render_menu_leaders(
             &text,
             index == menu.leader_cursor,
             Some(MenuAction::SelectLeader(leader)),
+            &mut menu.hits,
+            hover_position,
+        );
+    }
+}
+
+fn render_menu_watch_modes(
+    area: Rect,
+    buffer: &mut Buffer,
+    menu: &mut MenuState,
+    hover_position: Option<(u16, u16)>,
+) {
+    render_text(
+        buffer,
+        Rect::new(area.x, area.y, area.width, 1),
+        "File watcher mode",
+        menu_heading_style(),
+    );
+    for (row, mode) in all_watch_modes().iter().enumerate() {
+        if row + 1 >= usize::from(area.height) {
+            break;
+        }
+        let selected = *mode == menu.draft.settings.watch_mode;
+        let description = match mode {
+            WatchMode::Auto => "native events with safe fallback",
+            WatchMode::Native => "native events only",
+            WatchMode::Polling => "metadata polling",
+        };
+        let text = format!(
+            "[{}] {} - {description}",
+            if selected { "x" } else { " " },
+            mode.label()
+        );
+        render_menu_row(
+            buffer,
+            Rect::new(area.x, area.y + row as u16 + 1, area.width, 1),
+            &text,
+            row == menu.watch_mode_cursor,
+            Some(MenuAction::SelectWatchMode(*mode)),
             &mut menu.hits,
             hover_position,
         );
@@ -8967,10 +9900,11 @@ fn menu_item_count(menu: &MenuState, exit_mode: MenuExitMode) -> usize {
     match menu.tab {
         MenuTab::Help => 0,
         MenuTab::Tasks if menu.env_owner.is_some() => env_item_count(menu),
+        MenuTab::Tasks if menu.watch_owner.is_some() => watch_item_count(menu),
         MenuTab::Tasks if menu.task_detail.is_some() => task_detail_fields().len(),
         MenuTab::Tasks if menu.terminal_detail.is_some() => terminal_detail_fields().len(),
         MenuTab::Tasks => task_list_count(menu),
-        MenuTab::Settings => 6,
+        MenuTab::Settings => 8,
         MenuTab::Exit => exit_actions(exit_mode).len() + menu_problems(menu).len(),
     }
 }
@@ -9276,6 +10210,36 @@ fn selected_env_action(menu: &MenuState) -> Option<MenuAction> {
     }
 }
 
+fn watch_item_count(menu: &MenuState) -> usize {
+    if menu.watch_detail.is_some() {
+        3
+    } else {
+        menu.watch_owner
+            .and_then(|owner| menu_watch_paths(menu, owner))
+            .map(|paths| paths.len() + 2)
+            .unwrap_or(0)
+    }
+}
+
+fn selected_watch_action(menu: &MenuState) -> Option<MenuAction> {
+    if menu.watch_detail.is_some() {
+        return match menu.watch_cursor {
+            0 => Some(MenuAction::EditWatchPath),
+            1 => Some(MenuAction::DeleteWatchPath),
+            2 => Some(MenuAction::BackWatchPaths),
+            _ => None,
+        };
+    }
+    let owner = menu.watch_owner?;
+    let path_count = menu_watch_paths(menu, owner)?.len();
+    match menu.watch_cursor {
+        0 => Some(MenuAction::AddWatchPath),
+        cursor if cursor <= path_count => Some(MenuAction::OpenWatchPath(cursor - 1)),
+        cursor if cursor == path_count + 1 => Some(MenuAction::BackWatchPaths),
+        _ => None,
+    }
+}
+
 fn task_detail_fields() -> &'static [TaskField] {
     &[
         TaskField::Name,
@@ -9284,6 +10248,9 @@ fn task_detail_fields() -> &'static [TaskField] {
         TaskField::Env,
         TaskField::Dependencies,
         TaskField::StartDelay,
+        TaskField::Watch,
+        TaskField::WatchIgnore,
+        TaskField::WatchDelay,
         TaskField::Delete,
         TaskField::Back,
     ]
@@ -9316,6 +10283,14 @@ fn task_field_text(task: &Task, field: TaskField) -> String {
             "Start delay: {}",
             task.start_delay.as_deref().unwrap_or("(none)")
         ),
+        TaskField::Watch => format!("Watched paths: {}", path_list_summary(&task.watch)),
+        TaskField::WatchIgnore => {
+            format!("Ignored paths: {}", path_list_summary(&task.watch_ignore))
+        }
+        TaskField::WatchDelay => format!(
+            "Watch delay: {}",
+            task.watch_delay.as_deref().unwrap_or(DEFAULT_WATCH_DELAY)
+        ),
         TaskField::Delete => "Delete task".to_owned(),
         TaskField::Back => "Back to task list".to_owned(),
     }
@@ -9329,6 +10304,9 @@ fn task_field_name(field: TaskField) -> &'static str {
         TaskField::Env => "environment",
         TaskField::Dependencies => "dependencies",
         TaskField::StartDelay => "start delay",
+        TaskField::Watch => "watched paths",
+        TaskField::WatchIgnore => "ignored paths",
+        TaskField::WatchDelay => "watch delay",
         TaskField::Delete => "delete",
         TaskField::Back => "back",
     }
@@ -9360,6 +10338,11 @@ fn menu_edit_title(edit: &MenuEdit) -> &'static str {
         MenuEditTarget::TerminalField { field, .. } => terminal_field_name(*field),
         MenuEditTarget::EnvKey { .. } => "environment key",
         MenuEditTarget::EnvValue { .. } => "environment value",
+        MenuEditTarget::WatchPath { owner, .. } => match owner.kind {
+            WatchPathKind::Watched => "watched path",
+            WatchPathKind::Ignored => "ignored path",
+        },
+        MenuEditTarget::WatchPollInterval => "watch polling interval",
     }
 }
 
@@ -9371,6 +10354,9 @@ fn task_field_to_config_field(field: TaskField) -> Option<ConfigTaskField> {
         TaskField::Env => Some(ConfigTaskField::Env),
         TaskField::Dependencies => Some(ConfigTaskField::Dependencies),
         TaskField::StartDelay => Some(ConfigTaskField::StartDelay),
+        TaskField::Watch => Some(ConfigTaskField::Watch),
+        TaskField::WatchIgnore => Some(ConfigTaskField::WatchIgnore),
+        TaskField::WatchDelay => Some(ConfigTaskField::WatchDelay),
         TaskField::Delete | TaskField::Back => None,
     }
 }
@@ -9549,6 +10535,10 @@ fn all_leaders() -> &'static [Leader] {
     ]
 }
 
+fn all_watch_modes() -> &'static [WatchMode] {
+    &[WatchMode::Auto, WatchMode::Native, WatchMode::Polling]
+}
+
 fn all_mcp_access_levels() -> &'static [McpAccess] {
     &[McpAccess::Off, McpAccess::ReadOnly, McpAccess::Full]
 }
@@ -9645,6 +10635,70 @@ fn env_summary(env: &BTreeMap<String, String>) -> String {
     }
 }
 
+fn path_list_summary(paths: &[PathBuf]) -> String {
+    if paths.is_empty() {
+        return "(none)".to_owned();
+    }
+    let shown = paths
+        .iter()
+        .take(2)
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    let remaining = paths.len().saturating_sub(shown.len());
+    if remaining == 0 {
+        shown.join(", ")
+    } else {
+        format!("{} +{remaining} more", shown.join(", "))
+    }
+}
+
+fn menu_watch_paths(menu: &MenuState, owner: WatchPathOwner) -> Option<&Vec<PathBuf>> {
+    let task = menu.draft.tasks.get(owner.task)?;
+    Some(match owner.kind {
+        WatchPathKind::Watched => &task.watch,
+        WatchPathKind::Ignored => &task.watch_ignore,
+    })
+}
+
+fn menu_watch_paths_mut(menu: &mut MenuState, owner: WatchPathOwner) -> Option<&mut Vec<PathBuf>> {
+    let task = menu.draft.tasks.get_mut(owner.task)?;
+    Some(match owner.kind {
+        WatchPathKind::Watched => &mut task.watch,
+        WatchPathKind::Ignored => &mut task.watch_ignore,
+    })
+}
+
+fn watch_path_type(menu: &MenuState, owner: WatchPathOwner, path: &Path) -> &'static str {
+    let Some(task) = menu.draft.tasks.get(owner.task) else {
+        return "missing";
+    };
+    let config_root = menu.path.parent().unwrap_or_else(|| Path::new("."));
+    let cwd = if task.cwd.is_absolute() {
+        task.cwd.clone()
+    } else {
+        config_root.join(&task.cwd)
+    };
+    let resolved = resolve_from_task_cwd(&cwd, path);
+    let Ok(link_metadata) = fs::symlink_metadata(&resolved) else {
+        return "missing";
+    };
+    if link_metadata.file_type().is_symlink() {
+        return match fs::metadata(&resolved) {
+            Ok(metadata) if metadata.is_dir() => "symlink -> directory",
+            Ok(metadata) if metadata.is_file() => "symlink -> file",
+            Ok(_) => "symlink -> other",
+            Err(_) => "broken symlink",
+        };
+    }
+    if link_metadata.is_dir() {
+        "directory"
+    } else if link_metadata.is_file() {
+        "file"
+    } else {
+        "other"
+    }
+}
+
 fn menu_env(menu: &MenuState, owner: EnvOwner) -> Option<&BTreeMap<String, String>> {
     match owner {
         EnvOwner::Task(index) => menu.draft.tasks.get(index).map(|task| &task.env),
@@ -9732,7 +10786,12 @@ fn validate_menu_cwd(root: &Path, value: &str) -> Result<PathBuf> {
     Ok(cwd)
 }
 
-fn complete_directory(root: &Path, value: &str, cursor: usize) -> Result<DirectoryCompletion> {
+fn complete_path(
+    root: &Path,
+    value: &str,
+    cursor: usize,
+    kind: CompletionKind,
+) -> Result<DirectoryCompletion> {
     let cursor_byte = byte_index_for_char(value, cursor);
     let before = &value[..cursor_byte];
     let after = &value[cursor_byte..];
@@ -9759,7 +10818,11 @@ fn complete_directory(root: &Path, value: &str, cursor: usize) -> Result<Directo
     let mut matches = Vec::new();
     for entry in entries {
         let entry = entry?;
-        if !entry.file_type()?.is_dir() {
+        let Ok(metadata) = fs::metadata(entry.path()) else {
+            continue;
+        };
+        let is_dir = metadata.is_dir();
+        if !is_dir && (kind == CompletionKind::Directories || !metadata.is_file()) {
             continue;
         }
         let Ok(name) = entry.file_name().into_string() else {
@@ -9769,24 +10832,30 @@ fn complete_directory(root: &Path, value: &str, cursor: usize) -> Result<Directo
             continue;
         }
         if name.starts_with(prefix) {
-            matches.push(name);
+            matches.push((name, is_dir));
         }
     }
-    matches.sort();
+    matches.sort_by(|left, right| left.0.cmp(&right.0));
 
     match matches.len() {
         0 => Ok(DirectoryCompletion::NoMatches),
         1 => {
-            let mut completed = format!("{display_parent}{}/", matches[0]);
+            let (name, is_dir) = &matches[0];
+            let suffix = if *is_dir { "/" } else { "" };
+            let mut completed = format!("{display_parent}{name}{suffix}");
             completed.push_str(after);
-            let cursor = char_count(display_parent) + char_count(&matches[0]) + 1;
+            let cursor = char_count(display_parent) + char_count(name) + usize::from(*is_dir);
             Ok(DirectoryCompletion::Updated {
                 value: completed,
                 cursor,
             })
         }
         count => {
-            let common = common_prefix(&matches);
+            let names = matches
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>();
+            let common = common_prefix(&names);
             if common != prefix {
                 let mut completed = format!("{display_parent}{common}");
                 completed.push_str(after);
@@ -15798,6 +16867,7 @@ mod tests {
             Arc::new(Mutex::new(HashSet::new())),
             false,
             false,
+            true,
         );
 
         assert_eq!(app.tasks.len(), 2);
@@ -15967,6 +17037,115 @@ mod tests {
         assert!(app.tasks[0].start_requested);
         assert_eq!(app.tasks[0].status, TaskStatus::Waiting);
         assert_eq!(app.tasks[0].generation, generation);
+    }
+
+    #[test]
+    fn watched_changes_use_trailing_debounce_and_merge_paths() {
+        let mut watched = test_task("watched");
+        watched.depends_on = vec!["gate".to_owned()];
+        watched.watch_delay = Some("100ms".to_owned());
+        let mut app = test_app_with_tasks(vec![watched, test_task("gate")]);
+        let started = Instant::now();
+
+        app.handle_watch_event(
+            WatchEvent::Changed {
+                task: "watched".to_owned(),
+                paths: vec![PathBuf::from("/tmp/one.rs")],
+                source: crate::watch::WatchEventSource::Native,
+                overflow: false,
+            },
+            started,
+        );
+        app.handle_watch_event(
+            WatchEvent::Changed {
+                task: "watched".to_owned(),
+                paths: vec![PathBuf::from("/tmp/two.rs")],
+                source: crate::watch::WatchEventSource::Native,
+                overflow: false,
+            },
+            started + Duration::from_millis(75),
+        );
+
+        assert!(!app.apply_due_watch_changes(started + Duration::from_millis(100)));
+        assert!(app.apply_due_watch_changes(started + Duration::from_millis(176)));
+        assert!(app.tasks[0].start_requested);
+        assert_eq!(app.tasks[0].status, TaskStatus::Waiting);
+        let history = app.tasks[0].history.all_text();
+        assert!(history.contains("changed: /tmp/one.rs (+1 more); restarting"));
+    }
+
+    #[test]
+    fn watched_dependency_restart_marks_dependents_and_starts_exited_task() {
+        let mut server = test_task("server");
+        server.depends_on = vec!["gate".to_owned()];
+        let mut client = test_task("client");
+        client.depends_on = vec!["server".to_owned()];
+        let mut app = test_app_with_tasks(vec![server, client, test_task("gate")]);
+        app.tasks[0].status = TaskStatus::Exited {
+            code: 0,
+            success: true,
+            signal: None,
+        };
+        let now = Instant::now();
+
+        app.handle_watch_event(
+            WatchEvent::Changed {
+                task: "server".to_owned(),
+                paths: vec![PathBuf::from("src/main.rs")],
+                source: crate::watch::WatchEventSource::Native,
+                overflow: false,
+            },
+            now - Duration::from_secs(1),
+        );
+        assert!(app.apply_due_watch_changes(now));
+
+        assert!(app.tasks[0].start_requested);
+        assert!(app.tasks[1].start_requested);
+        assert!(
+            app.tasks[0]
+                .history
+                .all_text()
+                .contains("changed: src/main.rs; restarting")
+        );
+        assert!(
+            app.tasks[1]
+                .history
+                .all_text()
+                .contains("dependency changed: server; restarting")
+        );
+    }
+
+    #[test]
+    fn watched_change_does_not_reset_an_already_scheduled_start() {
+        let mut watched = test_task("watched");
+        watched.depends_on = vec!["gate".to_owned()];
+        let mut app = test_app_with_tasks(vec![watched, test_task("gate")]);
+        let scheduled = Instant::now() + Duration::from_secs(30);
+        app.tasks[0].start_requested = true;
+        app.tasks[0].pending_start = Some(scheduled);
+        app.tasks[0].status = TaskStatus::Waiting;
+        app.tasks[1].pid = Some(424_242);
+        app.tasks[1].status = TaskStatus::Running;
+        let now = Instant::now();
+
+        app.handle_watch_event(
+            WatchEvent::Changed {
+                task: "watched".to_owned(),
+                paths: Vec::new(),
+                source: crate::watch::WatchEventSource::Overflow,
+                overflow: true,
+            },
+            now - Duration::from_secs(1),
+        );
+        assert!(app.apply_due_watch_changes(now));
+
+        assert_eq!(app.tasks[0].pending_start, Some(scheduled));
+        assert!(
+            app.tasks[0]
+                .history
+                .all_text()
+                .contains("multiple filesystem changes")
+        );
     }
 
     #[test]
@@ -16495,6 +17674,166 @@ mod tests {
     }
 
     #[test]
+    fn watch_path_menu_adds_files_and_directories_from_task_cwd() {
+        let temp = tempdir().unwrap();
+        let web = temp.path().join("web");
+        fs::create_dir_all(web.join("src")).unwrap();
+        fs::write(web.join("Cargo.toml"), "[package]\n").unwrap();
+        let mut task = test_task("web");
+        task.cwd = PathBuf::from("web");
+        let mut app = test_app_with_tasks(vec![task]);
+        app.loaded.root = temp.path().to_path_buf();
+        app.loaded.path = temp.path().join(CONFIG_FILE);
+        app.open_menu(MenuTab::Tasks);
+        app.apply_menu_action(MenuAction::OpenTask(0)).unwrap();
+        app.apply_menu_action(MenuAction::TaskField(TaskField::Watch))
+            .unwrap();
+
+        app.apply_menu_action(MenuAction::AddWatchPath).unwrap();
+        {
+            let edit = app.menu.as_mut().unwrap().edit.as_mut().unwrap();
+            edit.value = "Car".to_owned();
+            edit.cursor = char_count(&edit.value);
+        }
+        app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(
+            app.menu.as_ref().unwrap().edit.as_ref().unwrap().value,
+            "Cargo.toml"
+        );
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(
+            app.menu.as_ref().unwrap().draft.tasks[0].watch,
+            vec![PathBuf::from("Cargo.toml")]
+        );
+        assert_eq!(app.menu.as_ref().unwrap().watch_detail, Some(0));
+
+        app.apply_menu_action(MenuAction::BackWatchPaths).unwrap();
+        app.apply_menu_action(MenuAction::AddWatchPath).unwrap();
+        {
+            let edit = app.menu.as_mut().unwrap().edit.as_mut().unwrap();
+            edit.value = "sr".to_owned();
+            edit.cursor = char_count(&edit.value);
+        }
+        app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(
+            app.menu.as_ref().unwrap().edit.as_ref().unwrap().value,
+            "src/"
+        );
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.menu.as_ref().unwrap().draft.tasks[0].watch.len(), 2);
+    }
+
+    #[test]
+    fn ignored_watch_paths_may_be_missing_and_back_restores_task_field() {
+        let temp = tempdir().unwrap();
+        let mut app = test_app_with_tasks(vec![test_task("web")]);
+        app.loaded.root = temp.path().to_path_buf();
+        app.loaded.path = temp.path().join(CONFIG_FILE);
+        app.open_menu(MenuTab::Tasks);
+        app.apply_menu_action(MenuAction::OpenTask(0)).unwrap();
+        app.apply_menu_action(MenuAction::TaskField(TaskField::WatchIgnore))
+            .unwrap();
+        app.apply_menu_action(MenuAction::AddWatchPath).unwrap();
+        {
+            let edit = app.menu.as_mut().unwrap().edit.as_mut().unwrap();
+            edit.value = "generated/later".to_owned();
+            edit.cursor = char_count(&edit.value);
+        }
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(
+            app.menu.as_ref().unwrap().draft.tasks[0].watch_ignore,
+            vec![PathBuf::from("generated/later")]
+        );
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+
+        let menu = app.menu.as_ref().unwrap();
+        assert!(menu.watch_owner.is_none());
+        assert_eq!(
+            task_field_to_config_field(task_detail_fields()[menu.cursor]),
+            Some(ConfigTaskField::WatchIgnore)
+        );
+    }
+
+    #[test]
+    fn watch_path_detail_edits_and_deletes_selected_entry() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("one.rs"), "one").unwrap();
+        fs::write(temp.path().join("two.rs"), "two").unwrap();
+        let mut task = test_task("worker");
+        task.watch = vec![PathBuf::from("one.rs")];
+        let mut app = test_app_with_tasks(vec![task]);
+        app.loaded.root = temp.path().to_path_buf();
+        app.loaded.path = temp.path().join(CONFIG_FILE);
+        app.open_menu(MenuTab::Tasks);
+        app.apply_menu_action(MenuAction::OpenTask(0)).unwrap();
+        app.apply_menu_action(MenuAction::TaskField(TaskField::Watch))
+            .unwrap();
+        app.apply_menu_action(MenuAction::OpenWatchPath(0)).unwrap();
+        app.apply_menu_action(MenuAction::EditWatchPath).unwrap();
+        {
+            let edit = app.menu.as_mut().unwrap().edit.as_mut().unwrap();
+            edit.value = "two.rs".to_owned();
+            edit.cursor = char_count(&edit.value);
+        }
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(
+            app.menu.as_ref().unwrap().draft.tasks[0].watch,
+            vec![PathBuf::from("two.rs")]
+        );
+
+        app.handle_key(key(KeyCode::Delete, KeyModifiers::NONE))
+            .unwrap();
+        let menu = app.menu.as_ref().unwrap();
+        assert!(menu.draft.tasks[0].watch.is_empty());
+        assert!(menu.watch_detail.is_none());
+        assert_eq!(menu.watch_cursor, 0);
+    }
+
+    #[test]
+    fn watcher_settings_apply_live_and_discard_restores_them() {
+        let mut app = test_app();
+        app.open_menu(MenuTab::Settings);
+        app.apply_menu_action(MenuAction::SelectWatchMode(WatchMode::Polling))
+            .unwrap();
+        app.apply_menu_action(MenuAction::EditWatchPollInterval)
+            .unwrap();
+        {
+            let edit = app.menu.as_mut().unwrap().edit.as_mut().unwrap();
+            edit.value = "100ms".to_owned();
+            edit.cursor = char_count(&edit.value);
+        }
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.menu.as_ref().unwrap().edit.is_some());
+
+        {
+            let edit = app.menu.as_mut().unwrap().edit.as_mut().unwrap();
+            edit.value = "750ms".to_owned();
+            edit.cursor = char_count(&edit.value);
+        }
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.loaded.config.settings.watch_mode, WatchMode::Polling);
+        assert_eq!(app.loaded.config.settings.watch_poll_interval, "750ms");
+
+        app.handle_menu_exit_action(MenuExitAction::Discard)
+            .unwrap();
+        assert_eq!(app.loaded.config.settings.watch_mode, WatchMode::Auto);
+        assert_eq!(app.loaded.config.settings.watch_poll_interval, "1s");
+    }
+
+    #[test]
     fn menu_add_task_and_save_writes_config_in_configure_mode() {
         let temp = tempdir().unwrap();
         let path = temp.path().join(CONFIG_FILE);
@@ -16514,6 +17853,7 @@ mod tests {
             Arc::new(Mutex::new(HashSet::new())),
             true,
             false,
+            true,
         );
 
         app.open_menu(MenuTab::Tasks);
@@ -16548,6 +17888,7 @@ mod tests {
             Arc::new(Mutex::new(HashSet::new())),
             true,
             false,
+            true,
         );
 
         app.open_menu(MenuTab::Tasks);
@@ -17727,6 +19068,7 @@ mod tests {
             Arc::new(Mutex::new(HashSet::new())),
             false,
             false,
+            true,
         )
     }
 

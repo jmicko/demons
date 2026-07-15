@@ -18,6 +18,7 @@ Demons is intentionally minimal: it is **not** a session manager, a process supe
   TUI apps work).
 - Real keyboard and mouse navigation.
 - Restart crashed or running tasks on demand (`r`).
+- Restart configured tasks and their dependents when watched files change.
 - Single static-ish binary, no runtime dependencies.
 - Unix-only (Linux + macOS). Windows is explicitly out of scope.
 
@@ -29,7 +30,6 @@ Demons is intentionally minimal: it is **not** a session manager, a process supe
 - Build orchestration (use `make` / `just` / `cargo` for that).
 - Windows support.
 - Plugin or extension system.
-- File-watcher-based auto-restart (manual `r` restart only).
 - Automatic pane output logging to file. Manual scrollback
   export is available with `S`.
 
@@ -51,7 +51,7 @@ Demons is intentionally minimal: it is **not** a session manager, a process supe
 ```toml
 # Config schema version, separate from the Demons app/crate version.
 # Current unversioned configs are treated as the current schema and are
-# normalized after they successfully validate. Older configs migrate to v4.
+# normalized after they successfully validate. Older configs migrate to v5.
 schema_version = 5
 
 # Optional. Demons-level settings.
@@ -72,6 +72,10 @@ mcp_access = "off"
 mcp_status_bar = true
 # Generated and managed by Demons when MCP access is enabled.
 # mcp_scope_id = "3f4a7f63-2492-477a-ae7f-92bffab78fa4"
+# File watcher backend: "auto" (default), "native", or "polling".
+watch_mode = "auto"
+# Polling cadence when polling is selected or automatic fallback is active.
+watch_poll_interval = "1s"
 
 # Tasks. One [[task]] per pane.
 [[task]]
@@ -85,12 +89,16 @@ cwd = "."
 # Optional. Environment variables merged on top of the inherited env.
 env = { RUST_LOG = "debug" }
 # Optional. Task names that must be started before this task starts.
-depends_on = ["server"]
+depends_on = []
 # Optional. Delay after dependencies have started. Supports ms, s, m, and h.
 start_delay = "3s"
-# Optional. Glob patterns (relative to cwd) to watch. On change, the task
-# is killed and respawned. Reserved; not implemented.
-# watch = ["src/**/*.rs", "Cargo.toml"]
+# Optional literal files or directories, relative to cwd or absolute.
+# Directories are watched recursively.
+watch = ["src", "Cargo.toml"]
+# Optional files or directory trees to exclude. These may not exist yet.
+watch_ignore = ["target", "src/generated"]
+# Optional trailing debounce after the newest change. Default: 250ms.
+watch_delay = "250ms"
 # Optional. Run mode "run-on-change" — task only runs when watched files
 # change, then exits. Reserved; not implemented.
 # run_on_change = ["src/**/*.rs"]
@@ -106,9 +114,9 @@ env = { RUST_LOG = "debug" }
 
 Validation rules (enforced at startup, fail loudly):
 
-- `schema_version` must be `4` for this release. Missing `schema_version` is
+- `schema_version` must be `5` for this release. Missing `schema_version` is
   treated as the current schema for compatibility with existing configs.
-  Schema versions 1 through 3 migrate to version 4.
+  Older supported schema versions migrate to version 5.
 - At least one `[[task]]` or `[[terminal]]` is required.
 - Task and terminal `name` values are required and unique per file.
 - `command` is required and non-empty.
@@ -117,14 +125,21 @@ Validation rules (enforced at startup, fail loudly):
   itself, and cannot form dependency cycles.
 - `start_delay` must be a non-negative integer with an optional unit of `ms`,
   `s`, `m`, or `h`; no unit means seconds.
+- Every `watch` entry must be a unique, existing file or directory. Relative
+  paths resolve from the task's `cwd`; directories are recursive.
+- `watch_ignore` entries must be unique but may be missing. An ignored
+  directory excludes its descendants.
+- `watch_delay` must be between `25ms` and `60s`. The default is `250ms`.
+- `settings.watch_mode` must be `auto`, `native`, or `polling`, and
+  `settings.watch_poll_interval` must be between `250ms` and `60s`.
 - `settings.multi_click_ms` must be between 150 and 1000 milliseconds.
 - `settings.mcp_access` must be `off`, `read_only`, or `full`. Read-only and
   full access require a valid UUID in `settings.mcp_scope_id`; the
   configurator generates it when needed.
 - Unknown keys are an error (no silent ignoring — the configurator owns the schema).
 - Reserved fields are parseable so future files have a stable schema, but
-  schema v4 rejects `logging = true` and any task that sets `watch`,
-  `run_on_change`, or `repeat`. Reserved behavior is never silently ignored.
+  schema v5 rejects `logging = true` and any task that sets `run_on_change` or
+  `repeat`. Reserved behavior is never silently ignored.
 
 ### 4.3 Configurator
 
@@ -159,15 +174,16 @@ The runtime menu is opened with `?` in command mode or by clicking the footer's
 
 - **Help** — command reference.
 - **Tasks** - configured task and terminal list. Enter or click a task to edit
-  name, command, cwd, env, dependencies, and start delay. Persistent terminals
-  expose name, cwd, and env. Environment variables use a nested key/value list
-  with add, key edit, value edit, and delete actions. Dependencies are selected
-  from a checkbox list of other tasks. Working-directory edits validate
-  immediately and support Tab completion for directories relative to the config
-  file.
+  name, command, cwd, env, dependencies, start delay, watched paths, ignored
+  paths, and watch delay. Persistent terminals expose name, cwd, and env.
+  Environment variables use a nested key/value list with add, key edit, value
+  edit, and delete actions. Dependencies are selected from a checkbox list of
+  other tasks. Working-directory edits validate immediately and support Tab
+  completion for directories relative to the config file. Watch path editors
+  support files and directories relative to the task cwd.
 - **Settings** — app-level settings such as the leader key,
   double/triple-click timing, project-scoped MCP access, and MCP activity-bar
-  visibility.
+  visibility, plus watcher mode and polling interval.
 - **Exit** — discard, save without restarting, save and restart affected, save
   and restart all, and a Problems section when the draft has config problems.
   In `demons init`, save/discard closes the configurator without starting
@@ -176,7 +192,8 @@ The runtime menu is opened with `?` in command mode or by clicking the footer's
 Keyboard behavior follows common TUI menu conventions: arrows move, Enter
 activates, Space toggles dependency checkboxes, Left/Right adjust sliders, Esc
 backs out one level, and text fields support cursor movement and basic line
-editing. Tab completes directories while editing a task's working directory.
+editing. Tab completes directories while editing a working directory and files
+or directories while editing a watch path.
 
 ### 4.4 Project-scoped MCP integration
 
@@ -225,6 +242,7 @@ demons                         # Run all tasks from the nearest demons.toml.
 demons init                    # Open the configurator without starting tasks.
 demons --config <path>         # Use a specific config file.
 demons -c <path>               # Short form.
+demons --no-watch              # Disable file watching for this run.
 demons --config <path> mcp serve --scope <uuid>
                                 # Managed stdio adapter; normally generated.
 demons --help                  # Show usage.
@@ -235,7 +253,6 @@ Reserved for a future release:
 
 ```
 demons "cmd1" "cmd2"           # One-off multi-pane run, no config.
-demons --no-watch              # Disable file watching for this run.
 ```
 
 ## 6. Runtime
@@ -362,7 +379,19 @@ For each pane:
   Each dependent's `start_delay` starts after its dependencies have started.
 - While a task is waiting on `start_delay`, the pane body shows a countdown to
   launch.
-- File-watch-driven restart, `run_on_change`, and `repeat` remain schema-reserved.
+- A watched change restarts the owning task and the union of its transitive
+  dependents. An exited task starts again. Each task applies a trailing
+  `watch_delay`, and repeated paths are coalesced before one restart wave.
+- `auto` watcher mode uses native OS events, falls back to metadata polling if
+  registration fails, and uses a low-frequency sentinel on filesystems known
+  to lose native events. A detected miss switches that task to polling for the
+  rest of the session. `native` has no fallback; `polling` starts directly in
+  polling mode. Event and restart queues are bounded.
+- Polling fingerprints file type, size, modification time, identity, and
+  symlink target. Ignored directory trees are pruned before traversal, scans
+  wait the configured interval after completion, and each task snapshot is
+  limited to 250,000 entries.
+- `run_on_change` and `repeat` remain schema-reserved.
 - On Demons quit: send SIGTERM to task process groups and SIGHUP to shell pane
   process groups, wait 2s, then send SIGKILL to any that are still alive. Exit
   only when all children are reaped.
@@ -385,6 +414,8 @@ For each pane:
 - **CLI**: `clap` v4.
 - **Config**: `toml` + `serde`.
 - **Terminal emulation**: `vt100`.
+- **File watching**: `notify` for native events and `walkdir` for bounded,
+  ignore-aware polling fallback.
 - **Build**: standard `cargo build --release`. A `Makefile` provides `make build` and `make install` targets.
 - **Distribution**: `cargo install --path .` or `make install` to copy the release binary into `~/.cargo/bin/`.
 
@@ -392,7 +423,6 @@ For each pane:
 
 - Session persistence.
 - Detach / reattach.
-- File-watch-based auto-restart.
 - `run_on_change`.
 - `repeat`-interval tasks.
 - Automatic pane output logging to file. Manual scrollback export is available.
@@ -413,12 +443,17 @@ multi_click_ms = 500
 logging = false
 mcp_access = "off"
 mcp_status_bar = true
+watch_mode = "auto"
+watch_poll_interval = "1s"
 
 [[task]]
 name = "server"
 command = "cargo run"
 cwd = "."
 depends_on = []
+watch = ["src", "Cargo.toml"]
+watch_ignore = ["target"]
+watch_delay = "250ms"
 
 [task.env]
 

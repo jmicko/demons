@@ -6,12 +6,17 @@ leader = "alt-j"
 multi_click_ms = 500
 logging = false
 mcp_status_bar = true
+watch_mode = "auto"
+watch_poll_interval = "1s"
 
 [[task]]
 name = "server"
 command = "cargo run"
 cwd = "."
 depends_on = []
+watch = ["src", "Cargo.toml"]
+watch_ignore = ["target"]
+watch_delay = "250ms"
 
 [task.env]
 

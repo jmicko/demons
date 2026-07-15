@@ -22,6 +22,7 @@ crossterm = "0.29"
 fontdb = "0.23"
 fontdue = "0.9.3"
 libc = "0.2"
+notify = "8.2.0"
 png = "0.18"
 portable-pty = "0.9"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
@@ -36,6 +37,7 @@ toml_edit = "0.22"
 unicode-width = "0.2"
 uuid = { version = "1.23", features = ["v4"] }
 vt100 = "0.15"
+walkdir = "2.5.0"
 
 [dev-dependencies]
 tempfile = "3.15"

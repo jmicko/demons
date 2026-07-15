@@ -81,12 +81,17 @@ multi_click_ms = 500
 logging = false
 mcp_access = "off"
 mcp_status_bar = true
+watch_mode = "auto"
+watch_poll_interval = "1s"
 
 [[task]]
 name = "server"
 command = "cargo run"
 cwd = "."
 depends_on = []
+watch = ["src", "Cargo.toml"]
+watch_ignore = ["target"]
+watch_delay = "250ms"
 
 [task.env]
 
@@ -112,6 +117,7 @@ demons
 
 Demons searches the current directory and its parents for the nearest
 `demons.toml`. Use `demons --config path/to/file.toml` to select one directly.
+Use `demons --no-watch` to disable configured file watchers for one session.
 
 ## Controls
 
@@ -277,6 +283,49 @@ start_delay = "3s"
 [task.env]
 ```
 
+### Automatic Restarts
+
+A task can watch any number of literal files and directories. Relative paths
+are resolved from that task's `cwd`; absolute paths are also supported.
+Directories are watched recursively. When a watched path changes, Demons
+restarts that task and its dependents through the same dependency and
+`start_delay` rules used by a manual restart.
+
+```toml
+schema_version = 5
+
+[settings]
+watch_mode = "auto"          # "auto", "native", or "polling"
+watch_poll_interval = "1s"   # used by polling mode and automatic fallback
+
+[[task]]
+name = "server"
+command = "cargo run"
+cwd = "."
+watch = ["src", "Cargo.toml"]
+watch_ignore = ["target", "src/generated"]
+watch_delay = "250ms"
+```
+
+`watch` entries must already exist and must resolve to a file or directory.
+`watch_ignore` entries may be missing, which is useful for generated paths.
+The optional `watch_delay` is a trailing debounce: a burst of saves produces
+one restart after changes have been quiet for that duration. It accepts `ms`,
+`s`, `m`, and `h`, defaults to `250ms`, and must be between `25ms` and `60s`.
+
+`watch_mode = "auto"` uses native operating-system events and automatically
+falls back to bounded metadata polling when native registration fails or a
+filesystem proves unreliable. `native` disables that fallback. `polling`
+always scans metadata at `watch_poll_interval`, which must be between `250ms`
+and `60s`. The interval starts after each scan finishes, ignored directory
+trees are pruned, and a task scan is capped at 250,000 entries. Use
+`demons --no-watch` to suppress all watcher activity without editing the file.
+
+Watched and ignored paths are managed from each task's nested Tasks menu.
+Their editor supports Tab completion for both files and directories relative
+to the task working directory. Watcher mode and polling interval are in the
+Settings tab.
+
 Use `[[terminal]]` for a regular shell pane that starts alongside tasks:
 
 ```toml
@@ -302,12 +351,12 @@ it.
 
 `schema_version` is the Demons config schema version, not the Demons app or
 crate version. Existing unversioned configs are treated as the current schema
-and are normalized after they successfully validate. Schema versions 1 through
-3 migrate to version 4 when they are next saved.
+and are normalized after they successfully validate. Older supported schema
+versions migrate to version 5 when they are next saved.
 
-`logging`, `watch`, `run_on_change`, and `repeat` are reserved schema fields.
-Demons rejects reserved task fields when set, and rejects `logging = true`, so
-a configuration never silently promises behavior that is not implemented.
+`logging`, `run_on_change`, and `repeat` are reserved schema fields. Demons
+rejects reserved task fields when set, and rejects `logging = true`, so a
+configuration never silently promises behavior that is not implemented.
 
 ## Codex Integration
 

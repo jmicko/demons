@@ -4,6 +4,15 @@ All notable user-facing changes should be recorded here before a release.
 
 ## Unreleased
 
+- Added config schema v5 with per-task literal file and recursive directory
+  watches, ignored paths, and trailing restart debounce.
+- Added native file-system events with automatic polling fallback, configurable
+  watcher mode and polling cadence, ignored-tree pruning, and bounded queues.
+- Added task-menu editors with file/directory Tab completion for watched and
+  ignored paths, plus live watcher settings that revert on Discard.
+- Added `--no-watch` to disable all configured watchers for one session.
+- Changed watched restarts to use the existing dependency graph and start
+  delays, including restarting exited tasks and coalescing change bursts.
 - Added config schema v4 with Off, Read only, and Full project-scoped MCP
   access levels managed from the Settings tab.
 - Added an optional one-line MCP activity bar with a fixed-position control
