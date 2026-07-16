@@ -2278,7 +2278,7 @@ pub fn config_blocking_problems(config: &Config, path: &Path) -> Vec<ConfigProbl
             index,
             ConfigTaskField::Watch,
             "Watched path",
-            &cwd,
+            root,
             &task.watch,
             true,
         );
@@ -2287,7 +2287,7 @@ pub fn config_blocking_problems(config: &Config, path: &Path) -> Vec<ConfigProbl
             index,
             ConfigTaskField::WatchIgnore,
             "Ignored path",
-            &cwd,
+            root,
             &task.watch_ignore,
             false,
         );
@@ -2365,7 +2365,7 @@ fn append_watch_path_problems(
     task_index: usize,
     field: ConfigTaskField,
     label: &str,
-    task_cwd: &Path,
+    config_root: &Path,
     paths: &[PathBuf],
     must_exist: bool,
 ) {
@@ -2384,7 +2384,7 @@ fn append_watch_path_problems(
             continue;
         }
         if must_exist {
-            let resolved = resolve_from_task_cwd(task_cwd, path);
+            let resolved = resolve_from_config_root(config_root, path);
             match fs::metadata(&resolved) {
                 Ok(metadata) if metadata.is_file() || metadata.is_dir() => {}
                 Ok(_) => problems.push(task_problem(
@@ -2415,11 +2415,11 @@ fn configured_path_error(path: &Path) -> Option<&'static str> {
     None
 }
 
-pub fn resolve_from_task_cwd(task_cwd: &Path, path: &Path) -> PathBuf {
+pub fn resolve_from_config_root(config_root: &Path, path: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
     } else {
-        task_cwd.join(path)
+        config_root.join(path)
     }
 }
 
@@ -2608,10 +2608,10 @@ pub fn validate_for_path(config: &Config, path: &Path) -> Result<()> {
             );
         }
 
-        validate_watch_paths(&task.name, &cwd, "watch", &task.watch, true, path)?;
+        validate_watch_paths(&task.name, root, "watch", &task.watch, true, path)?;
         validate_watch_paths(
             &task.name,
-            &cwd,
+            root,
             "watch_ignore",
             &task.watch_ignore,
             false,
@@ -2693,7 +2693,7 @@ pub fn validate_for_path(config: &Config, path: &Path) -> Result<()> {
 
 fn validate_watch_paths(
     task_name: &str,
-    task_cwd: &Path,
+    config_root: &Path,
     field: &str,
     paths: &[PathBuf],
     must_exist: bool,
@@ -2720,7 +2720,7 @@ fn validate_watch_paths(
         if !must_exist {
             continue;
         }
-        let resolved = resolve_from_task_cwd(task_cwd, watch_path);
+        let resolved = resolve_from_config_root(config_root, watch_path);
         let metadata = fs::metadata(&resolved).with_context(|| {
             format!(
                 "{}: task {:?} {field} path does not exist: {}",
@@ -3818,6 +3818,46 @@ watch = ["missing"]
                     }
         }));
         assert_eq!(fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
+    fn relative_watcher_paths_resolve_from_config_root_not_task_cwd() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join(CONFIG_FILE);
+        fs::create_dir_all(temp.path().join("apps/server/src")).unwrap();
+        let mut config: Config = toml::from_str(
+            r#"
+                schema_version = 5
+
+                [[task]]
+                name = "server"
+                command = "echo ready"
+                cwd = "apps/server"
+                watch = ["apps/server/src"]
+                watch_ignore = ["apps/server/target"]
+            "#,
+        )
+        .unwrap();
+
+        validate_for_path(&config, &path).unwrap();
+        assert_eq!(
+            resolve_from_config_root(temp.path(), &config.tasks[0].watch[0]),
+            temp.path().join("apps/server/src")
+        );
+
+        config.tasks[0].watch = vec![PathBuf::from("src")];
+        let error = validate_for_path(&config, &path).unwrap_err().to_string();
+        assert!(error.contains(&temp.path().join("src").display().to_string()));
+    }
+
+    #[test]
+    fn absolute_watcher_paths_are_not_rebased() {
+        let temp = tempdir().unwrap();
+        let absolute = temp.path().join("shared/source.rs");
+        assert_eq!(
+            resolve_from_config_root(Path::new("/different/project"), &absolute),
+            absolute
+        );
     }
 
     #[test]

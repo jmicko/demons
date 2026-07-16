@@ -49,7 +49,7 @@ use crate::{
         ConfigTaskField, ConfigTerminalField, DEFAULT_WATCH_DELAY, Leader, LoadedConfig,
         MAX_MULTI_CLICK_MS, MIN_MULTI_CLICK_MS, MULTI_CLICK_STEP_MS, McpAccess, Task, TaskCommand,
         TerminalPane, WatchMode, config_blocking_problems, parse_start_delay, parse_watch_delay,
-        parse_watch_poll_interval, resolve_from_task_cwd,
+        parse_watch_poll_interval, resolve_from_config_root,
     },
     control::{
         self, ControlEnvelope, ControlListener, ControlRequest, ControlResponse, OutputPage,
@@ -3261,18 +3261,12 @@ impl App {
                     anyhow::bail!("path cannot contain control characters");
                 }
                 let path = PathBuf::from(value);
-                let task = menu
-                    .draft
+                menu.draft
                     .tasks
                     .get(owner.task)
                     .context("task no longer exists")?;
-                let task_cwd = if task.cwd.is_absolute() {
-                    task.cwd.clone()
-                } else {
-                    root.join(&task.cwd)
-                };
                 if owner.kind == WatchPathKind::Watched {
-                    let resolved = resolve_from_task_cwd(&task_cwd, &path);
+                    let resolved = resolve_from_config_root(&root, &path);
                     match fs::metadata(&resolved) {
                         Ok(metadata) if metadata.is_file() || metadata.is_dir() => {}
                         Ok(_) => anyhow::bail!(
@@ -3327,13 +3321,8 @@ impl App {
                     ..
                 } => (config_root.clone(), CompletionKind::Directories),
                 MenuEditTarget::WatchPath { owner, .. } => {
-                    let task = menu.draft.tasks.get(owner.task)?;
-                    let root = if task.cwd.is_absolute() {
-                        task.cwd.clone()
-                    } else {
-                        config_root.join(&task.cwd)
-                    };
-                    (root, CompletionKind::FilesAndDirectories)
+                    menu.draft.tasks.get(owner.task)?;
+                    (config_root.clone(), CompletionKind::FilesAndDirectories)
                 }
                 _ => return None,
             };
@@ -3643,10 +3632,18 @@ impl App {
         let Some(owner) = menu.watch_owner else {
             return;
         };
-        let value = index
-            .and_then(|index| menu_watch_paths(menu, owner)?.get(index))
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let value = match index {
+            Some(index) => menu_watch_paths(menu, owner)
+                .and_then(|paths| paths.get(index))
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            None => menu
+                .draft
+                .tasks
+                .get(owner.task)
+                .map(|task| task.cwd.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        };
         menu.edit = Some(MenuEdit {
             target: MenuEditTarget::WatchPath { owner, index },
             cursor: char_count(&value),
@@ -10886,16 +10883,11 @@ fn menu_watch_paths_mut(menu: &mut MenuState, owner: WatchPathOwner) -> Option<&
 }
 
 fn watch_path_type(menu: &MenuState, owner: WatchPathOwner, path: &Path) -> &'static str {
-    let Some(task) = menu.draft.tasks.get(owner.task) else {
+    if menu.draft.tasks.get(owner.task).is_none() {
         return "missing";
-    };
+    }
     let config_root = menu.path.parent().unwrap_or_else(|| Path::new("."));
-    let cwd = if task.cwd.is_absolute() {
-        task.cwd.clone()
-    } else {
-        config_root.join(&task.cwd)
-    };
-    let resolved = resolve_from_task_cwd(&cwd, path);
+    let resolved = resolve_from_config_root(config_root, path);
     let Ok(link_metadata) = fs::symlink_metadata(&resolved) else {
         return "missing";
     };
@@ -17906,7 +17898,7 @@ mod tests {
     }
 
     #[test]
-    fn watch_path_menu_adds_files_and_directories_from_task_cwd() {
+    fn watch_path_menu_prefills_task_cwd_and_resolves_from_config_root() {
         let temp = tempdir().unwrap();
         let web = temp.path().join("web");
         fs::create_dir_all(web.join("src")).unwrap();
@@ -17922,38 +17914,46 @@ mod tests {
             .unwrap();
 
         app.apply_menu_action(MenuAction::AddWatchPath).unwrap();
+        assert_eq!(
+            app.menu.as_ref().unwrap().edit.as_ref().unwrap().value,
+            "web"
+        );
         {
             let edit = app.menu.as_mut().unwrap().edit.as_mut().unwrap();
-            edit.value = "Car".to_owned();
+            edit.value = "web/Car".to_owned();
             edit.cursor = char_count(&edit.value);
         }
         app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
             .unwrap();
         assert_eq!(
             app.menu.as_ref().unwrap().edit.as_ref().unwrap().value,
-            "Cargo.toml"
+            "web/Cargo.toml"
         );
         app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
 
         assert_eq!(
             app.menu.as_ref().unwrap().draft.tasks[0].watch,
-            vec![PathBuf::from("Cargo.toml")]
+            vec![PathBuf::from("web/Cargo.toml")]
         );
         assert_eq!(app.menu.as_ref().unwrap().watch_detail, Some(0));
 
         app.apply_menu_action(MenuAction::BackWatchPaths).unwrap();
         app.apply_menu_action(MenuAction::AddWatchPath).unwrap();
+        assert_eq!(
+            app.menu.as_ref().unwrap().edit.as_ref().unwrap().value,
+            "web"
+        );
         {
             let edit = app.menu.as_mut().unwrap().edit.as_mut().unwrap();
-            edit.value = "sr".to_owned();
+            edit.value = "web/sr".to_owned();
             edit.cursor = char_count(&edit.value);
         }
         app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
             .unwrap();
         assert_eq!(
             app.menu.as_ref().unwrap().edit.as_ref().unwrap().value,
-            "src/"
+            "web/src/"
         );
         app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
@@ -17977,9 +17977,13 @@ mod tests {
         app.apply_menu_action(MenuAction::TaskField(TaskField::Watch))
             .unwrap();
         app.apply_menu_action(MenuAction::AddWatchPath).unwrap();
+        assert_eq!(
+            app.menu.as_ref().unwrap().edit.as_ref().unwrap().value,
+            "web"
+        );
         {
             let edit = app.menu.as_mut().unwrap().edit.as_mut().unwrap();
-            edit.value = "Car".to_owned();
+            edit.value = "web/Car".to_owned();
             edit.cursor = char_count(&edit.value);
         }
 
@@ -17987,7 +17991,7 @@ mod tests {
             .unwrap();
 
         let edit = app.menu.as_ref().unwrap().edit.as_ref().unwrap();
-        assert_eq!(edit.value, "Cargo.");
+        assert_eq!(edit.value, "web/Cargo.");
         assert_eq!(
             edit.completions
                 .iter()
@@ -18028,14 +18032,14 @@ mod tests {
         app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
         let edit = app.menu.as_ref().unwrap().edit.as_ref().unwrap();
-        assert_eq!(edit.value, "Cargo.toml");
+        assert_eq!(edit.value, "web/Cargo.toml");
         assert!(edit.completions.is_empty());
 
         app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
         assert_eq!(
             app.menu.as_ref().unwrap().draft.tasks[0].watch,
-            vec![PathBuf::from("Cargo.toml")]
+            vec![PathBuf::from("web/Cargo.toml")]
         );
     }
 
@@ -18050,6 +18054,7 @@ mod tests {
         app.apply_menu_action(MenuAction::TaskField(TaskField::WatchIgnore))
             .unwrap();
         app.apply_menu_action(MenuAction::AddWatchPath).unwrap();
+        assert_eq!(app.menu.as_ref().unwrap().edit.as_ref().unwrap().value, ".");
         {
             let edit = app.menu.as_mut().unwrap().edit.as_mut().unwrap();
             edit.value = "generated/later".to_owned();

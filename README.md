@@ -286,7 +286,8 @@ start_delay = "3s"
 ### Automatic Restarts
 
 A task can watch any number of literal files and directories. Relative paths
-are resolved from that task's `cwd`; absolute paths are also supported.
+are resolved from the directory containing `demons.toml`; absolute paths are
+also supported.
 Directories are watched recursively. When a watched path changes, Demons
 restarts that task and its dependents through the same dependency and
 `start_delay` rules used by a manual restart.
@@ -327,9 +328,12 @@ trees are pruned, and a task scan is capped at 250,000 entries. Use
 
 Watched and ignored paths are managed from each task's nested Tasks menu.
 Their editor supports Tab completion for both files and directories relative
-to the task working directory. When several paths match, Tab opens a persistent
-match list; use Tab, Shift+Tab, the arrow keys, the mouse wheel, or a click to
-choose one. Watcher mode and polling interval are in the Settings tab.
+to the directory containing `demons.toml`. Every new entry starts with the
+task's working directory as editable text, providing a useful starting point
+without constraining the final path. When several paths match, Tab opens a
+persistent match list; use Tab, Shift+Tab, the arrow keys, the mouse wheel, or
+a click to choose one. Watcher mode and polling interval are in the Settings
+tab.
 
 Use `[[terminal]]` for a regular shell pane that starts alongside tasks:
 

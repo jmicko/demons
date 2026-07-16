@@ -16,7 +16,7 @@ use anyhow::{Context, Result, bail};
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use walkdir::{DirEntry, WalkDir};
 
-use crate::config::{Config, Task, WatchMode, parse_watch_poll_interval, resolve_from_task_cwd};
+use crate::config::{Config, Task, WatchMode, parse_watch_poll_interval, resolve_from_config_root};
 
 const RAW_EVENT_CAPACITY: usize = 1_024;
 const OUTPUT_EVENT_CAPACITY: usize = 256;
@@ -126,7 +126,7 @@ impl Drop for WatchService {
 #[derive(Clone, Debug)]
 struct TaskWatchSpec {
     name: String,
-    cwd: PathBuf,
+    config_root: PathBuf,
     roots: Vec<WatchRoot>,
     ignores: Vec<IgnorePath>,
     polling: bool,
@@ -145,8 +145,8 @@ struct WatchRoot {
 }
 
 impl WatchRoot {
-    fn load(cwd: &Path, configured: &Path) -> Result<Self> {
-        let configured = normalize_path(&resolve_from_task_cwd(cwd, configured));
+    fn load(config_root: &Path, configured: &Path) -> Result<Self> {
+        let configured = normalize_path(&resolve_from_config_root(config_root, configured));
         let target = fs::canonicalize(&configured)
             .with_context(|| format!("watched path does not exist: {}", configured.display()))?;
         let metadata = fs::metadata(&target)
@@ -184,8 +184,8 @@ struct IgnorePath {
 }
 
 impl IgnorePath {
-    fn load(cwd: &Path, configured: &Path) -> Self {
-        let configured = normalize_path(&resolve_from_task_cwd(cwd, configured));
+    fn load(config_root: &Path, configured: &Path) -> Self {
+        let configured = normalize_path(&resolve_from_config_root(config_root, configured));
         let target = fs::canonicalize(&configured)
             .ok()
             .map(|path| normalize_path(&path));
@@ -212,26 +212,19 @@ fn build_specs(root: &Path, config: &Config) -> Result<Vec<TaskWatchSpec>> {
 }
 
 fn build_spec(root: &Path, task: &Task, now: Instant) -> Result<TaskWatchSpec> {
-    let cwd = if task.cwd.is_absolute() {
-        task.cwd.clone()
-    } else {
-        root.join(&task.cwd)
-    };
-    let cwd = fs::canonicalize(&cwd)
-        .with_context(|| format!("cannot resolve cwd for watched task {:?}", task.name))?;
     let roots = task
         .watch
         .iter()
-        .map(|path| WatchRoot::load(&cwd, path))
+        .map(|path| WatchRoot::load(root, path))
         .collect::<Result<Vec<_>>>()?;
     let ignores = task
         .watch_ignore
         .iter()
-        .map(|path| IgnorePath::load(&cwd, path))
+        .map(|path| IgnorePath::load(root, path))
         .collect();
     Ok(TaskWatchSpec {
         name: task.name.clone(),
-        cwd,
+        config_root: root.to_path_buf(),
         roots,
         ignores,
         polling: false,
@@ -505,10 +498,10 @@ impl Coordinator {
             if self.specs[index].polling {
                 continue;
             }
-            let cwd = self.specs[index].cwd.clone();
+            let config_root = self.specs[index].config_root.clone();
             for root in &mut self.specs[index].roots {
                 let configured = root.configured.clone();
-                match WatchRoot::load(&cwd, &configured) {
+                match WatchRoot::load(&config_root, &configured) {
                     Ok(refreshed) => *root = refreshed,
                     Err(error) if self.mode == WatchMode::Auto => {
                         self.promote_to_polling(
@@ -1049,6 +1042,24 @@ mod tests {
             WatchService::start(temp.path(), &config, false)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn watcher_roots_are_independent_of_task_cwd() {
+        let temp = tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("apps/server")).unwrap();
+        fs::create_dir_all(temp.path().join("shared/src")).unwrap();
+        let mut config = watched_config(PathBuf::from("shared/src"), WatchMode::Polling);
+        config.tasks[0].cwd = PathBuf::from("apps/server");
+        config.tasks[0].watch_ignore = vec![PathBuf::from("shared/src/generated")];
+
+        let spec = build_specs(temp.path(), &config).unwrap().remove(0);
+
+        assert_eq!(spec.roots[0].configured, temp.path().join("shared/src"));
+        assert_eq!(
+            spec.ignores[0].configured,
+            temp.path().join("shared/src/generated")
         );
     }
 
