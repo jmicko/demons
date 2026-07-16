@@ -180,7 +180,8 @@ The runtime menu is opened with `?` in command mode or by clicking the footer's
   edit, and delete actions. Dependencies are selected from a checkbox list of
   other tasks. Working-directory edits validate immediately and support Tab
   completion for directories relative to the config file. Watch path editors
-  support files and directories relative to the task cwd.
+  support files and directories relative to the task cwd. Ambiguous path
+  completion presents a persistent keyboard- and mouse-selectable match list.
 - **Settings** — app-level settings such as the leader key,
   double/triple-click timing, project-scoped MCP access, and MCP activity-bar
   visibility, plus watcher mode and polling interval.

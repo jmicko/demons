@@ -309,6 +309,10 @@ watch_delay = "250ms"
 
 `watch` entries must already exist and must resolve to a file or directory.
 `watch_ignore` entries may be missing, which is useful for generated paths.
+Prefer source-focused watches over `watch = ["."]`: a recursive project-root
+watch also observes build output, databases, logs, and other runtime writes,
+which can make a restarted task trigger itself. If a broad watch is necessary,
+list generated paths such as `target` or `node_modules` in `watch_ignore`.
 The optional `watch_delay` is a trailing debounce: a burst of saves produces
 one restart after changes have been quiet for that duration. It accepts `ms`,
 `s`, `m`, and `h`, defaults to `250ms`, and must be between `25ms` and `60s`.
@@ -323,8 +327,9 @@ trees are pruned, and a task scan is capped at 250,000 entries. Use
 
 Watched and ignored paths are managed from each task's nested Tasks menu.
 Their editor supports Tab completion for both files and directories relative
-to the task working directory. Watcher mode and polling interval are in the
-Settings tab.
+to the task working directory. When several paths match, Tab opens a persistent
+match list; use Tab, Shift+Tab, the arrow keys, the mouse wheel, or a click to
+choose one. Watcher mode and polling interval are in the Settings tab.
 
 Use `[[terminal]]` for a regular shell pane that starts alongside tasks:
 

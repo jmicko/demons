@@ -2330,54 +2330,85 @@ impl App {
     fn handle_menu_edit_key(&mut self, key: KeyEvent) -> Result<Action> {
         match key.code {
             KeyCode::Esc => {
-                if let Some(menu) = self.menu.as_mut() {
+                if self.menu_path_completions_open() {
+                    self.clear_menu_path_completions();
+                } else if let Some(menu) = self.menu.as_mut() {
                     menu.edit = None;
                 }
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 return Ok(self.request_quit());
             }
-            KeyCode::Enter => self.submit_menu_edit(),
-            KeyCode::Tab => self.complete_menu_path(),
+            KeyCode::Enter => {
+                if self.menu_path_completions_open() {
+                    self.accept_selected_menu_path_completion();
+                } else {
+                    self.submit_menu_edit();
+                }
+            }
+            KeyCode::Tab => {
+                if self.menu_path_completions_open() {
+                    self.move_menu_path_completion(1);
+                } else {
+                    self.complete_menu_path();
+                }
+            }
+            KeyCode::BackTab if self.menu_path_completions_open() => {
+                self.move_menu_path_completion(-1);
+            }
+            KeyCode::Up if self.menu_path_completions_open() => {
+                self.move_menu_path_completion(-1);
+            }
+            KeyCode::Down if self.menu_path_completions_open() => {
+                self.move_menu_path_completion(1);
+            }
             KeyCode::Backspace => self.delete_menu_edit_char_before_cursor(),
             KeyCode::Delete => self.delete_menu_edit_char_at_cursor(),
             KeyCode::Left => {
+                self.clear_menu_path_completions();
                 if let Some(edit) = self.menu.as_mut().and_then(|menu| menu.edit.as_mut()) {
                     edit.cursor = edit.cursor.saturating_sub(1);
                 }
             }
             KeyCode::Right => {
+                self.clear_menu_path_completions();
                 if let Some(edit) = self.menu.as_mut().and_then(|menu| menu.edit.as_mut()) {
                     edit.cursor = (edit.cursor + 1).min(char_count(&edit.value));
                 }
             }
             KeyCode::Home => {
+                self.clear_menu_path_completions();
                 if let Some(edit) = self.menu.as_mut().and_then(|menu| menu.edit.as_mut()) {
                     edit.cursor = 0;
                 }
             }
             KeyCode::End => {
+                self.clear_menu_path_completions();
                 if let Some(edit) = self.menu.as_mut().and_then(|menu| menu.edit.as_mut()) {
                     edit.cursor = char_count(&edit.value);
                 }
             }
             KeyCode::Char('a' | 'A') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.clear_menu_path_completions();
                 if let Some(edit) = self.menu.as_mut().and_then(|menu| menu.edit.as_mut()) {
                     edit.cursor = 0;
                 }
             }
             KeyCode::Char('e' | 'E') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.clear_menu_path_completions();
                 if let Some(edit) = self.menu.as_mut().and_then(|menu| menu.edit.as_mut()) {
                     edit.cursor = char_count(&edit.value);
                 }
             }
             KeyCode::Char('u' | 'U') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.clear_menu_path_completions();
                 if let Some(edit) = self.menu.as_mut().and_then(|menu| menu.edit.as_mut()) {
                     edit.value.clear();
                     edit.cursor = 0;
                 }
             }
             KeyCode::Char('k' | 'K') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.clear_menu_path_completions();
                 if let Some(edit) = self.menu.as_mut().and_then(|menu| menu.edit.as_mut()) {
                     let index = byte_index_for_char(&edit.value, edit.cursor);
                     edit.value.truncate(index);
@@ -2715,6 +2746,9 @@ impl App {
             MenuAction::OpenWatchModePicker => self.open_menu_watch_mode_picker(),
             MenuAction::SelectWatchMode(mode) => self.set_menu_watch_mode(mode),
             MenuAction::EditWatchPollInterval => self.start_watch_poll_interval_edit(),
+            MenuAction::SelectPathCompletion(index) => {
+                self.accept_menu_path_completion(index);
+            }
             MenuAction::OpenMcpAccessPicker => self.open_menu_mcp_access_picker(),
             MenuAction::SelectMcpAccess(access) => self.request_menu_mcp_access(access),
             MenuAction::ToggleMcpStatusBar => self.toggle_menu_mcp_status_bar(),
@@ -3059,6 +3093,8 @@ impl App {
             },
             cursor: char_count(&value),
             value,
+            completions: Vec::new(),
+            completion_cursor: 0,
         });
     }
 
@@ -3081,6 +3117,8 @@ impl App {
             },
             cursor: char_count(&value),
             value,
+            completions: Vec::new(),
+            completion_cursor: 0,
         });
     }
 
@@ -3309,18 +3347,82 @@ impl App {
                 if let Some(edit) = self.menu.as_mut().and_then(|menu| menu.edit.as_mut()) {
                     edit.value = value;
                     edit.cursor = cursor;
+                    edit.completions.clear();
+                    edit.completion_cursor = 0;
                 }
             }
             Ok(DirectoryCompletion::NoMatches) => {
+                self.clear_menu_path_completions();
                 self.set_notice("No matching paths.".to_owned());
             }
-            Ok(DirectoryCompletion::Ambiguous { matches }) => {
-                self.set_notice(format!("{matches} matching paths. Keep typing."));
+            Ok(DirectoryCompletion::Ambiguous {
+                value,
+                cursor,
+                candidates,
+            }) => {
+                if let Some(edit) = self.menu.as_mut().and_then(|menu| menu.edit.as_mut()) {
+                    edit.value = value;
+                    edit.cursor = cursor;
+                    edit.completions = candidates;
+                    edit.completion_cursor = 0;
+                }
             }
             Err(error) => {
+                self.clear_menu_path_completions();
                 self.set_notice(format!("Completion failed: {error:#}"));
             }
         }
+    }
+
+    fn menu_path_completions_open(&self) -> bool {
+        self.menu
+            .as_ref()
+            .and_then(|menu| menu.edit.as_ref())
+            .is_some_and(|edit| !edit.completions.is_empty())
+    }
+
+    fn clear_menu_path_completions(&mut self) {
+        let Some(edit) = self.menu.as_mut().and_then(|menu| menu.edit.as_mut()) else {
+            return;
+        };
+        edit.completions.clear();
+        edit.completion_cursor = 0;
+    }
+
+    fn move_menu_path_completion(&mut self, delta: isize) {
+        let Some(edit) = self.menu.as_mut().and_then(|menu| menu.edit.as_mut()) else {
+            return;
+        };
+        let count = edit.completions.len();
+        if count == 0 {
+            return;
+        }
+        edit.completion_cursor =
+            (edit.completion_cursor as isize + delta).rem_euclid(count as isize) as usize;
+    }
+
+    fn accept_selected_menu_path_completion(&mut self) {
+        let index = self
+            .menu
+            .as_ref()
+            .and_then(|menu| menu.edit.as_ref())
+            .map(|edit| edit.completion_cursor);
+        if let Some(index) = index {
+            self.accept_menu_path_completion(index);
+        }
+    }
+
+    fn accept_menu_path_completion(&mut self, index: usize) {
+        let Some(edit) = self.menu.as_mut().and_then(|menu| menu.edit.as_mut()) else {
+            return;
+        };
+        let Some(completion) = edit.completions.get(index).cloned() else {
+            return;
+        };
+        edit.value = completion.value;
+        edit.cursor = completion.cursor;
+        edit.completions.clear();
+        edit.completion_cursor = 0;
     }
 
     fn delete_menu_task(&mut self, task_index: usize) {
@@ -3441,6 +3543,8 @@ impl App {
             },
             cursor: char_count(&key),
             value: key,
+            completions: Vec::new(),
+            completion_cursor: 0,
         });
     }
 
@@ -3477,6 +3581,8 @@ impl App {
             target,
             cursor: char_count(&value),
             value,
+            completions: Vec::new(),
+            completion_cursor: 0,
         });
     }
 
@@ -3545,6 +3651,8 @@ impl App {
             target: MenuEditTarget::WatchPath { owner, index },
             cursor: char_count(&value),
             value,
+            completions: Vec::new(),
+            completion_cursor: 0,
         });
     }
 
@@ -3664,6 +3772,8 @@ impl App {
             target: MenuEditTarget::WatchPollInterval,
             cursor: char_count(&value),
             value,
+            completions: Vec::new(),
+            completion_cursor: 0,
         });
     }
 
@@ -4269,6 +4379,8 @@ impl App {
         let index = byte_index_for_char(&edit.value, edit.cursor);
         edit.value.insert(index, character);
         edit.cursor += 1;
+        edit.completions.clear();
+        edit.completion_cursor = 0;
     }
 
     fn insert_menu_edit_text(&mut self, text: &str) {
@@ -4288,6 +4400,8 @@ impl App {
         let end = byte_index_for_char(&edit.value, edit.cursor);
         edit.value.replace_range(start..end, "");
         edit.cursor -= 1;
+        edit.completions.clear();
+        edit.completion_cursor = 0;
     }
 
     fn delete_menu_edit_char_at_cursor(&mut self) {
@@ -4300,6 +4414,8 @@ impl App {
         let start = byte_index_for_char(&edit.value, edit.cursor);
         let end = byte_index_for_char(&edit.value, edit.cursor + 1);
         edit.value.replace_range(start..end, "");
+        edit.completions.clear();
+        edit.completion_cursor = 0;
     }
 
     fn handle_search_key(&mut self, key: KeyEvent) -> Result<Action> {
@@ -4733,7 +4849,9 @@ impl App {
     fn handle_menu_mouse(&mut self, mouse: MouseEvent) -> Result<Action> {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                if self
+                if self.menu_path_completions_open() {
+                    self.move_menu_path_completion(-1);
+                } else if self
                     .menu
                     .as_ref()
                     .is_some_and(|menu| menu.mcp_empty_file_prompt.is_some())
@@ -4771,7 +4889,9 @@ impl App {
                 return Ok(Action::Continue);
             }
             MouseEventKind::ScrollDown => {
-                if self
+                if self.menu_path_completions_open() {
+                    self.move_menu_path_completion(1);
+                } else if self
                     .menu
                     .as_ref()
                     .is_some_and(|menu| menu.mcp_empty_file_prompt.is_some())
@@ -8014,6 +8134,8 @@ struct MenuEdit {
     target: MenuEditTarget,
     value: String,
     cursor: usize,
+    completions: Vec<PathCompletion>,
+    completion_cursor: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -8163,6 +8285,7 @@ enum MenuAction {
     OpenWatchModePicker,
     SelectWatchMode(WatchMode),
     EditWatchPollInterval,
+    SelectPathCompletion(usize),
     OpenMcpAccessPicker,
     SelectMcpAccess(McpAccess),
     ToggleMcpStatusBar,
@@ -8195,9 +8318,23 @@ impl ProblemBadges {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum DirectoryCompletion {
-    Updated { value: String, cursor: usize },
+    Updated {
+        value: String,
+        cursor: usize,
+    },
     NoMatches,
-    Ambiguous { matches: usize },
+    Ambiguous {
+        value: String,
+        cursor: usize,
+        candidates: Vec<PathCompletion>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PathCompletion {
+    label: String,
+    value: String,
+    cursor: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -8568,8 +8705,8 @@ fn render_menu(
         inner.height.saturating_sub(2),
     );
     clear_rect(buffer, body, menu_style());
-    if let Some(edit) = menu.edit.as_ref() {
-        render_menu_edit(body, buffer, edit);
+    if menu.edit.is_some() {
+        render_menu_edit(body, buffer, menu, hover_position);
         return;
     }
     if let Some(task) = menu.dependency_task {
@@ -9638,28 +9775,108 @@ fn render_menu_exit(
     }
 }
 
-fn render_menu_edit(area: Rect, buffer: &mut Buffer, edit: &MenuEdit) {
+fn render_menu_edit(
+    area: Rect,
+    buffer: &mut Buffer,
+    menu: &mut MenuState,
+    hover_position: Option<(u16, u16)>,
+) {
+    let MenuState {
+        edit: Some(edit),
+        hits,
+        ..
+    } = menu
+    else {
+        return;
+    };
+    let title = menu_edit_title(edit);
+    let path_completion = menu_edit_supports_path_completion(edit);
+    let mut value = edit.value.clone();
+    let cursor = edit.cursor;
+    let completions = &edit.completions;
+    let completion_cursor = edit
+        .completion_cursor
+        .min(completions.len().saturating_sub(1));
+
     render_text(
         buffer,
         Rect::new(area.x, area.y, area.width, 1),
-        &format!("Editing {}", menu_edit_title(edit)),
+        &format!("Editing {title}"),
         menu_heading_style(),
     );
-    let mut value = edit.value.clone();
-    let cursor = byte_index_for_char(&value, edit.cursor);
-    value.insert(cursor, '|');
+    let cursor_byte = byte_index_for_char(&value, cursor);
+    value.insert(cursor_byte, '|');
     render_text(
         buffer,
         Rect::new(area.x, area.y.saturating_add(2), area.width, 1),
         &value,
         Style::default().fg(THEME_BLACK).bg(THEME_SNOW),
     );
+
+    if !completions.is_empty() {
+        render_text(
+            buffer,
+            Rect::new(area.x, area.y.saturating_add(4), area.width, 1),
+            &format!(
+                "Matches ({}/{}) - Tab/arrows select | Enter uses | Esc hides",
+                completion_cursor + 1,
+                completions.len()
+            ),
+            menu_heading_style(),
+        );
+        let available_rows = usize::from(area.height.saturating_sub(5));
+        if available_rows == 0 {
+            return;
+        }
+        let start = completion_cursor
+            .saturating_add(1)
+            .saturating_sub(available_rows)
+            .min(completions.len().saturating_sub(available_rows));
+        for (row, (index, completion)) in completions
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(available_rows)
+            .enumerate()
+        {
+            let rect = Rect::new(area.x, area.y.saturating_add(5 + row as u16), area.width, 1);
+            render_menu_row(
+                buffer,
+                rect,
+                &completion.label,
+                index == completion_cursor,
+                Some(MenuAction::SelectPathCompletion(index)),
+                hits,
+                hover_position,
+            );
+        }
+        return;
+    }
+
+    let instructions = if path_completion {
+        "Tab completes paths. Enter saves this field. Esc cancels."
+    } else {
+        "Enter saves this field. Esc cancels."
+    };
     render_text(
         buffer,
         Rect::new(area.x, area.y.saturating_add(4), area.width, 1),
-        "Enter saves this field. Esc cancels.",
+        instructions,
         menu_style(),
     );
+}
+
+fn menu_edit_supports_path_completion(edit: &MenuEdit) -> bool {
+    matches!(
+        edit.target,
+        MenuEditTarget::TaskField {
+            field: TaskField::Cwd,
+            ..
+        } | MenuEditTarget::TerminalField {
+            field: TerminalField::Cwd,
+            ..
+        } | MenuEditTarget::WatchPath { .. }
+    )
 }
 
 fn render_menu_row(
@@ -10828,6 +11045,9 @@ fn complete_path(
         let Ok(name) = entry.file_name().into_string() else {
             continue;
         };
+        if name.chars().any(char::is_control) {
+            continue;
+        }
         if !prefix.starts_with('.') && name.starts_with('.') {
             continue;
         }
@@ -10850,23 +11070,35 @@ fn complete_path(
                 cursor,
             })
         }
-        count => {
+        _ => {
             let names = matches
                 .iter()
                 .map(|(name, _)| name.clone())
                 .collect::<Vec<_>>();
             let common = common_prefix(&names);
-            if common != prefix {
-                let mut completed = format!("{display_parent}{common}");
-                completed.push_str(after);
-                let cursor = char_count(display_parent) + char_count(&common);
-                Ok(DirectoryCompletion::Updated {
-                    value: completed,
-                    cursor,
+            let mut value = format!("{display_parent}{common}");
+            value.push_str(after);
+            let cursor = char_count(display_parent) + char_count(&common);
+            let candidates = matches
+                .into_iter()
+                .map(|(name, is_dir)| {
+                    let suffix = if is_dir { "/" } else { "" };
+                    let mut value = format!("{display_parent}{name}{suffix}");
+                    value.push_str(after);
+                    PathCompletion {
+                        label: format!("{name}{suffix}"),
+                        cursor: char_count(display_parent)
+                            + char_count(&name)
+                            + usize::from(is_dir),
+                        value,
+                    }
                 })
-            } else {
-                Ok(DirectoryCompletion::Ambiguous { matches: count })
-            }
+                .collect();
+            Ok(DirectoryCompletion::Ambiguous {
+                value,
+                cursor,
+                candidates,
+            })
         }
     }
 }
@@ -17726,6 +17958,85 @@ mod tests {
         app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
         assert_eq!(app.menu.as_ref().unwrap().draft.tasks[0].watch.len(), 2);
+    }
+
+    #[test]
+    fn watch_path_tab_shows_and_selects_ambiguous_matches() {
+        let temp = tempdir().unwrap();
+        let web = temp.path().join("web");
+        fs::create_dir_all(&web).unwrap();
+        fs::write(web.join("Cargo.lock"), "").unwrap();
+        fs::write(web.join("Cargo.toml"), "[package]\n").unwrap();
+        let mut task = test_task("web");
+        task.cwd = PathBuf::from("web");
+        let mut app = test_app_with_tasks(vec![task]);
+        app.loaded.root = temp.path().to_path_buf();
+        app.loaded.path = temp.path().join(CONFIG_FILE);
+        app.open_menu(MenuTab::Tasks);
+        app.apply_menu_action(MenuAction::OpenTask(0)).unwrap();
+        app.apply_menu_action(MenuAction::TaskField(TaskField::Watch))
+            .unwrap();
+        app.apply_menu_action(MenuAction::AddWatchPath).unwrap();
+        {
+            let edit = app.menu.as_mut().unwrap().edit.as_mut().unwrap();
+            edit.value = "Car".to_owned();
+            edit.cursor = char_count(&edit.value);
+        }
+
+        app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+
+        let edit = app.menu.as_ref().unwrap().edit.as_ref().unwrap();
+        assert_eq!(edit.value, "Cargo.");
+        assert_eq!(
+            edit.completions
+                .iter()
+                .map(|completion| completion.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Cargo.lock", "Cargo.toml"]
+        );
+        assert_eq!(edit.completion_cursor, 0);
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 30));
+        let exit_mode = app.menu_exit_mode();
+        render_menu(
+            Rect::new(0, 0, 100, 30),
+            &mut buffer,
+            app.menu.as_mut().unwrap(),
+            "Alt+J",
+            exit_mode,
+            None,
+        );
+        let rendered = (0..30)
+            .map(|row| buffer_line(&buffer, row, 100))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Matches (1/2)"));
+        assert!(rendered.contains("Cargo.lock"));
+        assert!(rendered.contains("Cargo.toml"));
+        assert!(
+            app.menu
+                .as_ref()
+                .unwrap()
+                .hits
+                .iter()
+                .any(|hit| { hit.action == MenuAction::SelectPathCompletion(1) })
+        );
+
+        app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        let edit = app.menu.as_ref().unwrap().edit.as_ref().unwrap();
+        assert_eq!(edit.value, "Cargo.toml");
+        assert!(edit.completions.is_empty());
+
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(
+            app.menu.as_ref().unwrap().draft.tasks[0].watch,
+            vec![PathBuf::from("Cargo.toml")]
+        );
     }
 
     #[test]
