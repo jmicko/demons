@@ -13,7 +13,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{
+    Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+    event::ModifyKind,
+};
 use walkdir::{DirEntry, WalkDir};
 
 use crate::config::{Config, Task, WatchMode, parse_watch_poll_interval, resolve_from_config_root};
@@ -133,8 +136,9 @@ struct TaskWatchSpec {
     sentinel: bool,
     snapshot: Snapshot,
     next_check: Instant,
-    native_seen: BTreeSet<PathBuf>,
+    native_seen: BTreeMap<PathBuf, Fingerprint>,
     native_seen_overflow: bool,
+    reconcile_once: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -231,8 +235,9 @@ fn build_spec(root: &Path, task: &Task, now: Instant) -> Result<TaskWatchSpec> {
         sentinel: false,
         snapshot: Snapshot::new(),
         next_check: now,
-        native_seen: BTreeSet::new(),
+        native_seen: BTreeMap::new(),
         native_seen_overflow: false,
+        reconcile_once: false,
     })
 }
 
@@ -385,6 +390,9 @@ impl Coordinator {
         }
         spec.polling = true;
         spec.sentinel = false;
+        spec.reconcile_once = false;
+        spec.native_seen.clear();
+        spec.native_seen_overflow = false;
         spec.snapshot = snapshot_spec(spec)?;
         spec.next_check = Instant::now() + self.poll_interval;
         let task = spec.name.clone();
@@ -453,6 +461,8 @@ impl Coordinator {
             .collect::<Vec<_>>();
         let mut changes = Vec::new();
         let mut rebuild = false;
+        let mut force_reinstall = false;
+        let topology_may_change = native_event_may_change_watch_topology(event.kind);
         for (index, spec) in self.specs.iter_mut().enumerate() {
             if spec.polling {
                 continue;
@@ -463,37 +473,42 @@ impl Coordinator {
                 .cloned()
                 .collect::<Vec<_>>();
             if !matched.is_empty() {
-                for path in &matched {
-                    if spec.native_seen.len() < MAX_NATIVE_SEEN_PATHS {
-                        spec.native_seen.insert(path.clone());
-                    } else {
-                        spec.native_seen_overflow = true;
+                if spec.sentinel || spec.reconcile_once {
+                    for path in &matched {
+                        if spec.native_seen.contains_key(path)
+                            || spec.native_seen.len() < MAX_NATIVE_SEEN_PATHS
+                        {
+                            spec.native_seen
+                                .insert(path.clone(), fingerprint_path(path));
+                        } else {
+                            spec.native_seen_overflow = true;
+                        }
                     }
                 }
                 changes.push((index, matched));
             }
-            if (event.kind.is_create() || event.kind.is_remove() || event.kind.is_modify())
-                && paths.iter().any(|path| {
-                    spec.roots
-                        .iter()
-                        .any(|root| root.structurally_matches(path))
-                })
-            {
-                rebuild = true;
+            if topology_may_change {
+                for root in &spec.roots {
+                    if paths.iter().any(|path| root.structurally_matches(path)) {
+                        rebuild = true;
+                        force_reinstall |= root.target_is_dir;
+                    }
+                }
             }
         }
         for (index, paths) in changes {
             self.queue_change(index, paths, WatchEventSource::Native, false);
         }
 
-        if rebuild && let Err(error) = self.rebuild_after_structure_change() {
+        if rebuild && let Err(error) = self.rebuild_after_structure_change(force_reinstall) {
             self.queue_notice(WatchEvent::Fatal(format!(
                 "failed to rebuild native watcher: {error:#}"
             )));
         }
     }
 
-    fn rebuild_after_structure_change(&mut self) -> Result<()> {
+    fn rebuild_after_structure_change(&mut self, force_reinstall: bool) -> Result<bool> {
+        let previous_registrations = native_registrations(&self.specs);
         for index in 0..self.specs.len() {
             if self.specs[index].polling {
                 continue;
@@ -516,11 +531,47 @@ impl Coordinator {
                 }
             }
         }
+        let registrations_changed = previous_registrations != native_registrations(&self.specs);
+        if !force_reinstall && !registrations_changed {
+            return Ok(false);
+        }
+
+        self.prepare_native_reconciliation();
         self.watcher = None;
         if self.specs.iter().any(|spec| !spec.polling) {
             self.install_native_watcher(false)?;
         }
-        Ok(())
+        Ok(true)
+    }
+
+    fn prepare_native_reconciliation(&mut self) {
+        let next_check = Instant::now() + self.poll_interval;
+        let mut warnings = Vec::new();
+        for spec in &mut self.specs {
+            if spec.polling {
+                continue;
+            }
+            spec.native_seen.clear();
+            spec.native_seen_overflow = false;
+            spec.reconcile_once = false;
+            match snapshot_spec(spec) {
+                Ok(snapshot) => {
+                    spec.snapshot = snapshot;
+                    spec.next_check = next_check;
+                    spec.reconcile_once = true;
+                }
+                Err(error) => warnings.push((
+                    spec.name.clone(),
+                    format!("could not verify changes during native watcher refresh ({error:#})"),
+                )),
+            }
+        }
+        for (task, message) in warnings {
+            self.queue_notice(WatchEvent::Warning {
+                task: Some(task),
+                message,
+            });
+        }
     }
 
     fn handle_native_error(&mut self, error: notify::Error) {
@@ -554,7 +605,8 @@ impl Coordinator {
             .iter()
             .enumerate()
             .filter_map(|(index, spec)| {
-                ((spec.polling || spec.sentinel) && now >= spec.next_check).then_some(index)
+                ((spec.polling || spec.sentinel || spec.reconcile_once) && now >= spec.next_check)
+                    .then_some(index)
             })
             .collect::<Vec<_>>();
         for index in due {
@@ -570,6 +622,7 @@ impl Coordinator {
     }
 
     fn check_spec(&mut self, index: usize, stop: &AtomicBool) -> Result<()> {
+        let reconcile_once = self.specs[index].reconcile_once;
         let next = if self.specs[index].polling {
             self.poll_interval
         } else {
@@ -577,10 +630,16 @@ impl Coordinator {
         };
         let new_snapshot = snapshot_spec_until(&self.specs[index], Some(stop))?;
         let changed = diff_snapshots(&self.specs[index].snapshot, &new_snapshot);
+        let missed = if self.specs[index].native_seen_overflow {
+            changed.clone()
+        } else {
+            missed_native_changes(&changed, &new_snapshot, &self.specs[index].native_seen)
+        };
         self.specs[index].snapshot = new_snapshot;
         self.specs[index].next_check = Instant::now() + next;
+        self.specs[index].reconcile_once = false;
         if changed.is_empty() {
-            if self.specs[index].sentinel {
+            if self.specs[index].sentinel || reconcile_once {
                 self.specs[index].native_seen.clear();
                 self.specs[index].native_seen_overflow = false;
             }
@@ -592,23 +651,13 @@ impl Coordinator {
             return Ok(());
         }
 
-        if self.specs[index].native_seen_overflow {
-            self.specs[index].native_seen.clear();
-            self.specs[index].native_seen_overflow = false;
-            return Ok(());
-        }
-        let missed = changed
-            .into_iter()
-            .filter(|path| {
-                !self.specs[index]
-                    .native_seen
-                    .iter()
-                    .any(|seen| paths_related(path, seen))
-            })
-            .collect::<Vec<_>>();
         self.specs[index].native_seen.clear();
         self.specs[index].native_seen_overflow = false;
         if missed.is_empty() {
+            return Ok(());
+        }
+        if reconcile_once {
+            self.queue_change(index, missed, WatchEventSource::Sentinel, false);
             return Ok(());
         }
         self.promote_to_polling(
@@ -716,7 +765,7 @@ impl TaskWatchSpec {
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 struct Registration {
     recursive: bool,
     specs: HashSet<usize>,
@@ -920,6 +969,47 @@ fn diff_snapshots(old: &Snapshot, new: &Snapshot) -> Vec<PathBuf> {
         .collect()
 }
 
+fn native_event_may_change_watch_topology(kind: EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Any
+            | EventKind::Create(_)
+            | EventKind::Remove(_)
+            | EventKind::Other
+            | EventKind::Modify(ModifyKind::Any | ModifyKind::Name(_) | ModifyKind::Other)
+    )
+}
+
+fn fingerprint_path(path: &Path) -> Fingerprint {
+    let Ok(target) = fs::canonicalize(path).map(|path| normalize_path(&path)) else {
+        return Fingerprint::missing();
+    };
+    let Ok(metadata) = fs::metadata(&target) else {
+        return Fingerprint::missing();
+    };
+    Fingerprint::from_metadata(&metadata, &target)
+}
+
+fn missed_native_changes(
+    changed: &[PathBuf],
+    snapshot: &Snapshot,
+    seen: &BTreeMap<PathBuf, Fingerprint>,
+) -> Vec<PathBuf> {
+    changed
+        .iter()
+        .filter(|path| {
+            let current = snapshot
+                .get(*path)
+                .cloned()
+                .unwrap_or_else(Fingerprint::missing);
+            !seen.iter().any(|(seen_path, seen_fingerprint)| {
+                paths_related(path, seen_path) && *seen_fingerprint == current
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 fn paths_related(left: &Path, right: &Path) -> bool {
     left == right || left.starts_with(right) || right.starts_with(left)
 }
@@ -1064,6 +1154,100 @@ mod tests {
     }
 
     #[test]
+    fn content_writes_do_not_require_native_registration_rebuilds() {
+        use notify::event::{DataChange, MetadataKind, RenameMode};
+
+        assert!(!native_event_may_change_watch_topology(EventKind::Modify(
+            ModifyKind::Data(DataChange::Content)
+        )));
+        assert!(!native_event_may_change_watch_topology(EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::WriteTime)
+        )));
+        assert!(native_event_may_change_watch_topology(EventKind::Modify(
+            ModifyKind::Name(RenameMode::Both)
+        )));
+        assert!(native_event_may_change_watch_topology(EventKind::Create(
+            notify::event::CreateKind::File
+        )));
+    }
+
+    #[test]
+    fn replacing_an_exact_file_keeps_the_native_registration_topology() {
+        let temp = tempdir().unwrap();
+        let file = temp.path().join("watched.txt");
+        fs::write(&file, "one").unwrap();
+        let config = watched_config(PathBuf::from("watched.txt"), WatchMode::Native);
+        let specs = build_specs(temp.path(), &config).unwrap();
+        let (tx, _rx) = mpsc::sync_channel(8);
+        let mut coordinator =
+            Coordinator::new(specs, WatchMode::Native, Duration::from_secs(1), tx).unwrap();
+
+        let replacement = temp.path().join("replacement.tmp");
+        fs::write(&replacement, "replacement contents").unwrap();
+        fs::rename(replacement, &file).unwrap();
+
+        assert!(!coordinator.rebuild_after_structure_change(false).unwrap());
+        assert!(coordinator.watcher.is_some());
+    }
+
+    #[test]
+    fn native_observations_distinguish_multiple_revisions_of_the_same_path() {
+        let temp = tempdir().unwrap();
+        let file = temp.path().join("watched.txt");
+        fs::write(&file, "first").unwrap();
+        let spec = build_specs(
+            temp.path(),
+            &watched_config(PathBuf::from("watched.txt"), WatchMode::Native),
+        )
+        .unwrap()
+        .remove(0);
+
+        fs::write(&file, "intermediate revision").unwrap();
+        let mut seen = BTreeMap::from([(file.clone(), fingerprint_path(&file))]);
+        fs::write(&file, "final revision with a different length").unwrap();
+        let snapshot = snapshot_spec(&spec).unwrap();
+        assert_eq!(
+            missed_native_changes(std::slice::from_ref(&file), &snapshot, &seen),
+            vec![file.clone()]
+        );
+
+        seen.insert(file.clone(), fingerprint_path(&file));
+        assert!(missed_native_changes(&[file], &snapshot, &seen).is_empty());
+    }
+
+    #[test]
+    fn one_time_reconciliation_reports_changes_missed_during_rebuild() {
+        let temp = tempdir().unwrap();
+        let file = temp.path().join("watched.txt");
+        fs::write(&file, "before").unwrap();
+        let config = watched_config(PathBuf::from("watched.txt"), WatchMode::Native);
+        let specs = build_specs(temp.path(), &config).unwrap();
+        let (tx, rx) = mpsc::sync_channel(8);
+        let mut coordinator =
+            Coordinator::new(specs, WatchMode::Native, Duration::from_millis(250), tx).unwrap();
+        coordinator.specs[0].snapshot = snapshot_spec(&coordinator.specs[0]).unwrap();
+        coordinator.specs[0].reconcile_once = true;
+
+        fs::write(&file, "after rebuild").unwrap();
+        coordinator.check_spec(0, &AtomicBool::new(false)).unwrap();
+        coordinator.try_flush();
+
+        let WatchEvent::Changed {
+            task,
+            paths,
+            source,
+            ..
+        } = rx.try_recv().unwrap()
+        else {
+            panic!("expected a reconciled change event");
+        };
+        assert_eq!(task, "server");
+        assert_eq!(paths, vec![file]);
+        assert_eq!(source, WatchEventSource::Sentinel);
+        assert!(!coordinator.specs[0].reconcile_once);
+    }
+
+    #[test]
     fn snapshots_prune_ignored_subtrees_and_report_changes() {
         let temp = tempdir().unwrap();
         let src = temp.path().join("src");
@@ -1174,6 +1358,28 @@ mod tests {
         let event = wait_for_change(&service, Duration::from_secs(3));
         assert_eq!(event.0, "server");
         assert!(event.1.contains(&watched));
+    }
+
+    #[test]
+    fn native_exact_file_watch_survives_repeated_atomic_saves() {
+        let temp = tempdir().unwrap();
+        let watched = temp.path().join("watched.txt");
+        let replacement = temp.path().join(".watched.txt.tmp");
+        fs::write(&watched, "initial").unwrap();
+        let config = watched_config(PathBuf::from("watched.txt"), WatchMode::Native);
+        let service = WatchService::start(temp.path(), &config, true)
+            .unwrap()
+            .unwrap();
+        thread::sleep(Duration::from_millis(100));
+
+        for revision in 0..5 {
+            fs::write(&replacement, format!("revision {revision}")).unwrap();
+            fs::rename(&replacement, &watched).unwrap();
+
+            let event = wait_for_change(&service, Duration::from_secs(3));
+            assert_eq!(event.0, "server");
+            assert!(event.1.contains(&watched));
+        }
     }
 
     #[test]
