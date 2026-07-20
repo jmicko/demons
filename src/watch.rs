@@ -1069,6 +1069,7 @@ fn suspicious_filesystem_from_mountinfo(path: &Path, source: &str) -> bool {
     best.is_some_and(|(_, kind)| is_suspicious_filesystem_type(kind))
 }
 
+#[cfg(target_os = "linux")]
 fn is_suspicious_filesystem_type(kind: &str) -> bool {
     matches!(
         kind,
@@ -1078,6 +1079,7 @@ fn is_suspicious_filesystem_type(kind: &str) -> bool {
         || kind.starts_with("glusterfs")
 }
 
+#[cfg(target_os = "linux")]
 fn decode_mount_field(field: &str) -> String {
     field
         .replace("\\040", " ")
