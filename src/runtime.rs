@@ -33,7 +33,7 @@ use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
     buffer::Buffer,
-    layout::Rect,
+    layout::{Rect, Size},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget, Wrap},
@@ -394,6 +394,7 @@ fn run_loop(
     shutdown_requested: &AtomicBool,
 ) -> Result<()> {
     let mut dirty = true;
+    let mut terminal_size = terminal.size().context("failed to read terminal size")?;
     loop {
         if shutdown_requested.load(Ordering::Relaxed) {
             app.mark_stopping();
@@ -404,6 +405,8 @@ fn run_loop(
             app.mark_stopping();
             return Ok(());
         }
+        let current_size = terminal.size().context("failed to read terminal size")?;
+        dirty |= update_terminal_size(&mut terminal_size, current_size);
         dirty |= app.drain_process_events();
         dirty |= app.drain_control_requests();
         dirty |= app.resolve_control_waits();
@@ -479,6 +482,14 @@ fn poll_terminal_stream_input<T: IsTerminal>(
     } else {
         Ok(TerminalInputPoll::Timeout)
     }
+}
+
+fn update_terminal_size(previous: &mut Size, current: Size) -> bool {
+    if *previous == current {
+        return false;
+    }
+    *previous = current;
+    true
 }
 
 fn terminal_stdio_attached() -> bool {
@@ -14089,6 +14100,15 @@ mod tests {
         assert!(!terminal_fd_attached(read_fd));
 
         assert_eq!(unsafe { libc::close(read_fd) }, 0);
+    }
+
+    #[test]
+    fn terminal_size_changes_mark_the_frame_dirty() {
+        let mut previous = Size::new(80, 24);
+
+        assert!(!update_terminal_size(&mut previous, Size::new(80, 24)));
+        assert!(update_terminal_size(&mut previous, Size::new(120, 40)));
+        assert_eq!(previous, Size::new(120, 40));
     }
 
     #[cfg(unix)]
