@@ -146,6 +146,7 @@ struct WatchRoot {
     configured: PathBuf,
     target: PathBuf,
     target_is_dir: bool,
+    fingerprint: Fingerprint,
 }
 
 impl WatchRoot {
@@ -161,23 +162,43 @@ impl WatchRoot {
                 configured.display()
             );
         }
+        let target = normalize_path(&target);
         Ok(Self {
             configured,
-            target: normalize_path(&target),
+            fingerprint: Fingerprint::from_metadata(&metadata, &target),
+            target,
             target_is_dir: metadata.is_dir(),
         })
     }
 
-    fn matches(&self, path: &Path) -> bool {
+    fn display_path(&self, path: &Path) -> Option<PathBuf> {
         if self.target_is_dir {
-            path.starts_with(&self.configured) || path.starts_with(&self.target)
-        } else {
-            path == self.configured || path == self.target
+            if let Ok(relative) = path.strip_prefix(&self.target) {
+                return Some(normalize_path(&self.configured.join(relative)));
+            }
+            if path.starts_with(&self.configured) {
+                return Some(path.to_path_buf());
+            }
+            return None;
         }
+        (path == self.configured || path == self.target).then(|| self.configured.clone())
     }
 
     fn structurally_matches(&self, path: &Path) -> bool {
         path == self.configured || path == self.target
+    }
+
+    fn take_native_change(&mut self, path: &Path) -> Option<(PathBuf, bool)> {
+        let display = self.display_path(path)?;
+        let structural = self.structurally_matches(path);
+        if structural {
+            let current = fingerprint_path(path);
+            if current == self.fingerprint {
+                return None;
+            }
+            self.fingerprint = current;
+        }
+        Some((display, structural))
     }
 }
 
@@ -441,7 +462,7 @@ impl Coordinator {
         if event.kind.is_access() {
             return;
         }
-        if event.paths.is_empty() {
+        if event.paths.is_empty() || event.need_rescan() {
             let indexes = self
                 .specs
                 .iter()
@@ -467,33 +488,30 @@ impl Coordinator {
             if spec.polling {
                 continue;
             }
-            let matched = paths
-                .iter()
-                .filter(|path| spec.matches(path) && !spec.ignored(path, path))
-                .cloned()
-                .collect::<Vec<_>>();
-            if !matched.is_empty() {
+            let mut matched = BTreeSet::new();
+            for path in &paths {
+                let Some((display, structural, target_is_dir)) = spec.match_native_path(path)
+                else {
+                    continue;
+                };
+                if topology_may_change && structural {
+                    rebuild = true;
+                    force_reinstall |= target_is_dir;
+                }
                 if spec.sentinel || spec.reconcile_once {
-                    for path in &matched {
-                        if spec.native_seen.contains_key(path)
-                            || spec.native_seen.len() < MAX_NATIVE_SEEN_PATHS
-                        {
-                            spec.native_seen
-                                .insert(path.clone(), fingerprint_path(path));
-                        } else {
-                            spec.native_seen_overflow = true;
-                        }
+                    if spec.native_seen.contains_key(&display)
+                        || spec.native_seen.len() < MAX_NATIVE_SEEN_PATHS
+                    {
+                        spec.native_seen
+                            .insert(display.clone(), fingerprint_path(path));
+                    } else {
+                        spec.native_seen_overflow = true;
                     }
                 }
-                changes.push((index, matched));
+                matched.insert(display);
             }
-            if topology_may_change {
-                for root in &spec.roots {
-                    if paths.iter().any(|path| root.structurally_matches(path)) {
-                        rebuild = true;
-                        force_reinstall |= root.target_is_dir;
-                    }
-                }
+            if !matched.is_empty() {
+                changes.push((index, matched.into_iter().collect()));
             }
         }
         for (index, paths) in changes {
@@ -754,8 +772,21 @@ impl Coordinator {
 }
 
 impl TaskWatchSpec {
-    fn matches(&self, path: &Path) -> bool {
-        self.roots.iter().any(|root| root.matches(path))
+    fn match_native_path(&mut self, source_path: &Path) -> Option<(PathBuf, bool, bool)> {
+        let (roots, ignores) = (&mut self.roots, &self.ignores);
+        for root in roots {
+            let Some((display_path, structural)) = root.take_native_change(source_path) else {
+                continue;
+            };
+            if ignores
+                .iter()
+                .any(|ignore| ignore.matches(&display_path, source_path))
+            {
+                continue;
+            }
+            return Some((display_path, structural, root.target_is_dir));
+        }
+        None
     }
 
     fn ignored(&self, display_path: &Path, source_path: &Path) -> bool {
@@ -800,6 +831,9 @@ fn add_registration(
     recursive: bool,
     spec: usize,
 ) {
+    let path = fs::canonicalize(&path)
+        .map(|path| normalize_path(&path))
+        .unwrap_or(path);
     let registration = registrations.entry(path).or_default();
     registration.recursive |= recursive;
     registration.specs.insert(spec);
@@ -1153,6 +1187,48 @@ mod tests {
             spec.ignores[0].configured,
             temp.path().join("shared/src/generated")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_events_map_canonical_aliases_and_filter_unchanged_roots() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let real = temp.path().join("real");
+        let alias = temp.path().join("alias");
+        fs::create_dir(&real).unwrap();
+        symlink(&real, &alias).unwrap();
+        fs::write(real.join("watched.txt"), "one").unwrap();
+
+        let mut file_spec = build_specs(
+            temp.path(),
+            &watched_config(PathBuf::from("alias/watched.txt"), WatchMode::Native),
+        )
+        .unwrap()
+        .remove(0);
+        let source = fs::canonicalize(real.join("watched.txt")).unwrap();
+        assert!(file_spec.match_native_path(&source).is_none());
+
+        fs::write(&source, "two-two").unwrap();
+        assert_eq!(
+            file_spec.match_native_path(&source),
+            Some((alias.join("watched.txt"), true, false))
+        );
+        assert!(file_spec.match_native_path(&source).is_none());
+
+        let mut directory_spec = build_specs(
+            temp.path(),
+            &watched_config(PathBuf::from("alias"), WatchMode::Native),
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!(
+            directory_spec.match_native_path(&source),
+            Some((alias.join("watched.txt"), false, true))
+        );
+        let root = fs::canonicalize(&real).unwrap();
+        assert!(directory_spec.match_native_path(&root).is_none());
     }
 
     #[test]

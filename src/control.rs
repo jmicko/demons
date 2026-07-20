@@ -4,6 +4,7 @@ use std::{
     env, fs,
     io::{self, Read, Write},
     os::unix::{
+        ffi::OsStrExt,
         fs::{DirBuilderExt, MetadataExt, PermissionsExt},
         net::{UnixListener, UnixStream},
     },
@@ -257,9 +258,10 @@ pub struct ControlListener {
 impl ControlListener {
     pub fn start(scope_id: &str, config_path: &Path) -> Result<(Self, Receiver<ControlEnvelope>)> {
         uuid::Uuid::parse_str(scope_id).context("invalid MCP project scope ID")?;
-        let runtime_dir = runtime_dir()?;
         let instance_id = uuid::Uuid::new_v4().to_string();
-        let socket_path = runtime_dir.join(format!("{instance_id}.sock"));
+        let socket_name = format!("{instance_id}.sock");
+        let runtime_dir = runtime_dir(&socket_name)?;
+        let socket_path = runtime_dir.join(socket_name);
         let discovery_path = runtime_dir.join(format!("{scope_id}-{instance_id}.json"));
         remove_owned_file_if_present(&socket_path)?;
         let listener = UnixListener::bind(&socket_path)
@@ -519,15 +521,20 @@ pub fn authorize(access: McpAccess, request: &ControlRequest) -> Result<()> {
     Ok(())
 }
 
-fn runtime_dir() -> Result<PathBuf> {
+fn runtime_dir(socket_name: &str) -> Result<PathBuf> {
     let candidates = runtime_dir_candidates()?;
     let dir = candidates
-        .first()
-        .cloned()
-        .context("no safe runtime directory is available")?;
+        .into_iter()
+        .find(|dir| unix_socket_path_fits(&dir.join(socket_name)))
+        .context("no safe runtime directory has room for the control socket path")?;
     let uid = unsafe { libc::geteuid() };
     ensure_private_dir(&dir, uid)?;
     Ok(dir)
+}
+
+fn unix_socket_path_fits(path: &Path) -> bool {
+    let address = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
+    path.as_os_str().as_bytes().len() < address.sun_path.len()
 }
 
 fn runtime_dir_candidates() -> Result<Vec<PathBuf>> {
@@ -546,9 +553,13 @@ fn runtime_dir_candidates() -> Result<Vec<PathBuf>> {
             bases.push(path);
         }
     }
-    let fallback = env::temp_dir().join(format!("demons-{uid}"));
-    if !bases.contains(&fallback) {
-        bases.push(fallback);
+    for fallback in [
+        PathBuf::from("/tmp").join(format!("demons-{uid}")),
+        env::temp_dir().join(format!("demons-{uid}")),
+    ] {
+        if !bases.contains(&fallback) {
+            bases.push(fallback);
+        }
     }
 
     let mut directories = Vec::new();
