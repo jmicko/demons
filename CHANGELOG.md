@@ -4,15 +4,21 @@ All notable user-facing changes should be recorded here before a release.
 
 ## Unreleased
 
+## 0.4.0 - 2026-07-20
+
 - Added config schema v5 with per-task literal file and recursive directory
   watches, ignored paths, and trailing restart debounce.
 - Added native file-system events with automatic polling fallback, configurable
   watcher mode and polling cadence, ignored-tree pruning, and bounded queues.
 - Added task-menu editors with file/directory Tab completion for watched and
   ignored paths, plus live watcher settings that revert on Discard.
+- Changed relative watched and ignored paths to resolve from the project config
+  directory while keeping the task working directory as the editor default.
 - Added `--no-watch` to disable all configured watchers for one session.
 - Changed watched restarts to use the existing dependency graph and start
   delays, including restarting exited tasks and coalescing change bursts.
+- Fixed watcher registration refreshes so file events arriving during a refresh
+  are preserved instead of leaving a task stopped without a replacement.
 - Added config schema v4 with Off, Read only, and Full project-scoped MCP
   access levels managed from the Settings tab.
 - Added an optional one-line MCP activity bar with a fixed-position control
@@ -35,6 +41,8 @@ All notable user-facing changes should be recorded here before a release.
   avoid creating `.codex` when no registration exists.
 - Added an explicit save-time repair for a zero-byte `.codex` file while
   leaving nonempty files, symlinks, cancellation, and discarded edits intact.
+- Fixed terminal resizing so the layout redraws immediately without weakening
+  detached-terminal cleanup.
 
 ## 0.3.0 - 2026-07-09
 

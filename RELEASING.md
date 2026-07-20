@@ -11,7 +11,7 @@ a minor release, and patch releases should be limited to fixes and documentation
 Update the crate version with:
 
 ```sh
-scripts/set-version.sh 0.3.0
+scripts/set-version.sh 0.4.0
 ```
 
 The script updates `Cargo.toml` and the root `demons` entry in `Cargo.lock`,
@@ -45,7 +45,7 @@ Before publishing from a machine for the first time:
 6. Run a crates.io publish dry run after the version bump:
 
    ```sh
-   cargo publish --dry-run --locked
+   cargo publish --dry-run --locked --allow-dirty
    ```
 
 7. Do a short manual TUI smoke test:
