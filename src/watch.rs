@@ -311,29 +311,41 @@ impl Coordinator {
         if mode == WatchMode::Polling {
             for spec in &mut coordinator.specs {
                 spec.polling = true;
+                spec.snapshot = snapshot_spec(spec)?;
+                spec.next_check = Instant::now() + poll_interval;
             }
         } else {
-            coordinator.install_native_watcher(true)?;
-        }
-
-        for spec in &mut coordinator.specs {
-            if mode == WatchMode::Auto
-                && !spec.polling
-                && spec
-                    .roots
-                    .iter()
-                    .any(|root| suspicious_filesystem(&root.target))
-            {
-                spec.sentinel = true;
+            let mut warnings = Vec::new();
+            for spec in &mut coordinator.specs {
+                match snapshot_spec(spec) {
+                    Ok(snapshot) => {
+                        spec.snapshot = snapshot;
+                        spec.next_check = Instant::now() + poll_interval;
+                        spec.reconcile_once = true;
+                    }
+                    Err(error) => warnings.push((
+                        spec.name.clone(),
+                        format!("could not establish the native watcher baseline ({error:#})"),
+                    )),
+                }
             }
-            if spec.polling || spec.sentinel {
-                spec.snapshot = snapshot_spec(spec)?;
-                spec.next_check = Instant::now()
-                    + if spec.polling {
-                        poll_interval
-                    } else {
-                        SENTINEL_INTERVAL
-                    };
+            coordinator.install_native_watcher(true)?;
+            for (task, message) in warnings {
+                coordinator.queue_notice(WatchEvent::Warning {
+                    task: Some(task),
+                    message,
+                });
+            }
+            for spec in &mut coordinator.specs {
+                if mode == WatchMode::Auto
+                    && !spec.polling
+                    && spec
+                        .roots
+                        .iter()
+                        .any(|root| suspicious_filesystem(&root.target))
+                {
+                    spec.sentinel = true;
+                }
             }
         }
         Ok(coordinator)
@@ -494,6 +506,18 @@ impl Coordinator {
                 else {
                     continue;
                 };
+                let current =
+                    (spec.reconcile_once || spec.sentinel).then(|| fingerprint_path(path));
+                if spec.reconcile_once
+                    && spec
+                        .snapshot
+                        .get(&display)
+                        .cloned()
+                        .unwrap_or_else(Fingerprint::missing)
+                        == *current.as_ref().expect("reconciliation fingerprints paths")
+                {
+                    continue;
+                }
                 if topology_may_change && structural {
                     rebuild = true;
                     force_reinstall |= target_is_dir;
@@ -502,8 +526,10 @@ impl Coordinator {
                     if spec.native_seen.contains_key(&display)
                         || spec.native_seen.len() < MAX_NATIVE_SEEN_PATHS
                     {
-                        spec.native_seen
-                            .insert(display.clone(), fingerprint_path(path));
+                        spec.native_seen.insert(
+                            display.clone(),
+                            current.expect("native verification fingerprints paths"),
+                        );
                     } else {
                         spec.native_seen_overflow = true;
                     }
@@ -653,7 +679,12 @@ impl Coordinator {
         } else {
             missed_native_changes(&changed, &new_snapshot, &self.specs[index].native_seen)
         };
-        self.specs[index].snapshot = new_snapshot;
+        let keep_snapshot = self.specs[index].polling || self.specs[index].sentinel;
+        self.specs[index].snapshot = if keep_snapshot {
+            new_snapshot
+        } else {
+            Snapshot::new()
+        };
         self.specs[index].next_check = Instant::now() + next;
         self.specs[index].reconcile_once = false;
         if changed.is_empty() {
@@ -1323,6 +1354,33 @@ mod tests {
         assert_eq!(paths, vec![file]);
         assert_eq!(source, WatchEventSource::Sentinel);
         assert!(!coordinator.specs[0].reconcile_once);
+    }
+
+    #[test]
+    fn native_startup_baseline_filters_stale_events_but_keeps_real_edits() {
+        use notify::event::DataChange;
+
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("src");
+        fs::create_dir(&src).unwrap();
+        let file = src.join("main.rs");
+        fs::write(&file, "before").unwrap();
+        let config = watched_config(PathBuf::from("src"), WatchMode::Native);
+        let specs = build_specs(temp.path(), &config).unwrap();
+        let (tx, _rx) = mpsc::sync_channel(8);
+        let mut coordinator =
+            Coordinator::new(specs, WatchMode::Native, Duration::from_secs(1), tx).unwrap();
+        let event = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+            .add_path(file.clone());
+
+        coordinator.handle_native_event(event.clone());
+        assert!(coordinator.pending_changes.is_empty());
+
+        fs::write(&file, "after with a different length").unwrap();
+        coordinator.handle_native_event(event);
+
+        let pending = coordinator.pending_changes.get("server").unwrap();
+        assert_eq!(pending.paths, BTreeSet::from([file]));
     }
 
     #[test]
